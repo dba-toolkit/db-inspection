@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from inspection_core.models import PackageContext
@@ -118,6 +119,63 @@ class PostgreSQLPresentationBuilder:
         mem_snap = _parse_free_b(ctx.root / "tables" / "memory_snapshot.tsv")
         dbstats = tables.get("database_stats", [])
 
+        def _colon_map(path: Path) -> dict[str, str]:
+            if not path.exists():
+                return {}
+            result: dict[str, str] = {}
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if ":" not in raw:
+                    continue
+                name, value = raw.split(":", 1)
+                result[name.strip()] = value.strip()
+            return result
+
+        def _key_value_rows(path: Path) -> list[dict[str, Any]]:
+            if not path.exists():
+                return []
+            rows: list[dict[str, Any]] = []
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "\t" in line:
+                    name, value = line.split("\t", 1)
+                elif "=" in line:
+                    name, value = line.split("=", 1)
+                else:
+                    continue
+                rows.append(_row(参数=name.strip(), 值=value.strip()))
+            return rows
+
+        def _mount_rows(path: Path) -> list[dict[str, Any]]:
+            if not path.exists():
+                return []
+            rows: list[dict[str, Any]] = []
+            pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
+            for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                matched = pattern.match(raw.strip())
+                if not matched:
+                    continue
+                rows.append(_row(
+                    设备=matched.group(1).strip(),
+                    挂载点=matched.group(2).strip(),
+                    类型=matched.group(3).strip(),
+                    挂载选项=matched.group(4).strip(),
+                ))
+            return rows
+
+        def _dmesg_rows(path: Path, limit: int = 20) -> list[dict[str, Any]]:
+            if not path.exists():
+                return []
+            lines = [l.strip() for l in path.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()]
+            return [_row(内核错误日志=l) for l in lines[:limit]]
+
+        lscpu = _colon_map(root / "evidence" / "lscpu.txt")
+        time_info = ctx.snapshot.get("time_evidence", {})
+        kernel_rows = _key_value_rows(root / "tables" / "kernel_parameters.tsv")
+        mount_rows = _mount_rows(root / "evidence" / "mounts.txt")
+        dmesg_rows = _dmesg_rows(root / "evidence" / "dmesg_errors.txt")
+
         # =====================================================================
         # Section 1: 实例基础信息
         # =====================================================================
@@ -155,14 +213,26 @@ class PostgreSQLPresentationBuilder:
         # Section 2: 操作系统信息
         # =====================================================================
         os_rows = [
+            _row(检查项="主机名", 采集值=host.get("hostname", ""), 说明=""),
+            _row(检查项="IP 地址", 采集值=host.get("primary_ip", ""), 说明=""),
             _row(检查项="操作系统", 采集值=host.get("os", ""), 说明=""),
             _row(检查项="内核版本", 采集值=host.get("kernel", ""), 说明=""),
+            _row(检查项="CPU 型号", 采集值=lscpu.get("Model name", ""), 说明=""),
             _row(检查项="CPU 核数", 采集值=str(host.get("cpu_count", "")), 说明=""),
             _row(检查项="内存总量", 采集值=_fmt_bytes(host.get("memory_total_bytes")), 说明=""),
         ]
         if mem_snap and mem_snap.get("available"):
             os_rows.append(_row(检查项="可用内存", 采集值=_fmt_bytes(mem_snap["available"]), 说明="现场快照"))
-        _add_section("system_info", "操作系统信息", [
+
+        ntp_value = str(time_info.get("ntp_synchronized", "")).lower()
+        ntp_ok = ntp_value in {"yes", "true", "1", "active"}
+        time_rows = [
+            _row(检查项="本地时间", 采集值=time_info.get("host_local_time", ""), 说明=""),
+            _row(检查项="时区", 采集值=time_info.get("timezone", ""), 说明=""),
+            _row(检查项="NTP 同步", 采集值=time_info.get("ntp_synchronized", ""), 说明=""),
+        ]
+
+        _add_section("system_info", "系统信息", [
             _item("system.host", "主机与操作系统信息", "snapshot.json#host_identity", os_rows,
                   conclusion="{} {}，{}核/{}，现场可用 {}。".format(
                       host.get("os", "未知")[:30], host.get("kernel", "")[:20],
@@ -171,6 +241,20 @@ class PostgreSQLPresentationBuilder:
                       _fmt_bytes(mem_snap.get("available", 0)) if mem_snap and mem_snap.get("available") else "未知"),
                   evidence=[f"OS: {host.get('os', '')}", f"CPU: {host.get('cpu_count', '')}核"],
                   recommendation="" if (host.get("cpu_count") or 0) >= 2 else "建议至少 2 核用于生产环境"),
+            _item("system.time", "时间与时区", "snapshot.json#time_evidence", time_rows,
+                  conclusion="主机时间未与 NTP 同步，日志关联和故障时间线存在偏差风险。" if not ntp_ok else "主机时间同步状态正常。",
+                  status="risk" if not ntp_ok else "normal",
+                  evidence=[f"NTP synchronized={time_info.get('ntp_synchronized')}"],
+                  recommendation="启用并验证企业时间同步服务。" if not ntp_ok else ""),
+            _item("system.kernel", "关键内核参数", "tables/kernel_parameters.tsv", kernel_rows,
+                  conclusion="已取得数据库相关内核参数，参数值需结合操作系统基线复核。",
+                  evidence=[f"参数 {len(kernel_rows)} 项"]),
+            _item("system.mounts", "挂载参数", "evidence/mounts.txt", mount_rows,
+                  conclusion="已取得挂载参数，可用于检查数据目录文件系统的持久性选项。" if mount_rows else "未采集到挂载参数。",
+                  evidence=[f"挂载点 {len(mount_rows)} 个"]),
+            _item("system.dmesg_errors", "内核错误摘要", "evidence/dmesg_errors.txt", dmesg_rows,
+                  conclusion="存在内核错误级别日志，建议结合硬件与系统日志复核。" if dmesg_rows else "未发现内核错误级别日志。",
+                  status="attention" if dmesg_rows else "normal"),
         ])
 
         # =====================================================================
@@ -796,4 +880,3 @@ class PostgreSQLPresentationBuilder:
 
 
 # ---------------------------------------------------------------------------
-
