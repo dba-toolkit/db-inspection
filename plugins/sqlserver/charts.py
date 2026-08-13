@@ -38,13 +38,6 @@ def build_charts(snapshot: dict[str, Any], findings: list[dict[str, Any]], outpu
     add_line("03_connections.png", "连接与阻塞采样", samples,
              [("user_connections", "User Connections"), ("blocked_session_count", "Blocked Sessions")])
 
-    severity_order = ["critical", "high", "medium", "low"]
-    severity_cn = {"critical": "严重", "high": "高", "medium": "中", "low": "低"}
-    severity_values = [sum(1 for x in findings if x.get("severity") == s) for s in severity_order]
-    add_bar("04_risk_distribution.png", "巡检风险等级分布",
-            [severity_cn[s] for s in severity_order], severity_values, "项",
-            ["#9B1C1C", "#C2410C", "#B26A00", "#66717E"])
-
     waits = sorted(snapshot.get("wait_stats", []), key=lambda x: num(x.get("wait_time_ms")) or 0, reverse=True)[:8]
     add_bar("05_waits.png", "主要等待类型（累计秒）",
             [str(x.get("wait_type", "-")) for x in waits], [(num(x.get("wait_time_ms")) or 0) / 1000 for x in waits], "s")

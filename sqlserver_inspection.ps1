@@ -227,6 +227,19 @@ try {
     [void]$limitations.Add("实例基础信息: $($_.Exception.Message)")
 }
 
+# 本地连接时 sys.dm_exec_connections 的 local_net_address 可能为 NULL，补用 PowerShell 探测本机 IPv4
+if (-not $snapshot.instance.connection_ip) {
+    try {
+        $localIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notmatch '^127\.' -and $_.IPAddress -notmatch '^169\.254\.' -and $_.IPAddress -ne '0.0.0.0' } |
+            Sort-Object InterfaceMetric | Select-Object -ExpandProperty IPAddress)
+        if ($localIps.Count -gt 0) { $snapshot.instance.connection_ip = $localIps[0] }
+    } catch { }
+}
+if (-not $snapshot.instance.connection_port) {
+    $snapshot.instance.connection_port = if ($Port -gt 0) { $Port } else { 1433 }
+}
+
 # 用实际采集的实例名 + IP + 端口重命名输出目录
 $realServer = $snapshot.instance.server_name
 if ($realServer) {
@@ -1021,7 +1034,6 @@ if ($NoPackage) {
     Write-CollectorLog "Package written: $zipPath"
     Write-Host "OUTPUT_PACKAGE=$zipPath"
 }
-
 
 
 

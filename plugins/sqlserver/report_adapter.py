@@ -262,7 +262,7 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
     quality = source.get("collection_quality") or {}
 
     server_name = instance.get("server_name") or overview.get("server_name")
-    raw_ip = overview.get("ip") or instance.get("connection_ip")
+    raw_ip = instance.get("connection_ip") or overview.get("ip")
     ip_address = raw_ip if raw_ip not in (None, "", ".") else (instance.get("machine_name") or server_name)
     raw_port = target.get("port") or instance.get("connection_port") or 0
     port_value = raw_port or 1433
