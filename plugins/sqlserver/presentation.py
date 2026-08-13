@@ -1,182 +1,15 @@
-#!/usr/bin/env python3
-"""Analyze SQL Server inspection snapshots and build a stable report model."""
+"""SQL Server ???????"""
+
 from __future__ import annotations
 
-import argparse
-import json
-import math
-import shutil
-import tempfile
-import zipfile
 from collections import Counter
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from rules import RuleEngine
+from .metrics import num, score
+
 
 ANALYZER_VERSION = "1.1.0"
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8-sig") as f:
-        value = json.load(f)
-    if not isinstance(value, dict):
-        raise ValueError(f"JSON root must be an object: {path}")
-    return value
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(value, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-
-
-def discover_snapshot(source: Path, temp_root: Path) -> Path:
-    if source.is_file() and source.suffix.lower() == ".json":
-        return source
-    if source.is_dir():
-        direct = source / "snapshot.json"
-        if direct.exists():
-            return direct
-        matches = list(source.rglob("snapshot.json"))
-        if len(matches) == 1:
-            return matches[0]
-        raise ValueError(f"Cannot uniquely locate snapshot.json in {source}")
-    if source.is_file() and source.suffix.lower() == ".zip":
-        out = temp_root / source.stem
-        with zipfile.ZipFile(source) as zf:
-            for item in zf.infolist():
-                target = (out / item.filename).resolve()
-                if out.resolve() not in target.parents and target != out.resolve():
-                    raise ValueError(f"Unsafe archive entry: {item.filename}")
-            zf.extractall(out)
-        matches = list(out.rglob("snapshot.json"))
-        if len(matches) != 1:
-            raise ValueError(f"Archive must contain one snapshot.json: {source}")
-        return matches[0]
-    raise ValueError(f"Unsupported input: {source}")
-
-
-def num(v: Any) -> float | None:
-    try:
-        x = float(v)
-        return x if math.isfinite(x) else None
-    except (TypeError, ValueError):
-        return None
-
-
-def build_charts(snapshot: dict[str, Any], findings: list[dict[str, Any]], output: Path) -> list[dict[str, str]]:
-    from chart_style import bar_chart, line_chart
-
-    output.mkdir(parents=True, exist_ok=True)
-    charts: list[dict[str, str]] = []
-
-    def add_line(filename: str, title: str, samples: list[dict[str, Any]], specs: list[tuple[str, str]]) -> None:
-        if not samples or not any(any(num(x.get(key)) is not None for x in samples) for key, _ in specs):
-            return
-        path = output / filename
-        labels = [str(x.get("timestamp", ""))[11:19] for x in samples]
-        line_chart(path, title, labels, [(label, [num(x.get(key)) for x in samples]) for key, label in specs])
-        charts.append({"id": path.stem, "title": title, "path": str(path.resolve()), "kind": "line"})
-
-    def add_bar(filename: str, title: str, labels: list[str], values: list[float], suffix: str = "", colors: list[str] | None = None) -> None:
-        if not labels or not values:
-            return
-        path = output / filename
-        bar_chart(path, title, labels, values, colors=colors, suffix=suffix)
-        charts.append({"id": path.stem, "title": title, "path": str(path.resolve()), "kind": "bar"})
-
-    samples = snapshot.get("performance_samples", [])
-    add_line("01_activity.png", "SQL Server 业务活动采样", samples,
-             [("batch_requests_per_sec", "Batch Requests/s"), ("transactions_per_sec", "Transactions/s")])
-    add_line("02_memory.png", "SQL Server 内存压力指标", samples,
-             [("page_life_expectancy", "PLE (s)"), ("memory_grants_pending", "Memory Grants Pending")])
-    add_line("03_connections.png", "连接与阻塞采样", samples,
-             [("user_connections", "User Connections"), ("blocked_session_count", "Blocked Sessions")])
-
-    severity_order = ["critical", "high", "medium", "low"]
-    severity_cn = {"critical": "严重", "high": "高", "medium": "中", "low": "低"}
-    severity_values = [sum(1 for x in findings if x.get("severity") == s) for s in severity_order]
-    add_bar("04_risk_distribution.png", "巡检风险等级分布",
-            [severity_cn[s] for s in severity_order], severity_values, "项",
-            ["#9B1C1C", "#C2410C", "#B26A00", "#66717E"])
-
-    waits = sorted(snapshot.get("wait_stats", []), key=lambda x: num(x.get("wait_time_ms")) or 0, reverse=True)[:8]
-    add_bar("05_waits.png", "主要等待类型（累计秒）",
-            [str(x.get("wait_type", "-")) for x in waits], [(num(x.get("wait_time_ms")) or 0) / 1000 for x in waits], "s")
-
-    dbs = [x for x in snapshot.get("databases", []) if str(x.get("name", "")).lower() not in {"master", "model", "msdb", "tempdb"}]
-    dbs = sorted(dbs, key=lambda x: (num(x.get("data_size_mb")) or 0) + (num(x.get("log_size_mb")) or 0), reverse=True)[:8]
-    add_bar("06_database_size.png", "用户数据库容量（GB）",
-            [str(x.get("name", "-")) for x in dbs], [((num(x.get("data_size_mb")) or 0) + (num(x.get("log_size_mb")) or 0)) / 1024 for x in dbs], "GB")
-
-    files = sorted(snapshot.get("database_files", []), key=lambda x: max(num(x.get("avg_read_latency_ms")) or 0, num(x.get("avg_write_latency_ms")) or 0), reverse=True)[:8]
-    add_bar("07_file_latency.png", "数据库文件最大平均 I/O 延迟",
-            [f"{x.get('database_name')}/{x.get('logical_name')}" for x in files],
-            [max(num(x.get("avg_read_latency_ms")) or 0, num(x.get("avg_write_latency_ms")) or 0) for x in files], "ms")
-
-    volumes = sorted(snapshot.get("volumes", []), key=lambda x: num(x.get("free_pct")) or 100)[:8]
-    add_bar("08_volume_free.png", "数据库所在卷可用空间比例",
-            [str(x.get("volume_mount_point") or x.get("logical_volume_name") or "卷") for x in volumes],
-            [num(x.get("free_pct")) or 0 for x in volumes], "%",
-            ["#9B1C1C" if (num(x.get("free_pct")) or 0) < 10 else "#B26A00" if (num(x.get("free_pct")) or 0) < 20 else "#276749" for x in volumes])
-
-    collected = snapshot.get("collection", {}).get("finished_at")
-    try:
-        now = datetime.fromisoformat(str(collected).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
-        now = datetime.now().astimezone()
-    backup_labels: list[str] = []
-    backup_hours: list[float] = []
-    for row in snapshot.get("backups", []):
-        if str(row.get("database_name", "")).lower() == "tempdb":
-            continue
-        try:
-            then = datetime.fromisoformat(str(row.get("last_full_backup")).replace("Z", "+00:00"))
-            if then.tzinfo is None and now.tzinfo is not None:
-                then = then.replace(tzinfo=now.tzinfo)
-            hours = max(0.0, (now - then).total_seconds() / 3600)
-        except (TypeError, ValueError):
-            hours = 999.0
-        backup_labels.append(str(row.get("database_name", "-")))
-        backup_hours.append(hours)
-    pairs = sorted(zip(backup_labels, backup_hours), key=lambda x: x[1], reverse=True)[:8]
-    add_bar("09_backup_age.png", "最近完整备份距今时间",
-            [x[0] for x in pairs], [x[1] for x in pairs], "h",
-            ["#9B1C1C" if x[1] > 168 else "#B26A00" if x[1] > 72 else "#276749" for x in pairs])
-
-    return charts
-
-
-def normalize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    snapshot.setdefault("schema_version", "1.0")
-    for key in ("databases", "backups", "backup_history", "no_backup_databases", "database_files",
-                "wait_stats", "blocking", "active_requests", "connection_stats",
-                "top_queries", "top_queries_logical_reads", "top_queries_executions", "top_queries_physical_reads",
-                "missing_indexes", "unused_indexes", "configurations", "failed_jobs",
-                "availability_replicas", "error_log_summary", "performance_samples"):
-        snapshot.setdefault(key, [])
-    for key in ("volumes", "log_space", "vlf_summary", "suspect_pages", "agent_jobs",
-                "database_mirroring", "log_shipping", "replication",
-                "stale_statistics", "fragmented_indexes", "orphaned_users",
-                "tables_without_pk", "large_tables", "database_rcsi", "database_summary",
-                "buffer_pool", "memory_status", "cpu_by_database"):
-        snapshot.setdefault(key, [])
-    snapshot.setdefault("instance", {})
-    snapshot.setdefault("tempdb", {"files": []})
-    snapshot.setdefault("security", {"sql_logins": [], "sysadmin_members": [], "linked_servers": [], "security_checks": []})
-    snapshot.setdefault("collection", {})
-    return snapshot
-
-
-def score(findings: list[dict[str, Any]], quality_pct: float) -> tuple[int, str]:
-    weights = {"critical": 18, "high": 10, "medium": 4, "low": 1}
-    raw = max(0, 100 - sum(weights.get(str(x.get("severity")), 0) for x in findings))
-    result = round(raw * (0.85 + 0.15 * quality_pct / 100))
-    grade = "健康" if result >= 90 else "良好" if result >= 75 else "关注" if result >= 60 else "高风险"
-    return result, grade
 
 
 def build_model(snapshot: dict[str, Any], findings: list[dict[str, Any]], charts: list[dict[str, str]]) -> dict[str, Any]:
@@ -397,7 +230,6 @@ def build_model(snapshot: dict[str, Any], findings: list[dict[str, Any]], charts
         ],
         "sections": _inject_analysis(_build_sections(snapshot, perf_summary), findings),
     }
-
 
 def _build_sections(s: dict[str, Any], perf: dict[str, Any]) -> list[dict[str, Any]]:
     """Build data-driven inspection sections for the docx generator."""
@@ -765,37 +597,3 @@ def _inject_analysis(sections, findings):
             }
     return sections
 
-
-def main() -> int:
-    p = argparse.ArgumentParser(description="Analyze SQL Server inspection package")
-    p.add_argument("input", help="snapshot.json, extracted directory, or zip package")
-    p.add_argument("--output", default="analysis_output")
-    p.add_argument("--rules-config", default=str(Path(__file__).with_name("inspection_rules.json")))
-    args = p.parse_args()
-    output = Path(args.output).resolve()
-    output.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="sqlserver_inspection_") as tmp:
-        path = discover_snapshot(Path(args.input).resolve(), Path(tmp))
-        snapshot = normalize_snapshot(read_json(path))
-    config = read_json(Path(args.rules_config).resolve())
-    ignored_waits = {str(x).upper() for x in config.get("ignored_wait_types", [])}
-    snapshot["wait_stats"] = [x for x in snapshot.get("wait_stats", []) if str(x.get("wait_type", "")).upper() not in ignored_waits]
-    collected = snapshot.get("collection", {}).get("finished_at") or datetime.now().astimezone().isoformat()
-    try:
-        now = datetime.fromisoformat(str(collected).replace("Z", "+00:00"))
-    except ValueError:
-        now = datetime.now().astimezone()
-    findings = RuleEngine(config, now).evaluate(snapshot)
-    charts = build_charts(snapshot, findings, output / "charts")
-    model = build_model(snapshot, findings, charts)
-    write_json(output / "analysis.json", {"snapshot": snapshot, "findings": findings})
-    write_json(output / "report_model.json", model)
-    lines = [f"SQL Server 巡检分析完成", f"健康评分: {model['health']['score']} ({model['health']['grade']})", f"发现项: {len(findings)}", f"采集完整度: {model['collection_quality']['score_pct']}%"]
-    (output / "analysis_summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print("\n".join(lines))
-    print(f"报告模型: {output / 'report_model.json'}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

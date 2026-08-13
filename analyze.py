@@ -43,7 +43,7 @@ def build_command(db_type: str, source: Path, output: Path, rules_config: Path |
         return cmd
     if db_type == "sqlserver":
         default_rules = ROOT / "plugins" / "sqlserver" / "inspection_rules.json"
-        cmd = [sys.executable, str(ROOT / "plugins" / "sqlserver" / "analyze_inspection.py"), str(source), "--output", str(output)]
+        cmd = [sys.executable, str(ROOT / "analyze_sqlserver.py"), str(source), "--output", str(output)]
         cmd += ["--rules-config", str(rules_config or default_rules)]
         return cmd
     raise ValueError(f"unknown db_type: {db_type}")
