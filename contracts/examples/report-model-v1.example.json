@@ -1,0 +1,245 @@
+{
+  "contract": "db-inspection.report-model",
+  "schema_version": "1.0.0",
+  "generated_at": "2026-08-11T16:04:29+08:00",
+  "database": {
+    "engine": "mysql",
+    "version": "8.0.42",
+    "edition": "Community",
+    "extensions": {}
+  },
+  "target": {
+    "target_id": "db01_192.168.100.80_3306",
+    "display_name": "db01 MySQL 3306",
+    "environment": "internal",
+    "topology_mode": "single_instance",
+    "nodes": [
+      {
+        "node_id": "db01_192.168.100.80_3306",
+        "host": "db01",
+        "ip": "192.168.100.80",
+        "port": 3306,
+        "instance_name": null,
+        "role": "standalone_or_source",
+        "extensions": {}
+      }
+    ],
+    "extensions": {}
+  },
+  "cover": {
+    "title": "MySQL 数据库巡检分析报告",
+    "subtitle": null,
+    "inspection_target": "db01 MySQL 3306",
+    "inspection_date": "2026-08-11",
+    "report_version": "V1.0",
+    "classification": "内部资料"
+  },
+  "document_control": {
+    "customer": "内部回归基线",
+    "company": "内部基线",
+    "author": "王劲松",
+    "reviewer": "待复核",
+    "revision_history": [
+      {
+        "version": "V1.0",
+        "date": "2026-08-11",
+        "description": "首次生成",
+        "author": "王劲松"
+      }
+    ]
+  },
+  "scope": {
+    "started_at": "2026-08-11T16:01:02+08:00",
+    "finished_at": "2026-08-11T16:02:57+08:00",
+    "included_domains": ["capacity"],
+    "excluded_domains": [],
+    "limitations": ["短时采样不能代表全天业务高峰。"]
+  },
+  "quality": {
+    "score": 99.8,
+    "status": "partial",
+    "counts": {
+      "total": 79,
+      "ok": 78,
+      "non_ok": 1
+    },
+    "gaps": [
+      {
+        "check_id": "mysql.backup_verification",
+        "status": "external_evidence_required",
+        "reason": "主机侧采集不能证明备份可恢复。",
+        "recommended_action": "补充备份平台记录和恢复演练证据。"
+      }
+    ]
+  },
+  "health": {
+    "score": 45,
+    "grade": "D",
+    "status": "risk",
+    "risk_counts": {
+      "critical": 0,
+      "high": 1,
+      "medium": 0,
+      "low": 0,
+      "info": 0
+    }
+  },
+  "executive_summary": {
+    "overall_conclusion": "当前环境存在需要优先处理的容量风险。",
+    "highlights": ["/data 文件系统使用率超过阈值。"],
+    "limitations": ["备份可恢复性需要外部证据。"]
+  },
+  "sections": [
+    {
+      "section_id": "capacity",
+      "title": "容量与存储检查",
+      "order": 1,
+      "summary": "主数据盘空间不足，需要优先整改。",
+      "items": [
+        {
+          "check_id": "system.filesystems",
+          "title": "文件系统容量",
+          "domain": "capacity",
+          "order": 1,
+          "applicability": {
+            "status": "applicable",
+            "reason": null
+          },
+          "collection": {
+            "status": "ok",
+            "row_count": 1,
+            "reason": null
+          },
+          "evidence": [
+            {
+              "source_ref": "tables/filesystems.tsv#/data",
+              "check_id": "system.filesystems",
+              "description": "文件系统容量采集结果"
+            }
+          ],
+          "data": {
+            "kind": "table",
+            "columns": [
+              {"key": "mountpoint", "label": "挂载点", "type": "string", "unit": null, "sensitive": false},
+              {"key": "usage_percent", "label": "使用率", "type": "percent", "unit": "percent", "sensitive": false}
+            ],
+            "rows": [
+              {"mountpoint": "/data", "usage_percent": 93.2}
+            ],
+            "metrics": [],
+            "text": null,
+            "total_rows": 1,
+            "note": null
+          },
+          "evaluation_refs": ["eval-db01-filesystem-001"],
+          "analysis": {
+            "status": "risk",
+            "conclusion": "/data 使用率超过 90% 阈值。",
+            "impact": "可能造成数据库或日志写入失败。",
+            "recommendation": "尽快释放或扩展空间。"
+          },
+          "presentation": {
+            "location": "main",
+            "max_rows": 20,
+            "chart_refs": []
+          },
+          "extensions": {}
+        }
+      ],
+      "extensions": {}
+    }
+  ],
+  "rule_evaluations": [
+    {
+      "contract": "db-inspection.rule-evaluation",
+      "schema_version": "1.0.0",
+      "evaluation_id": "eval-db01-filesystem-001",
+      "rule_id": "COMMON.CAPACITY.FILESYSTEM_USAGE",
+      "finding_id": "R004",
+      "database_engine": "mysql",
+      "target_id": "db01_192.168.100.80_3306",
+      "node_id": "db01_192.168.100.80_3306",
+      "domain": "capacity",
+      "title": "文件系统使用率过高",
+      "applicability": {
+        "status": "applicable",
+        "reason": null,
+        "required_capabilities": []
+      },
+      "collection_status": "complete",
+      "evaluation_status": "triggered",
+      "severity_if_triggered": "high",
+      "facts": [
+        {"name": "filesystem_usage_percent", "value": 93.2, "unit": "percent", "source_ref": "tables/filesystems.tsv#/data", "observed_at": "2026-08-11T16:01:05+08:00"}
+      ],
+      "threshold": {"operator": ">=", "critical_percent": 90},
+      "reason": null,
+      "conclusion": "/data 文件系统使用率超过 90% 阈值。",
+      "impact": "剩余空间不足可能造成写入失败。",
+      "recommendation": {
+        "summary": "释放或扩展 /data 空间。",
+        "actions": ["确认增长来源。", "清理或扩容。"],
+        "owner_role": "DBA/系统管理员",
+        "target_window": "7 天内",
+        "requires_restart": false,
+        "verification": ["使用率降至阈值以下。"]
+      },
+      "evidence": [
+        {"source_ref": "tables/filesystems.tsv#/data", "check_id": "system.filesystems", "description": "文件系统容量采集结果"}
+      ],
+      "confidence": 1.0,
+      "evaluated_at": "2026-08-11T16:04:29+08:00",
+      "extensions": {}
+    }
+  ],
+  "risk_register": [
+    {
+      "risk_id": "R004",
+      "evaluation_ref": "eval-db01-filesystem-001",
+      "priority": "P1",
+      "severity": "high",
+      "title": "文件系统使用率过高",
+      "object_name": "/data",
+      "current_state": "使用率 93.2%",
+      "impact": "可能造成数据库或日志写入失败。",
+      "recommendation": "确认增长来源并释放或扩展空间。",
+      "owner": null,
+      "target_window": "7 天内",
+      "verification": "使用率降至阈值以下且写入任务正常。",
+      "status": "open"
+    }
+  ],
+  "remediation_plan": {
+    "phases": [
+      {
+        "phase_id": "P1",
+        "title": "立即处理",
+        "description": "优先消除可能影响可用性的风险。",
+        "risk_refs": ["R004"]
+      }
+    ]
+  },
+  "charts": [
+    {
+      "chart_id": "capacity.filesystem",
+      "title": "文件系统使用率",
+      "status": "skipped",
+      "file": null,
+      "reason": "示例未生成图表。",
+      "extensions": {}
+    }
+  ],
+  "appendix": {
+    "rule_coverage": {
+      "total": 1,
+      "triggered": 1,
+      "passed": 0,
+      "not_evaluated": 0,
+      "not_applicable": 0
+    },
+    "methodology": ["结论由确定性规则生成。"],
+    "disclaimers": ["变更前必须完成备份、测试和回滚评估。"],
+    "extensions": {}
+  },
+  "extensions": {}
+}

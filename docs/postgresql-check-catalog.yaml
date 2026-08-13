@@ -1,0 +1,73 @@
+catalog_version: "0.1"
+as_of: "2026-08-11"
+database: postgresql
+scope: "PostgreSQL 2.0.1 分析插件、36 条规则、14 个报告项和公共 Word 契约"
+
+contracts:
+  source_analyzer_version: "2.0.1"
+  source_analysis_schema: "2.0"
+  legacy_report_model: report_model_legacy.json
+  report_contract: postgresql_inspection_report_model
+  report_schema: "2.0"
+  word_renderer: inspection_core/word_engine.py
+  word_profile: plugins/postgresql/word_report.py
+
+report_sections:
+  - {id: system_environment, item_id: pg.instance, title: "实例基础信息"}
+  - {id: system_info, item_id: system.host, title: "操作系统信息"}
+  - {id: filesystem_capacity, item_id: system.filesystems, title: "文件系统容量"}
+  - {id: connections, item_id: pg.connections, title: "连接与会话"}
+  - {id: space_usage, item_id: pg.space, title: "空间使用"}
+  - {id: performance, item_id: pg.performance, title: "性能"}
+  - {id: vacuum, item_id: pg.vacuum, title: "VACUUM 与维护"}
+  - {id: replication, item_id: pg.replication, title: "复制"}
+  - {id: indexes, item_id: pg.indexes, title: "索引分析"}
+  - {id: security, item_id: pg.security, title: "安全配置"}
+  - {id: backup, item_id: pg.backup, title: "备份策略"}
+  - {id: logs, item_id: pg.logs, title: "日志摘要"}
+  - {id: settings, item_id: pg.settings, title: "关键参数"}
+  - {id: objects, item_id: pg.objects, title: "对象统计"}
+
+rules:
+  - COMMON.COLLECTION.QUALITY
+  - COMMON.COLLECTION.ERRORS
+  - COMMON.SYSTEM.CPU
+  - COMMON.SYSTEM.IOWAIT
+  - COMMON.SYSTEM.DISK_UTIL
+  - COMMON.SYSTEM.MEMORY
+  - PG.CACHE.HIT_RATIO
+  - PG.CONNECTION.USAGE
+  - PG.VACUUM.DEAD_TUPLE
+  - PG.VACUUM.DEAD_RATIO
+  - PG.VACUUM.STALE
+  - PG.BLOAT.TABLE
+  - PG.INDEX.UNUSED
+  - PG.INDEX.DUPLICATE
+  - PG.REPLICATION.LAG
+  - PG.WAL.ARCHIVE
+  - PG.AGE.XID
+  - PG.LONG.TRANSACTION
+  - PG.LOCK.WAIT
+  - PG.PARTITION.COUNT
+  - PG.BACKUP.CONFIGURED
+  - PG.SECURITY.AUTH
+  - PG.SECURITY.PASSWORD
+  - PG.SETTINGS.AUTOVACUUM
+  - PG.SETTINGS.WAL_LEVEL
+  - PG.SETTINGS.ARCHIVE
+  - PG.STORAGE.NO_PRIMARY_KEY
+  - PG.SECURITY.SSL
+  - PG.REPLICATION.SLOT_INACTIVE
+  - PG.SETTINGS.SLOW_QUERY_LOG
+  - PG.SETTINGS.IDLE_TIMEOUT
+  - PG.SETTINGS.STATEMENT_TIMEOUT
+  - PG.FILESYSTEM.DATA_DIR
+  - PG.INDEX.INVALID
+  - PG.ROLE.SUPERUSER_COUNT
+  - PG.LOG.CONFIG
+
+known_boundaries:
+  - "当前只接入分析和报告；D:\\AI\\PG\\GPT\\pg_inspection_standard.sh 仍是独立采集器，尚未改写。"
+  - "旧 PG 报告严重性 critical/warning/info 在标准报告契约中映射为 high/medium/low，同时保留 source_severity。"
+  - "旧报告模型不携带 manifest 校验明细，公共报告明确显示 not_evaluated，不伪造为完整。"
+  - "备份主机线索缺失只形成 not_evaluated；需补充备份平台、成功记录和恢复演练证据。"

@@ -1,0 +1,208 @@
+catalog_version: "0.1"
+as_of: "2026-08-11"
+database: mysql
+scope: "当前采集器、分析器、规则和报告项的现状目录"
+# PostgreSQL 已单独登记在 docs/postgresql-check-catalog.yaml，避免把两种数据库的专属检查混在一个目录中。
+# Oracle 当前以 tests/baselines/oracle/current/baseline.json 冻结 48 个巡检项与 34 条规则统计，待分析插件稳定后再单独登记 check catalog。
+# SQL Server 当前以 tests/baselines/sqlserver/current/baseline.json 冻结 27 个巡检项与 14 条规则统计，待分析插件稳定后再单独登记 check catalog。
+status_values:
+  collection: [ok, empty, unsupported, not_applicable, skipped, partial, permission_denied, timeout, error]
+  evaluation: [triggered, passed, not_evaluated, not_applicable]
+  report_analysis: [ok, normal, attention, risk, not_evaluated, not_applicable]
+
+contracts:
+  collector_version: "1.1.0"
+  package_version: "1.0"
+  snapshot_schema: "1.0"
+  analysis_version: "2.1.0"
+  analysis_schema: "2.0"
+  report_contract: mysql_inspection_report_model
+  report_schema: "2.0"
+  generator_version: "4.2.0"
+  word_layouts: [professional, legacy]
+  word_renderer: inspection_core/word_engine.py
+  word_profile: plugins/mysql/word_report.py
+
+# 采集项由 mysql_inspection_standard.sh 的 item_id 汇总。
+# artifact 是采集包内路径；同一个 item 在不同能力分支下可能成功、跳过或不适用。
+collector_items:
+  system_static:
+    - {id: system.os_release, artifact: evidence/os_release.txt}
+    - {id: system.time_status, artifact: evidence/time_status.txt}
+    - {id: system.timedatectl, artifact: evidence/timedatectl.txt}
+    - {id: system.chronyc_tracking, artifact: evidence/chronyc_tracking.txt}
+    - {id: system.chronyc_sources, artifact: evidence/chronyc_sources.txt}
+    - {id: system.ntpq_peers, artifact: evidence/ntpq_peers.txt}
+    - {id: system.lscpu, artifact: evidence/lscpu.txt}
+    - {id: system.free, artifact: tables/memory_snapshot.tsv}
+    - {id: system.filesystems, artifact: tables/filesystems.tsv}
+    - {id: system.inodes, artifact: tables/inodes.tsv}
+    - {id: system.block_devices, artifact: tables/block_devices.tsv}
+    - {id: system.ip_address, artifact: evidence/ip_address.txt}
+    - {id: system.ifconfig, artifact: evidence/ip_address.txt}
+    - {id: system.ip_route, artifact: evidence/ip_route.txt}
+    - {id: system.socket_summary, artifact: evidence/socket_summary.txt}
+    - {id: system.numa, artifact: evidence/numa.txt}
+    - {id: system.sysctl_selected, artifact: tables/kernel_parameters.tsv}
+    - {id: system.hugepages, artifact: tables/hugepages.tsv}
+    - {id: system.mysql_processes, artifact: evidence/mysql_processes.txt}
+    - {id: system.mycnf_allowlist, artifact: tables/mycnf_allowlist.tsv}
+  sampling:
+    - {id: timeseries.realtime_sampling, artifact: timeseries/}
+    - {id: system.sar_history, artifact: history/}
+  mysql_capabilities:
+    - {id: mysql.capability_probe, artifact: tables/capabilities.tsv}
+  mysql_basic:
+    - {id: mysql.global_variables, artifact: tables/global_variables.tsv}
+    - {id: mysql.global_status, artifact: tables/global_status.tsv}
+    - {id: mysql.engines, artifact: tables/engines.tsv}
+    - {id: mysql.plugins, artifact: tables/plugins.tsv}
+    - {id: mysql.schemas, artifact: tables/schemas.tsv}
+    - {id: mysql.innodb_status, artifact: evidence/innodb_status.tsv}
+    - {id: mysql.open_tables, artifact: tables/open_tables.tsv}
+  mysql_capacity:
+    - {id: mysql.database_sizes, artifact: tables/database_sizes.tsv}
+    - {id: mysql.object_counts, artifact: tables/object_counts.tsv}
+    - {id: mysql.large_tables, artifact: tables/large_tables_top.tsv}
+    - {id: mysql.fragmentation, artifact: tables/fragmentation_top.tsv}
+    - {id: mysql.no_primary_key_summary, artifact: tables/no_primary_key_summary.tsv}
+    - {id: mysql.no_primary_key, artifact: tables/no_primary_key_top.tsv}
+    - {id: mysql.auto_increment_usage, artifact: tables/auto_increment_usage.tsv}
+    - {id: mysql.partition_summary, artifact: tables/partition_summary.tsv}
+    - {id: mysql.non_innodb_tables, artifact: tables/non_innodb_tables.tsv}
+  mysql_performance:
+    - {id: mysql.long_transactions, artifact: tables/long_transactions.tsv}
+    - {id: mysql.metadata_locks, artifact: tables/metadata_locks_pending.tsv}
+    - {id: mysql.data_lock_waits, artifact: tables/data_lock_waits.tsv}
+    - {id: mysql.processlist, artifact: tables/processlist.tsv}
+    - {id: mysql.sql_digests, artifact: tables/sql_digests_top.tsv}
+    - {id: mysql.redundant_indexes, artifact: tables/redundant_indexes.tsv}
+    - {id: mysql.unused_indexes, artifact: tables/unused_indexes.tsv}
+    - {id: mysql.table_io_top, artifact: tables/table_io_top.tsv}
+    - {id: mysql.file_io_top, artifact: tables/file_io_top.tsv}
+    - {id: mysql.wait_events_top, artifact: tables/wait_events_top.tsv}
+  mysql_replication:
+    - {id: mysql.replica_status, artifact: tables/replica_status.tsv}
+    - {id: mysql.binary_log_status, artifact: tables/binary_log_status.tsv}
+    - {id: mysql.binary_logs, artifact: tables/binary_logs.tsv}
+    - {id: mysql.replication_channels, artifact: tables/replication_channels.tsv}
+    - {id: mysql.replication_workers, artifact: tables/replication_workers.tsv}
+    - {id: mysql.group_replication_members, artifact: tables/group_replication_members.tsv}
+    - {id: mysql.group_replication_stats, artifact: tables/group_replication_stats.tsv}
+    - {id: mysql.wsrep_variables, artifact: tables/wsrep_variables.tsv}
+    - {id: mysql.wsrep_status, artifact: tables/wsrep_status.tsv}
+  mysql_security_objects:
+    - {id: mysql.accounts, artifact: tables/accounts.tsv}
+    - {id: mysql.schema_privileges, artifact: tables/schema_privileges.tsv}
+    - {id: mysql.user_privileges, artifact: tables/user_privileges.tsv}
+    - {id: mysql.events, artifact: tables/events.tsv}
+    - {id: mysql.routines, artifact: tables/routines.tsv}
+    - {id: mysql.triggers, artifact: tables/triggers.tsv}
+  mysql_logs_backup:
+    - {id: mysql.log_file_metadata, artifact: tables/log_files.tsv}
+    - {id: mysql.error_log_summary, artifact: tables/error_log_summary.tsv}
+    - {id: mysql.error_log_samples, artifact: tables/error_log_samples.tsv}
+    - {id: mysql.error_log_tail, artifact: evidence/error_log_tail.txt}
+    - {id: system.backup_cron, artifact: evidence/backup_cron.txt}
+    - {id: system.backup_timers, artifact: evidence/backup_timers.txt}
+    - {id: system.backup_processes, artifact: evidence/backup_processes.txt}
+  package:
+    - {id: package.security_scan, artifact: logs/security_scan_findings.txt}
+
+# 当前 report_model.json 中的 9 个章节、33 个 item。
+report_sections:
+  - id: system_environment
+    title: "系统与环境检查"
+    items:
+      - {id: system.host, source: snapshot.json#host_identity}
+      - {id: system.time, source: snapshot.json#time_evidence}
+      - {id: system.filesystems, source: tables/filesystems.tsv}
+      - {id: system.kernel, source: tables/kernel_parameters.tsv}
+  - id: mysql_instance
+    title: "MySQL 实例与组件检查"
+    items:
+      - {id: mysql.basic, source: snapshot.json#instance_identity}
+      - {id: mysql.schemas, source: tables/schemas.tsv}
+      - {id: mysql.engines, source: tables/engines.tsv}
+      - {id: mysql.plugins, source: tables/plugins.tsv}
+  - id: system_performance
+    title: "操作系统性能检查"
+    items:
+      - {id: system.performance.resources, source: "timeseries/system_cpu.csv; timeseries/system_memory.csv"}
+      - {id: system.performance.disk, source: timeseries/system_disk.csv}
+      - {id: system.performance.network, source: timeseries/system_network.csv}
+  - id: mysql_configuration
+    title: "MySQL 参数配置检查"
+    items:
+      - {id: mysql.config.memory, source: tables/global_variables.tsv}
+      - {id: mysql.config.connection, source: tables/global_variables.tsv}
+      - {id: mysql.config.durability, source: tables/global_variables.tsv}
+      - {id: mysql.config.charset, source: tables/global_variables.tsv}
+      - {id: mysql.config.file, source: tables/mycnf_allowlist.tsv}
+  - id: mysql_runtime
+    title: "MySQL 运行状态检查"
+    items:
+      - {id: mysql.runtime.metrics, source: timeseries/mysql_status.csv}
+      - {id: mysql.runtime.sessions, source: tables/processlist.tsv}
+      - {id: mysql.runtime.locks, source: "tables/long_transactions.tsv; tables/data_lock_waits.tsv; tables/metadata_locks_pending.tsv"}
+  - id: capacity_objects
+    title: "容量与对象检查"
+    items:
+      - {id: mysql.capacity.schemas, source: tables/database_sizes.tsv}
+      - {id: mysql.capacity.objects, source: tables/object_counts.tsv}
+      - {id: mysql.capacity.risks, source: "tables/no_primary_key_summary.tsv; tables/non_innodb_tables.tsv; tables/auto_increment_usage.tsv; tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; tables/unused_indexes.tsv"}
+  - id: sql_io
+    title: "SQL、等待与文件 I/O 检查"
+    items:
+      - {id: mysql.sql.digest, source: tables/sql_digests_top.tsv}
+      - {id: mysql.waits, source: tables/wait_events_top.tsv}
+      - {id: mysql.file_io, source: tables/file_io_top.tsv}
+  - id: security
+    title: "账号与权限检查"
+    items:
+      - {id: mysql.security.accounts, source: tables/accounts.tsv}
+      - {id: mysql.security.privileges, source: tables/user_privileges.tsv}
+  - id: logs_backup_replication
+    title: "日志、备份与复制检查"
+    items:
+      - {id: mysql.logs.files, source: tables/log_files.tsv}
+      - {id: mysql.logs.summary, source: tables/error_log_summary.tsv}
+      - {id: mysql.replication.binlog, source: tables/binary_log_status.tsv}
+      - {id: mysql.replication.binlog.files, source: tables/binary_logs.tsv}
+      - {id: mysql.replication.status, source: "tables/replica_status.tsv; tables/group_replication_members.tsv"}
+      - {id: mysql.backup, source: evidence/backup_*.txt}
+
+rules:
+  - {id: COMMON.COLLECTION.INTEGRITY, category: collection, severity: high, check: manifest_integrity}
+  - {id: COMMON.COLLECTION.QUALITY, category: collection, severity: medium, threshold: {quality_score_min: 80}}
+  - {id: COMMON.SYSTEM.TIME_SYNC, category: system, severity: medium}
+  - {id: COMMON.SYSTEM.CPU_PRESSURE, category: system, severity: medium, threshold: {cpu_peak_warning: 90}}
+  - {id: COMMON.SYSTEM.IOWAIT_PRESSURE, category: system, severity: medium, threshold: {iowait_peak_warning: 20}}
+  - {id: COMMON.SYSTEM.MEMORY_PRESSURE, category: system, severity: medium, threshold: {memory_usage_warning: 90}}
+  - {id: MYSQL.SECURITY.ROOT_REMOTE, category: security, severity: high}
+  - {id: MYSQL.INNODB.BUFFER_POOL_RATIO, category: performance, severity: medium, threshold: {buffer_pool_ratio_min: 0.4, buffer_pool_ratio_max: 0.85}}
+  - {id: MYSQL.PERFORMANCE.TMP_DISK_RATIO, category: performance, severity: medium, threshold: {tmp_disk_ratio_warning: 0.25}}
+  - {id: MYSQL.INNODB.BUFFER_POOL_MISS, category: performance, severity: medium, threshold: {buffer_pool_miss_warning: 0.01}}
+  - {id: MYSQL.PERFORMANCE.TABLE_CACHE_MISS, category: performance, severity: medium, threshold: {table_cache_miss_warning: 0.1}}
+  - {id: MYSQL.CONNECTION.USAGE, category: performance, severity: high, threshold: {connection_usage_warning: 0.85}}
+  - {id: COMMON.CAPACITY.FILESYSTEM_USAGE, category: capacity, severity: high, threshold: {filesystem_usage_critical: 90}}
+  - {id: MYSQL.SCHEMA.NO_PRIMARY_KEY, category: schema, severity: medium}
+  - {id: MYSQL.SCHEMA.REDUNDANT_INDEX, category: schema, severity: low}
+  - {id: MYSQL.SCHEMA.AUTO_INCREMENT_CAPACITY, category: schema, severity: medium}
+  - {id: MYSQL.SCHEMA.FRAGMENTATION, category: schema, severity: low}
+  - {id: MYSQL.SCHEMA.NON_INNODB, category: schema, severity: medium}
+  - {id: MYSQL.SQL.NO_INDEX_DIGEST, category: performance, severity: medium, threshold: {no_index_exec_min: 100, no_index_seconds_min: 60}}
+  - {id: MYSQL.TRANSACTION.LONG_RUNNING, category: performance, severity: high, threshold: {long_transaction_seconds: 300}}
+  - {id: MYSQL.LOCK.WAITING, category: performance, severity: high}
+  - {id: MYSQL.REPLICATION.HEALTH, category: availability, severity: high, threshold: {replication_lag_seconds: 60}}
+  - {id: MYSQL.LOG.ERROR_EVENTS, category: availability, severity: medium}
+  - {id: MYSQL.BACKUP.RECENT_SUCCESS, category: backup, severity: high}
+
+known_mapping_gaps:
+  - "采集项、规则和报告项尚无统一 check manifest；本文件目前是人工冻结目录。"
+  - "inspection_rules.json 只配置元数据和阈值，新增规则仍需修改 plugins/mysql/rules.py。"
+  - "部分采集项只用于能力判断或派生指标，不直接出现在 Word。"
+  - "events、routines、triggers、schema_privileges、table_io_top、open_tables 等已采集，但当前没有独立报告 item。"
+  - "备份检查只能看到主机侧线索，不能证明备份成功或可恢复。"
+  - "所有 TSV 缺少逐检查项 schema_version，字段变化当前依赖 MySQL package adapter/metrics 兼容。"
+  - "当前两个报告 item 使用 analysis.status=ok，其余正常项使用 normal；统一报告契约时需要版本化迁移。"

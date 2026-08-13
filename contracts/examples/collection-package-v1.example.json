@@ -1,0 +1,102 @@
+{
+  "contract": "db-inspection.collection-package",
+  "schema_version": "1.0.0",
+  "package_id": "mysql-db01-20260811T160102+0800",
+  "created_at": "2026-08-11T16:02:57+08:00",
+  "database": {
+    "engine": "mysql",
+    "version": "8.0.42",
+    "edition": "Community",
+    "family": "mysql",
+    "extensions": {}
+  },
+  "target": {
+    "target_id": "db01_192.168.100.80_3306",
+    "display_name": "db01 MySQL 3306",
+    "environment": "internal",
+    "topology_mode": "single_instance",
+    "nodes": [
+      {
+        "node_id": "db01_192.168.100.80_3306",
+        "host": "db01",
+        "ip": "192.168.100.80",
+        "port": 3306,
+        "instance_name": null,
+        "service_name": null,
+        "role": "standalone_or_source",
+        "extensions": {}
+      }
+    ],
+    "extensions": {}
+  },
+  "collector": {
+    "name": "mysql_inspection_standard",
+    "version": "1.1.0",
+    "source_package_version": "1.0",
+    "started_at": "2026-08-11T16:01:02+08:00",
+    "finished_at": "2026-08-11T16:02:57+08:00",
+    "timezone": "Asia/Shanghai",
+    "sampling": {
+      "mode": "standard"
+    },
+    "extensions": {}
+  },
+  "capabilities": [
+    {
+      "capability_id": "mysql.performance_schema",
+      "status": "supported",
+      "reason": null,
+      "evidence_refs": ["tables/capabilities.tsv"],
+      "extensions": {}
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "system.filesystems",
+      "category": "system.capacity",
+      "schema_version": "1.0.0",
+      "node_id": "db01_192.168.100.80_3306",
+      "status": "ok",
+      "started_at": "2026-08-11T16:01:05+08:00",
+      "finished_at": "2026-08-11T16:01:05+08:00",
+      "duration_ms": 25,
+      "row_count": 4,
+      "artifact": {
+        "path": "tables/filesystems.tsv",
+        "format": "tsv",
+        "media_type": "text/tab-separated-values",
+        "bytes": 512,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "schema_ref": "checks/system.filesystems/1.0.0",
+        "extensions": {}
+      },
+      "reason": null,
+      "error_code": null,
+      "extensions": {}
+    },
+    {
+      "check_id": "mysql.data_lock_waits",
+      "category": "mysql.performance",
+      "schema_version": "1.0.0",
+      "node_id": "db01_192.168.100.80_3306",
+      "status": "empty",
+      "started_at": "2026-08-11T16:01:30+08:00",
+      "finished_at": "2026-08-11T16:01:30+08:00",
+      "duration_ms": 18,
+      "row_count": 0,
+      "reason": null,
+      "error_code": null,
+      "extensions": {}
+    }
+  ],
+  "integrity": {
+    "status": "passed",
+    "algorithm": "sha256",
+    "files_count": 113,
+    "manifest_ref": "manifest.json",
+    "failures": [],
+    "extensions": {}
+  },
+  "extensions": {}
+}
+

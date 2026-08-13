@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://db-inspection.local/contracts/rule-model-v1.schema.json",
+  "title": "Database Inspection Rule Evaluation Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "evaluation_id",
+    "rule_id",
+    "database_engine",
+    "target_id",
+    "domain",
+    "title",
+    "applicability",
+    "collection_status",
+    "evaluation_status",
+    "severity_if_triggered",
+    "facts",
+    "evidence",
+    "confidence",
+    "evaluated_at"
+  ],
+  "properties": {
+    "contract": {"const": "db-inspection.rule-evaluation"},
+    "schema_version": {"$ref": "#/$defs/semver"},
+    "evaluation_id": {"type": "string", "minLength": 1},
+    "rule_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]+$"},
+    "finding_id": {"type": ["string", "null"]},
+    "database_engine": {
+      "type": "string",
+      "enum": ["mysql", "postgresql", "oracle", "sqlserver"]
+    },
+    "target_id": {"type": "string", "minLength": 1},
+    "node_id": {"type": ["string", "null"]},
+    "domain": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "minLength": 1},
+    "applicability": {"$ref": "#/$defs/applicability"},
+    "collection_status": {
+      "type": "string",
+      "enum": ["complete", "partial", "unavailable", "not_applicable"]
+    },
+    "evaluation_status": {
+      "type": "string",
+      "enum": ["triggered", "passed", "not_evaluated", "not_applicable"]
+    },
+    "severity_if_triggered": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low", "info"]
+    },
+    "facts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/fact"}
+    },
+    "threshold": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    },
+    "reason": {"type": ["string", "null"]},
+    "conclusion": {"type": ["string", "null"]},
+    "impact": {"type": ["string", "null"]},
+    "recommendation": {"$ref": "#/$defs/recommendation"},
+    "evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "evaluated_at": {"type": "string", "format": "date-time"},
+    "extensions": {"type": "object", "additionalProperties": true}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"evaluation_status": {"const": "triggered"}}},
+      "then": {
+        "required": ["finding_id", "conclusion", "impact", "recommendation"],
+        "properties": {"finding_id": {"type": "string", "minLength": 1}}
+      }
+    },
+    {
+      "if": {"properties": {"evaluation_status": {"const": "passed"}}},
+      "then": {
+        "required": ["conclusion"],
+        "properties": {"conclusion": {"type": "string", "minLength": 1}}
+      }
+    },
+    {
+      "if": {"properties": {"evaluation_status": {"enum": ["not_evaluated", "not_applicable"]}}},
+      "then": {
+        "required": ["reason"],
+        "properties": {"reason": {"type": "string", "minLength": 1}}
+      }
+    }
+  ],
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "applicability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason", "required_capabilities"],
+      "properties": {
+        "status": {"type": "string", "enum": ["applicable", "not_applicable", "unknown"]},
+        "reason": {"type": ["string", "null"]},
+        "required_capabilities": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "jsonValue": {
+      "type": ["string", "number", "integer", "boolean", "object", "array", "null"]
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value": {"$ref": "#/$defs/jsonValue"},
+        "unit": {"type": ["string", "null"]},
+        "source_ref": {"type": ["string", "null"]},
+        "observed_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref"],
+      "properties": {
+        "source_ref": {"type": "string", "minLength": 1},
+        "check_id": {"type": ["string", "null"]},
+        "description": {"type": ["string", "null"]}
+      }
+    },
+    "recommendation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["summary", "actions", "requires_restart", "verification"],
+      "properties": {
+        "summary": {"type": "string", "minLength": 1},
+        "actions": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "owner_role": {"type": ["string", "null"]},
+        "target_window": {"type": ["string", "null"]},
+        "requires_restart": {"type": "boolean"},
+        "verification": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

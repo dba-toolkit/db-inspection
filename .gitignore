@@ -1,0 +1,31 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ---- 敏感采集包与输出（内部数据，不提交）----
+*.tar.gz
+*.zip
+output/
+analysis_output*/
+tests/baselines/
+
+# ---- 临时 / 运行时 ----
+_work/
+*.log
+tmp/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Agent / 工具目录 ----
+.codex/
+.agents/
+.workbuddy/

@@ -1,0 +1,68 @@
+{
+  "contract": "db-inspection.rule-evaluation",
+  "schema_version": "1.0.0",
+  "evaluation_id": "eval-db01-filesystem-001",
+  "rule_id": "COMMON.CAPACITY.FILESYSTEM_USAGE",
+  "finding_id": "R004",
+  "database_engine": "mysql",
+  "target_id": "db01_192.168.100.80_3306",
+  "node_id": "db01_192.168.100.80_3306",
+  "domain": "capacity",
+  "title": "文件系统使用率过高",
+  "applicability": {
+    "status": "applicable",
+    "reason": null,
+    "required_capabilities": []
+  },
+  "collection_status": "complete",
+  "evaluation_status": "triggered",
+  "severity_if_triggered": "high",
+  "facts": [
+    {
+      "name": "filesystem_usage_percent",
+      "value": 93.2,
+      "unit": "percent",
+      "source_ref": "tables/filesystems.tsv#/data",
+      "observed_at": "2026-08-11T16:01:05+08:00"
+    },
+    {
+      "name": "mountpoint",
+      "value": "/data",
+      "unit": null,
+      "source_ref": "tables/filesystems.tsv#/data",
+      "observed_at": "2026-08-11T16:01:05+08:00"
+    }
+  ],
+  "threshold": {
+    "operator": ">=",
+    "critical_percent": 90
+  },
+  "reason": null,
+  "conclusion": "/data 文件系统使用率超过 90% 阈值。",
+  "impact": "剩余空间不足可能造成数据文件、临时文件或日志写入失败。",
+  "recommendation": {
+    "summary": "确认增长来源并尽快释放或扩展 /data 空间。",
+    "actions": [
+      "确认数据库文件、日志和备份文件的空间占用。",
+      "完成业务影响评估后清理过期文件或扩容。"
+    ],
+    "owner_role": "DBA/系统管理员",
+    "target_window": "7 天内",
+    "requires_restart": false,
+    "verification": [
+      "文件系统使用率降至阈值以下。",
+      "确认数据库和备份任务无写入错误。"
+    ]
+  },
+  "evidence": [
+    {
+      "source_ref": "tables/filesystems.tsv#/data",
+      "check_id": "system.filesystems",
+      "description": "文件系统容量采集结果"
+    }
+  ],
+  "confidence": 1.0,
+  "evaluated_at": "2026-08-11T16:04:29+08:00",
+  "extensions": {}
+}
+

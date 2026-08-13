@@ -1,0 +1,363 @@
+{
+  "_comment": "Oracle 巡检规则 — 阈值在此热更新，无需改代码",
+  "version": "2.0",
+
+  "globals": {
+    "tablespace_warning_pct": 80,
+    "tablespace_critical_pct": 95,
+    "asm_warning_pct": 80,
+    "fra_warning_pct": 80,
+    "failed_login_warning": 10,
+    "archive_switch_warning_per_hour": 30,
+    "buffer_cache_hit_warning": 90,
+    "sort_disk_warning_pct": 5,
+    "cpu_peak_warning": 90,
+    "iowait_peak_warning": 20,
+    "memory_usage_warning": 90,
+    "filesystem_usage_critical": 90,
+    "quality_score_min": 80
+  },
+
+  "rules": {
+    "ORA.COLLECTION.INTEGRITY": {
+      "category": "collection",
+      "severity": "high",
+      "confidence": 1.0,
+      "title": "采集包完整性校验失败",
+      "summary": "采集包存在缺失或哈希不一致，分析结果不可直接采信。",
+      "recommendation": "重新采集并传输完整压缩包。",
+      "evidence_refs": ["manifest.json"]
+    },
+    "ORA.COLLECTION.QUALITY": {
+      "category": "collection",
+      "severity": "medium",
+      "confidence": 1.0,
+      "threshold": { "quality_score_min": 80 },
+      "title": "采集数据完整度偏低",
+      "summary": "关键采集项缺失可能使部分检查无法执行。",
+      "recommendation": "检查失败采集项并在补足权限后重采。",
+      "evidence_refs": ["collection_status"]
+    },
+    "ORA.SYSTEM.TIME_SYNC": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.95,
+      "title": "服务器时间未同步",
+      "summary": "时间不同步会影响日志关联、故障诊断时间线和多节点一致性。",
+      "recommendation": "启用并验证 NTP/Chrony 服务，统一各节点时区。",
+      "evidence_refs": ["snapshot.json#time_evidence"]
+    },
+    "ORA.SYSTEM.CPU_PRESSURE": {
+      "category": "system",
+      "severity": "medium",
+      "threshold": { "cpu_peak_warning": 90 },
+      "title": "CPU 使用率出现高峰",
+      "summary": "持续 CPU 高负载可能造成数据库响应时间抖动。",
+      "recommendation": "结合业务高峰历史与运行队列确认持续性，再定位高 CPU SQL 或系统进程。",
+      "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
+    },
+    "ORA.SYSTEM.IOWAIT_PRESSURE": {
+      "category": "system",
+      "severity": "medium",
+      "threshold": { "iowait_peak_warning": 20 },
+      "title": "CPU IO wait 出现高峰",
+      "summary": "较高 IO wait 可能表明存储响应不足或集中写入。",
+      "recommendation": "关联磁盘 util、数据库物理读写和存储层监控。",
+      "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
+    },
+    "ORA.SYSTEM.MEMORY_PRESSURE": {
+      "category": "system",
+      "severity": "medium",
+      "threshold": { "memory_usage_warning": 90 },
+      "title": "主机内存使用率偏高",
+      "summary": "持续内存压力可能触发回收或交换，影响数据库稳定性。",
+      "recommendation": "结合 available、swap、OOM 记录和 Oracle SGA/PGA 预算综合判断。",
+      "evidence_refs": ["history/sar_memory.csv", "timeseries/system_memory.csv"]
+    },
+    "ORA.CAPACITY.FILESYSTEM_USAGE": {
+      "category": "capacity",
+      "severity": "high",
+      "confidence": 0.95,
+      "threshold": { "filesystem_usage_critical": 90 },
+      "title": "文件系统使用率过高",
+      "summary": "高使用率会增加数据库写入失败和服务中断风险。",
+      "recommendation": "确认数据/归档/备份目录对应挂载点，清理或扩容并设置容量告警。",
+      "evidence_refs": ["tables/filesystems.tsv"]
+    },
+    "ORA.STORAGE.TABLESPACE": {
+      "category": "storage",
+      "severity": "high",
+      "confidence": 1.0,
+      "threshold": { "tablespace_warning_pct": 80, "tablespace_critical_pct": 95 },
+      "title": "表空间使用率过高",
+      "summary": "表空间使用率超过告警阈值，可能存在空间不足风险。",
+      "recommendation": "扩容数据文件或添加新数据文件，清理历史归档和备份。",
+      "evidence_refs": ["tables/表空间使用情况.tsv"]
+    },
+    "ORA.STORAGE.ASM": {
+      "category": "storage",
+      "severity": "high",
+      "confidence": 1.0,
+      "threshold": { "asm_warning_pct": 80 },
+      "title": "ASM 磁盘组告警",
+      "summary": "ASM 磁盘组使用率超过阈值或状态异常。",
+      "recommendation": "添加磁盘扩容磁盘组，检查磁盘健康状态。",
+      "evidence_refs": ["tables/asm_diskgroup_summary.tsv"]
+    },
+    "ORA.STORAGE.FRA": {
+      "category": "storage",
+      "severity": "high",
+      "confidence": 1.0,
+      "threshold": { "fra_warning_pct": 80 },
+      "title": "快速恢复区使用率告警",
+      "summary": "FRA 使用率超过阈值，可能影响归档和备份。",
+      "recommendation": "扩展 FRA 大小或迁移到更大存储，清理过期归档和备份。",
+      "evidence_refs": ["tables/FRA使用统计.tsv"]
+    },
+    "ORA.OBJECT.INVALID": {
+      "category": "objects",
+      "severity": "medium",
+      "confidence": 0.95,
+      "title": "存在无效数据库对象",
+      "summary": "数据库中存在状态为 INVALID 的对象。",
+      "recommendation": "编译或重建无效对象，定位依赖链问题。",
+      "evidence_refs": ["tables/无效对象检查.tsv"]
+    },
+    "ORA.TXN.LONG": {
+      "category": "transactions",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "长时间未提交事务",
+      "summary": "存在运行超过巡检阈值的事务，可能积压 UNDO。",
+      "recommendation": "排查长事务来源，评估回滚或提交。",
+      "evidence_refs": ["tables/长事务检查.tsv"]
+    },
+    "ORA.LOCK.BLOCKING": {
+      "category": "transactions",
+      "severity": "high",
+      "confidence": 0.95,
+      "title": "锁等待/阻塞",
+      "summary": "发现会话间的锁等待或阻塞链。",
+      "recommendation": "定位阻塞源头，评估 kill session 或修改业务逻辑。",
+      "evidence_refs": ["tables/锁等待链.tsv"]
+    },
+    "ORA.ARCHIVE.MODE": {
+      "category": "backup",
+      "severity": "critical",
+      "confidence": 1.0,
+      "title": "数据库未开启归档模式",
+      "summary": "生产环境应开启 ARCHIVELOG 模式以保证可恢复性。",
+      "recommendation": "规划维护窗口，开启归档模式并确认归档路径。",
+      "evidence_refs": ["tables/归档模式检查.tsv"]
+    },
+    "ORA.BACKUP.RECENT": {
+      "category": "backup",
+      "severity": "high",
+      "confidence": 0.85,
+      "title": "近期无成功备份",
+      "summary": "近 48 小时未检测到成功的 RMAN 备份。",
+      "recommendation": "检查 RMAN 备份调度、日志和存储空间。",
+      "evidence_refs": ["tables/最近RMAN备份任务状态.tsv"]
+    },
+    "ORA.DATA.BLOCK_CORRUPTION": {
+      "category": "data",
+      "severity": "critical",
+      "confidence": 1.0,
+      "title": "数据库物理坏块",
+      "summary": "V$DATABASE_BLOCK_CORRUPTION 返回坏块记录。",
+      "recommendation": "立即使用 RMAN BLOCKRECOVER 恢复，排查存储原因。",
+      "evidence_refs": ["tables/数据库坏块记录.tsv"]
+    },
+    "ORA.DATA.FILE_HEADER": {
+      "category": "data",
+      "severity": "high",
+      "confidence": 1.0,
+      "title": "数据文件头异常",
+      "summary": "数据文件头存在离线、需恢复、模糊或错误状态。",
+      "recommendation": "检查文件系统与存储，必要时执行 RECOVER DATAFILE。",
+      "evidence_refs": ["tables/数据文件头异常.tsv"]
+    },
+    "ORA.DATA.CHECKSUM": {
+      "category": "data",
+      "severity": "medium",
+      "confidence": 1.0,
+      "title": "块校验参数未开启",
+      "summary": "db_block_checksum 或 db_lost_write_protect 未启用。",
+      "recommendation": "在生产环境开启块校验和丢失写保护。",
+      "evidence_refs": ["tables/块校验与丢失写保护参数.tsv"]
+    },
+    "ORA.CONTROL.REDUNDANCY": {
+      "category": "data",
+      "severity": "high",
+      "confidence": 1.0,
+      "title": "控制文件冗余不足",
+      "summary": "控制文件数量少于 2 份，存在单点故障风险。",
+      "recommendation": "将控制文件多路复用到不同故障域（不同磁盘/存储）。",
+      "evidence_refs": ["tables/控制文件多路复用.tsv"]
+    },
+    "ORA.JOB.FAILURE": {
+      "category": "maintenance",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "Scheduler 作业失败",
+      "summary": "近 7 天存在未成功的 Scheduler 作业。",
+      "recommendation": "检查失败作业日志和依赖条件，补跑或修复。",
+      "evidence_refs": ["tables/Scheduler失败作业.tsv"]
+    },
+    "ORA.PERFORMANCE.BUFFER_CACHE": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.75,
+      "threshold": { "buffer_cache_hit_warning": 90 },
+      "title": "Buffer Cache 命中率偏低",
+      "summary": "Buffer Cache 命中率低于建议阈值。",
+      "recommendation": "增加 buffer cache 大小或优化 SQL 访问路径。",
+      "evidence_refs": ["timeseries/oracle_sysstat.csv"]
+    },
+    "ORA.PERFORMANCE.SORT_DISK": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.75,
+      "threshold": { "sort_disk_warning_pct": 5 },
+      "title": "磁盘排序占比偏高",
+      "summary": "排序操作中磁盘排序比例超过建议阈值。",
+      "recommendation": "增大 PGA aggregate target 或优化排序 SQL 执行计划。",
+      "evidence_refs": ["timeseries/oracle_sysstat.csv"]
+    },
+    "ORA.SYSTEM.SAR_CPU_PEAK": {
+      "category": "system",
+      "severity": "low",
+      "confidence": 0.9,
+      "title": "24h 历史 CPU 高峰",
+      "summary": "SAR 历史记录中 CPU 使用率出现高峰。",
+      "recommendation": "结合业务周期确认峰值为常态还是偶发。",
+      "evidence_refs": ["history/sar_cpu.csv"]
+    },
+    "ORA.SYSTEM.SAR_IOWAIT_PEAK": {
+      "category": "system",
+      "severity": "low",
+      "confidence": 0.9,
+      "title": "24h 历史 IOWait 高峰",
+      "summary": "SAR 历史记录中 IOWait 出现高峰。",
+      "recommendation": "检查存储性能基线，确认是否需优化存储或 SQL。",
+      "evidence_refs": ["history/sar_cpu.csv"]
+    },
+    "ORA.SECURITY.PASSWORD_EXPIRY": {
+      "category": "security",
+      "severity": "medium",
+      "confidence": 1.0,
+      "title": "账户密码临近过期或已锁定",
+      "summary": "存在即将过期、已过期或锁定状态的数据库账户。",
+      "recommendation": "更新过期密码，解锁异常锁定账户，建立密码轮换流程。",
+      "evidence_refs": ["tables/用户密码过期预警.tsv"]
+    },
+    "ORA.CONFIG.REDO_MEMBER": {
+      "category": "config",
+      "severity": "high",
+      "confidence": 1.0,
+      "threshold": { "redo_member_min": 2 },
+      "title": "在线日志成员冗余不足",
+      "summary": "部分 redo log group 为单成员配置，存在日志文件单点故障风险。",
+      "recommendation": "为每个日志组添加至少一个成员到不同磁盘路径。",
+      "evidence_refs": ["tables/Redo 日志多路复用检查.tsv"]
+    },
+    "ORA.CONFIG.REDO_SIZE": {
+      "category": "config",
+      "severity": "medium",
+      "confidence": 0.85,
+      "threshold": { "redo_size_mb_min": 500, "redo_switch_per_hour_warning": 4 },
+      "title": "在线日志尺寸偏小",
+      "summary": "在线 redo log 尺寸偏小或切换频率过高，可能导致频繁检查点。",
+      "recommendation": "评估业务峰值日志量，适当调大 redo log 到 1GB-4GB。",
+      "evidence_refs": ["tables/Redo 日志组信息.tsv", "tables/重做日志切换频率.tsv"]
+    },
+    "ORA.PERFORMANCE.LIBRARY_CACHE": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.85,
+      "threshold": { "library_cache_hit_warning": 95, "library_cache_hit_critical": 90 },
+      "title": "Library Cache 命中率偏低",
+      "summary": "SQL AREA 的 GET/PIN 命中率低于建议阈值，存在硬解析开销。",
+      "recommendation": "检查未使用绑定变量的 SQL，增大 shared_pool_size。",
+      "evidence_refs": ["tables/Library Cache 命中率.tsv"]
+    },
+    "ORA.PERFORMANCE.WAIT_EVENTS": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.8,
+      "threshold": { "wait_time_seconds_warning": 60 },
+      "title": "数据库存在显著等待事件",
+      "summary": "等待事件累计耗时较高，可能影响数据库响应。",
+      "recommendation": "分析高耗时等待事件根因：I/O 类检查存储和 SQL；并发类检查锁和应用逻辑。",
+      "evidence_refs": ["tables/等待事件 TOP10（数据库级）.tsv"]
+    },
+    "ORA.CONFIG.AUTOEXTEND": {
+      "category": "storage",
+      "severity": "medium",
+      "confidence": 0.95,
+      "title": "数据文件未开启自动扩展",
+      "summary": "部分数据文件的自动扩展功能被关闭，可能因空间满导致业务中断。",
+      "recommendation": "为生产表空间数据文件开启 autoextend，设置合理的 maxsize。",
+      "evidence_refs": ["tables/数据文件自动扩展余量.tsv"]
+    },
+    "ORA.SECURITY.DBA_COUNT": {
+      "category": "security",
+      "severity": "low",
+      "confidence": 0.9,
+      "threshold": { "dba_user_count_warning": 5 },
+      "title": "DBA 角色用户偏多",
+      "summary": "拥有 DBA 角色的用户数量较多，增加误操作和安全风险。",
+      "recommendation": "遵循最小权限原则，为业务用户授予精确的系统/对象权限。",
+      "evidence_refs": ["tables/特权用户.tsv"]
+    },
+    "ORA.SECURITY.ACCOUNT_LOCKED": {
+      "category": "security",
+      "severity": "low",
+      "confidence": 0.9,
+      "threshold": { "locked_account_count_warning": 20 },
+      "title": "锁定账户数量偏多",
+      "summary": "大量账户处于 LOCKED 或 EXPIRED 状态，建议定期清理。",
+      "recommendation": "审计锁定的账户列表，删除不再使用的账户。",
+      "evidence_refs": ["tables/用户列表.tsv"]
+    },
+    "ORA.PERFORMANCE.SQL_EXECUTION": {
+      "category": "performance",
+      "severity": "low",
+      "confidence": 0.75,
+      "threshold": { "single_sql_elapsed_min_warning": 10 },
+      "title": "存在单 SQL 执行耗时偏高",
+      "summary": "部分 SQL 的单次执行时间超过阈值。",
+      "recommendation": "对比执行计划与统计信息，确认索引使用和连接方式。",
+      "evidence_refs": ["tables/Top 20 SQL (按执行时间).tsv"]
+    },
+    "ORA.DATA.INDEX_UNUSABLE": {
+      "category": "objects",
+      "severity": "medium",
+      "confidence": 1.0,
+      "title": "存在不可用索引",
+      "summary": "数据库中存在状态为 UNUSABLE 的索引，可能影响 SQL 性能。",
+      "recommendation": "重建不可用索引或评估是否可以删除。",
+      "evidence_refs": ["tables/无效_不可用索引.tsv"]
+    },
+    "ORA.DATA.MISSING_STATS": {
+      "category": "objects",
+      "severity": "low",
+      "confidence": 0.9,
+      "threshold": { "missing_stats_table_count_warning": 10 },
+      "title": "存在缺失统计信息的表",
+      "summary": "部分业务表未收集统计信息，可能导致执行计划不优。",
+      "recommendation": "使用 DBMS_STATS.GATHER_TABLE_STATS 收集统计信息。",
+      "evidence_refs": ["tables/缺失统计信息表.tsv"]
+    },
+    "ORA.PERFORMANCE.IO_HOTFILE": {
+      "category": "performance",
+      "severity": "low",
+      "confidence": 0.75,
+      "threshold": { "single_file_io_pct_warning": 30 },
+      "title": "存在 IO 热点数据文件",
+      "summary": "单个数据文件的读写 IO 占比显著偏高，可能成为存储瓶颈。",
+      "recommendation": "考虑将该数据文件迁移到更快的存储，或分散热点段到不同表空间。",
+      "evidence_refs": ["tables/IO 消耗最高数据文件 TOP10.tsv"]
+    }
+  }
+}

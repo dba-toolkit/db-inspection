@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://db-inspection.local/contracts/collection-facts-v1.schema.json",
+  "title": "Database Inspection Canonical Facts Contract v1",
+  "description": "分析层唯一读取的标准事实模型。无论数据库类型，顶层结构完全一致；数据库专属事实进入 db.extensions，不新增顶层字段。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "hostname",
+    "collect_time",
+    "db_type",
+    "static",
+    "sysctl",
+    "os_perf",
+    "sar",
+    "db"
+  ],
+  "properties": {
+    "contract": {"const": "db-inspection.collection-facts"},
+    "schema_version": {"$ref": "#/$defs/semver"},
+    "hostname": {
+      "type": "string",
+      "minLength": 1,
+      "description": "采集器运行主机名；若数据库是远程目标，须配合 target 字段证明主机归属。"
+    },
+    "collect_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "采集完成时间，ISO-8601 含时区，例如 2026-08-13T10:00:00+08:00。"
+    },
+    "db_type": {"$ref": "#/$defs/dbType"},
+    "target": {"$ref": "#/$defs/target"},
+    "static": {"$ref": "#/$defs/static"},
+    "sysctl": {"$ref": "#/$defs/sysctl"},
+    "os_perf": {"$ref": "#/$defs/osPerf"},
+    "sar": {"$ref": "#/$defs/sar"},
+    "db": {"$ref": "#/$defs/db"},
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "预留扩展；禁止把数据库业务字段放到这里，应放在 db.extensions。"
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "dbType": {
+      "type": "string",
+      "enum": ["mysql", "postgresql", "oracle", "sqlserver"]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "database_target_is_local"],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "display_name": {"type": ["string", "null"]},
+        "host": {"type": ["string", "null"]},
+        "ip": {"type": ["string", "null"]},
+        "port": {"type": ["integer", "null"], "minimum": 0, "maximum": 65535},
+        "topology_mode": {"type": ["string", "null"], "description": "single_instance / rac / cluster / ha_pair 等。"},
+        "database_target_is_local": {
+          "type": "boolean",
+          "description": "OS 指标是否可证明属于数据库目标主机；false 时 os_perf/sar/static 只能作为采集端主机信息展示，不得参与数据库资源规则。"
+        },
+        "observed_host": {"type": ["string", "null"]},
+        "collection_method": {"type": ["string", "null"], "description": "local_shell / ssh / cim / agent 等。"}
+      }
+    },
+    "static": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_model", "cpu_cores", "memory_bytes", "os_name", "os_version", "kernel_version"],
+      "properties": {
+        "server_type": {"type": ["string", "null"], "description": "服务器类型，如 X86数据库服务器。"},
+        "server_environment": {"type": ["string", "null"], "description": "Prod / Test / Dev / UAT 等。"},
+        "server_location": {"type": ["string", "null"]},
+        "server_vendor": {"type": ["string", "null"]},
+        "server_model": {"type": ["string", "null"]},
+        "cpu_model": {"type": "string", "minLength": 1},
+        "cpu_cores": {"type": "integer", "minimum": 1},
+        "cpu_cores_per_cpu": {"type": ["integer", "null"], "minimum": 1},
+        "memory_bytes": {"type": "integer", "minimum": 0, "description": "物理内存，单位字节。"},
+        "os_name": {"type": "string", "minLength": 1},
+        "os_version": {"type": "string", "minLength": 1},
+        "kernel_version": {"type": "string", "minLength": 1},
+        "architecture": {"type": ["string", "null"]},
+        "virtualization": {"type": ["string", "null"]},
+        "disk_redundancy_type": {"type": ["string", "null"], "description": "RAID / LVM / 无冗余 等。"},
+        "disk_scheduler": {
+          "type": ["object", "null"],
+          "additionalProperties": {"type": "string"},
+          "description": "设备名 -> 调度算法，如 {\"sda\": \"deadline\"}。"
+        },
+        "resource_limits": {"type": ["string", "null"], "description": "ulimit / limits.conf 文本摘要。"},
+        "uptime_seconds": {"type": ["integer", "null"], "minimum": 0, "description": "主机启动时长，秒。"}
+      }
+    },
+    "sysctl": {
+      "type": "object",
+      "description": "关键内核参数，键为 sysctl 名称，值为字符串或数字；缺失用 null。",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    },
+    "osPerf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory", "disk"],
+      "properties": {
+        "cpu": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["usage_pct"],
+          "properties": {
+            "usage_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "CPU 使用率，0-100。"},
+            "load_avg": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "one": {"type": ["number", "null"]},
+                "five": {"type": ["number", "null"]},
+                "fifteen": {"type": ["number", "null"]}
+              }
+            },
+            "iowait_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100}
+          }
+        },
+        "memory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["usage_pct"],
+          "properties": {
+            "total_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "used_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "available_bytes": {"type": ["integer", "null"], "minimum": 0},
+            "usage_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+            "swap": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "total_bytes": {"type": ["integer", "null"], "minimum": 0},
+                "used_bytes": {"type": ["integer", "null"], "minimum": 0},
+                "usage_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100}
+              }
+            }
+          }
+        },
+        "disk": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["usage_pct"],
+          "properties": {
+            "usage_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100, "description": "数据库数据目录所在文件系统使用率；多挂载点可另见 filesystems。"},
+            "filesystems": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["mount", "total_bytes", "used_bytes", "usage_pct"],
+                "properties": {
+                  "mount": {"type": "string", "minLength": 1},
+                  "total_bytes": {"type": "integer", "minimum": 0},
+                  "used_bytes": {"type": "integer", "minimum": 0},
+                  "usage_pct": {"type": "number", "minimum": 0, "maximum": 100}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "series": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "points"],
+      "properties": {
+        "unit": {"type": "string", "description": "percent / bytes / count 等。"},
+        "points": {
+          "type": "array",
+          "description": "每个元素为 [timestamp, value]，timestamp 为 ISO-8601 字符串，value 为数值或 null。",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": [
+              {"type": "string", "format": "date-time"},
+              {"type": ["number", "integer", "null"]}
+            ]
+          }
+        }
+      }
+    },
+    "sar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory"],
+      "properties": {
+        "cpu": {"$ref": "#/$defs/series"},
+        "memory": {"$ref": "#/$defs/series"},
+        "disk": {"$ref": "#/$defs/series"},
+        "network": {"$ref": "#/$defs/series"},
+        "iowait": {"$ref": "#/$defs/series"}
+      }
+    },
+    "db": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version"],
+      "properties": {
+        "version": {"type": "string", "minLength": 1},
+        "uptime_seconds": {"type": ["integer", "null"], "minimum": 0, "description": "数据库实例启动时长，秒。"},
+        "active_sessions": {"type": ["integer", "null"], "minimum": 0},
+        "total_connections": {"type": ["integer", "null"], "minimum": 0},
+        "max_connections": {"type": ["integer", "null"], "minimum": 0},
+        "slow_queries": {"type": ["integer", "null"], "minimum": 0, "description": "采集窗口内或累计慢查询数，语义由扩展说明。"},
+        "database_count": {"type": ["integer", "null"], "minimum": 0},
+        "extensions": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "数据库专属事实（如 MySQL innodb 缓冲池、Oracle 归档模式、PG 复制槽、SQL Server 备份等）。"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,147 @@
+rules_version: "1.0"
+database_type: mysql
+
+rules:
+  - id: "COMMON.SYSTEM.MEMORY_PRESSURE"
+    name: "内存使用率过高"
+    category: "SYSTEM"
+    severity: "MEDIUM"
+    enabled: true
+    tags: ["system", "memory"]
+    description: "主机内存使用率接近饱和。"
+    applicability:
+      required_capabilities: []
+      required_inputs: ["os_perf.memory.usage_pct"]
+    predicate:
+      type: threshold
+      fact: "os_perf.memory.usage_pct"
+      op: ">="
+      value: 90
+    output:
+      conclusion: "主机内存使用率达到 {value}%，存在内存压力。"
+      impact: "内存不足可能导致换页、OOM 或数据库性能抖动。"
+      recommendation: "确认内存占用来源，评估扩容或回收缓存/连接。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认内存使用率回落至阈值以下。"
+
+  - id: "COMMON.SYSTEM.SWAP_PRESSURE"
+    name: "Swap 使用与内存压力并存"
+    category: "SYSTEM"
+    severity: "MEDIUM"
+    enabled: true
+    tags: ["system", "memory", "swap"]
+    description: "已使用 swap 且内存使用率偏高。"
+    applicability:
+      required_capabilities: []
+      required_inputs: ["os_perf.memory.swap.used_bytes", "os_perf.memory.swap.usage_pct"]
+    predicate:
+      type: compound
+      logic: AND
+      items:
+        - {type: threshold, fact: "os_perf.memory.swap.used_bytes", op: ">", value: 0}
+        - {type: threshold, fact: "os_perf.memory.swap.usage_pct", op: ">", value: 20}
+    output:
+      conclusion: "系统已使用 swap，且 swap 使用率超过 20%。"
+      impact: "持续换页会放大 IO 延迟，说明物理内存不足。"
+      recommendation: "确认内存压力来源，评估扩容或降低内存占用。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认 swap 使用回落。"
+
+  - id: "MYSQL.CONNECTION.USAGE"
+    name: "连接使用率过高"
+    category: "PERFORMANCE"
+    severity: "HIGH"
+    enabled: true
+    tags: ["mysql", "connection"]
+    description: "连接使用率接近 max_connections 上限。"
+    applicability:
+      required_capabilities: []
+      required_inputs: ["db.active_sessions", "db.total_connections", "db.max_connections"]
+    predicate:
+      type: threshold
+      metric:
+        name: "mysql.connection_usage_pct"
+        inputs: ["db.active_sessions", "db.max_connections"]
+        formula: "active_sessions / max_connections * 100"
+      op: ">="
+      value: 85
+    output:
+      conclusion: "当前连接使用率为 {value}%，接近 max_connections 上限。"
+      impact: "连接耗尽后新连接将被拒绝。"
+      recommendation: "评估连接上限、连接池配置与空闲连接回收策略。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认连接数与 max_connections 比例回落。"
+
+  - id: "MYSQL.INNODB.BUFFER_POOL_RATIO"
+    name: "InnoDB 缓冲池命中率偏离合理区间"
+    category: "PERFORMANCE"
+    severity: "MEDIUM"
+    enabled: true
+    tags: ["mysql", "innodb"]
+    description: "缓冲池命中率低于合理区间。"
+    applicability:
+      required_capabilities: ["mysql.performance_schema"]
+      required_inputs: ["db.extensions.innodb_buffer_pool_hit_pct"]
+    predicate:
+      type: range
+      fact: "db.extensions.innodb_buffer_pool_hit_pct"
+      min: 90
+      max: 100
+      outside: true
+    output:
+      conclusion: "InnoDB 缓冲池命中率为 {value}%，低于合理区间。"
+      impact: "命中率过低说明缓冲池偏小或访问模式变化，可能放大磁盘 IO。"
+      recommendation: "结合缓冲池大小、热数据占比和业务访问模式评估。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认命中率回到目标区间。"
+
+  - id: "MYSQL.CAPACITY.LARGE_TABLE"
+    name: "存在超大表"
+    category: "CAPACITY"
+    severity: "MEDIUM"
+    enabled: true
+    tags: ["mysql", "capacity"]
+    description: "单表容量超过阈值。"
+    applicability:
+      required_capabilities: []
+      required_inputs: ["db.extensions.large_tables"]
+    predicate:
+      type: threshold
+      fact: "db.extensions.large_tables[*].size_mb"
+      op: ">"
+      value: 10240
+    output:
+      conclusion: "表 {label} 容量 {value}MB 超过阈值 10240MB。"
+      impact: "大表影响备份、DDL 和查询性能。"
+      recommendation: "评估分区、归档或拆分策略。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认大表容量回落或完成归档。"
+
+  - id: "COMMON.SYSTEM.CPU_TREND"
+    name: "CPU 使用率持续上升"
+    category: "SYSTEM"
+    severity: "MEDIUM"
+    enabled: true
+    tags: ["system", "cpu", "trend"]
+    description: "最近若干采样点 CPU 使用率持续上升。"
+    applicability:
+      required_capabilities: []
+      required_inputs: ["sar.cpu"]
+    predicate:
+      type: trend
+      fact: "sar.cpu"
+      window_points: 5
+      direction: "up"
+      min_slope: 2.0
+    output:
+      conclusion: "最近 {points} 个采样点 CPU 使用率持续上升，斜率为 {slope}。"
+      impact: "CPU 压力持续上升可能影响数据库响应。"
+      recommendation: "结合慢查询和进程负载定位 CPU 上升来源。"
+      requires_restart: false
+      owner_role: "DBA"
+      verification: "重新采集确认 CPU 趋势回落或稳定。"

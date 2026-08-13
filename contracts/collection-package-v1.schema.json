@@ -1,0 +1,223 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://db-inspection.local/contracts/collection-package-v1.schema.json",
+  "title": "Database Inspection Collection Package Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "package_id",
+    "created_at",
+    "database",
+    "target",
+    "collector",
+    "capabilities",
+    "checks",
+    "integrity"
+  ],
+  "properties": {
+    "contract": {"const": "db-inspection.collection-package"},
+    "schema_version": {"$ref": "#/$defs/semver"},
+    "package_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "database": {"$ref": "#/$defs/database"},
+    "target": {"$ref": "#/$defs/target"},
+    "collector": {"$ref": "#/$defs/collector"},
+    "capabilities": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/capability"}
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/check"}
+    },
+    "integrity": {"$ref": "#/$defs/integrity"},
+    "extensions": {"type": "object", "additionalProperties": true}
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "databaseEngine": {
+      "type": "string",
+      "enum": ["mysql", "postgresql", "oracle", "sqlserver"]
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "version"],
+      "properties": {
+        "engine": {"$ref": "#/$defs/databaseEngine"},
+        "version": {"type": "string", "minLength": 1},
+        "edition": {"type": ["string", "null"]},
+        "family": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "display_name", "nodes"],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "display_name": {"type": "string", "minLength": 1},
+        "environment": {"type": ["string", "null"]},
+        "topology_mode": {"type": ["string", "null"]},
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/node"}
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "host": {"type": ["string", "null"]},
+        "ip": {"type": ["string", "null"]},
+        "port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "instance_name": {"type": ["string", "null"]},
+        "service_name": {"type": ["string", "null"]},
+        "role": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source_package_version", "started_at", "finished_at"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"$ref": "#/$defs/semver"},
+        "source_package_version": {"type": "string", "minLength": 1},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "timezone": {"type": ["string", "null"]},
+        "sampling": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_id", "status"],
+      "properties": {
+        "capability_id": {"type": "string", "minLength": 1},
+        "status": {
+          "type": "string",
+          "enum": ["supported", "unsupported", "disabled", "not_detected", "unknown"]
+        },
+        "reason": {"type": ["string", "null"]},
+        "evidence_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "checkStatus": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "empty",
+        "unsupported",
+        "not_applicable",
+        "skipped",
+        "partial",
+        "permission_denied",
+        "timeout",
+        "error"
+      ]
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "category",
+        "schema_version",
+        "node_id",
+        "status",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+        "row_count"
+      ],
+      "properties": {
+        "check_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]+$"},
+        "category": {"type": "string", "minLength": 1},
+        "schema_version": {"$ref": "#/$defs/semver"},
+        "node_id": {"type": "string", "minLength": 1},
+        "status": {"$ref": "#/$defs/checkStatus"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "row_count": {"type": "integer", "minimum": 0},
+        "artifact": {"$ref": "#/$defs/artifact"},
+        "reason": {"type": ["string", "null"]},
+        "error_code": {"type": ["string", "integer", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"enum": ["ok", "partial"]}}},
+          "then": {"required": ["artifact"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": ["unsupported", "not_applicable", "skipped", "partial", "permission_denied", "timeout", "error"]
+              }
+            }
+          },
+          "then": {"required": ["reason"]}
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "format"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "format": {
+          "type": "string",
+          "enum": ["json", "jsonl", "tsv", "csv", "text", "markdown", "binary", "directory"]
+        },
+        "media_type": {"type": ["string", "null"]},
+        "bytes": {"type": ["integer", "null"], "minimum": 0},
+        "sha256": {"type": ["string", "null"], "pattern": "^[A-Fa-f0-9]{64}$"},
+        "schema_ref": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "algorithm", "files_count", "failures"],
+      "properties": {
+        "status": {"type": "string", "enum": ["passed", "failed", "not_available"]},
+        "algorithm": {"type": ["string", "null"], "enum": ["sha256", null]},
+        "files_count": {"type": "integer", "minimum": 0},
+        "manifest_ref": {"type": ["string", "null"]},
+        "failures": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    }
+  }
+}

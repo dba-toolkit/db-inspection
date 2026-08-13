@@ -1,0 +1,502 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://db-inspection.local/contracts/report-model-v1.schema.json",
+  "title": "Database Inspection Report Model Contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "schema_version",
+    "generated_at",
+    "database",
+    "target",
+    "cover",
+    "document_control",
+    "scope",
+    "quality",
+    "health",
+    "executive_summary",
+    "sections",
+    "rule_evaluations",
+    "risk_register",
+    "remediation_plan",
+    "charts",
+    "appendix"
+  ],
+  "properties": {
+    "contract": {"const": "db-inspection.report-model"},
+    "schema_version": {"$ref": "#/$defs/semver"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "database": {"$ref": "#/$defs/database"},
+    "target": {"$ref": "#/$defs/target"},
+    "cover": {"$ref": "#/$defs/cover"},
+    "document_control": {"$ref": "#/$defs/documentControl"},
+    "scope": {"$ref": "#/$defs/scope"},
+    "quality": {"$ref": "#/$defs/quality"},
+    "health": {"$ref": "#/$defs/health"},
+    "executive_summary": {"$ref": "#/$defs/executiveSummary"},
+    "sections": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/section"}
+    },
+    "rule_evaluations": {
+      "type": "array",
+      "items": {"$ref": "rule-model-v1.schema.json"}
+    },
+    "risk_register": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/risk"}
+    },
+    "remediation_plan": {"$ref": "#/$defs/remediationPlan"},
+    "charts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/chart"}
+    },
+    "appendix": {"$ref": "#/$defs/appendix"},
+    "extensions": {"type": "object", "additionalProperties": true}
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "databaseEngine": {
+      "type": "string",
+      "enum": ["mysql", "postgresql", "oracle", "sqlserver"]
+    },
+    "database": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "version"],
+      "properties": {
+        "engine": {"$ref": "#/$defs/databaseEngine"},
+        "version": {"type": "string", "minLength": 1},
+        "edition": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_id", "display_name", "topology_mode", "nodes"],
+      "properties": {
+        "target_id": {"type": "string", "minLength": 1},
+        "display_name": {"type": "string", "minLength": 1},
+        "environment": {"type": ["string", "null"]},
+        "topology_mode": {"type": ["string", "null"]},
+        "nodes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/node"}
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node_id"],
+      "properties": {
+        "node_id": {"type": "string", "minLength": 1},
+        "host": {"type": ["string", "null"]},
+        "ip": {"type": ["string", "null"]},
+        "port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+        "instance_name": {"type": ["string", "null"]},
+        "role": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "cover": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "inspection_target", "inspection_date", "report_version"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1},
+        "subtitle": {"type": ["string", "null"]},
+        "inspection_target": {"type": "string", "minLength": 1},
+        "inspection_date": {"type": "string", "format": "date"},
+        "report_version": {"type": "string", "minLength": 1},
+        "classification": {"type": ["string", "null"]}
+      }
+    },
+    "documentControl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["customer", "company", "author", "reviewer"],
+      "properties": {
+        "customer": {"type": "string"},
+        "company": {"type": "string"},
+        "author": {"type": "string"},
+        "reviewer": {"type": "string"},
+        "revision_history": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version", "date", "description"],
+            "properties": {
+              "version": {"type": "string"},
+              "date": {"type": "string", "format": "date"},
+              "description": {"type": "string"},
+              "author": {"type": ["string", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "finished_at", "included_domains", "limitations"],
+      "properties": {
+        "started_at": {"type": "string", "format": "date-time"},
+        "finished_at": {"type": "string", "format": "date-time"},
+        "included_domains": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "excluded_domains": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score", "status", "counts", "gaps"],
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 100},
+        "status": {"type": "string", "enum": ["complete", "partial", "unreliable"]},
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total", "ok", "non_ok"],
+          "properties": {
+            "total": {"type": "integer", "minimum": 0},
+            "ok": {"type": "integer", "minimum": 0},
+            "non_ok": {"type": "integer", "minimum": 0}
+          }
+        },
+        "gaps": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/collectionGap"}
+        }
+      }
+    },
+    "collectionGap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "status", "reason"],
+      "properties": {
+        "check_id": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "recommended_action": {"type": ["string", "null"]}
+      }
+    },
+    "health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["score", "grade", "status", "risk_counts"],
+      "properties": {
+        "score": {"type": "number", "minimum": 0, "maximum": 100},
+        "grade": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["healthy", "attention", "risk", "critical", "unknown"]},
+        "risk_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["critical", "high", "medium", "low", "info"],
+          "properties": {
+            "critical": {"type": "integer", "minimum": 0},
+            "high": {"type": "integer", "minimum": 0},
+            "medium": {"type": "integer", "minimum": 0},
+            "low": {"type": "integer", "minimum": 0},
+            "info": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "executiveSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["overall_conclusion", "highlights", "limitations"],
+      "properties": {
+        "overall_conclusion": {"type": "string", "minLength": 1},
+        "highlights": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "limitations": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "section": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["section_id", "title", "order", "items"],
+      "properties": {
+        "section_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]+$"},
+        "title": {"type": "string", "minLength": 1},
+        "order": {"type": "integer", "minimum": 1},
+        "summary": {"type": ["string", "null"]},
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/item"}
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "title",
+        "domain",
+        "order",
+        "applicability",
+        "collection",
+        "evidence",
+        "data",
+        "evaluation_refs",
+        "analysis",
+        "presentation"
+      ],
+      "properties": {
+        "check_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]+$"},
+        "title": {"type": "string", "minLength": 1},
+        "domain": {"type": "string", "minLength": 1},
+        "order": {"type": "integer", "minimum": 1},
+        "applicability": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {
+            "status": {"type": "string", "enum": ["applicable", "not_applicable", "unknown"]},
+            "reason": {"type": ["string", "null"]}
+          }
+        },
+        "collection": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "row_count", "reason"],
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["ok", "empty", "unsupported", "not_applicable", "skipped", "partial", "permission_denied", "timeout", "error"]
+            },
+            "row_count": {"type": "integer", "minimum": 0},
+            "reason": {"type": ["string", "null"]}
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "data": {"$ref": "#/$defs/dataBlock"},
+        "evaluation_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "analysis": {"$ref": "#/$defs/itemAnalysis"},
+        "presentation": {"$ref": "#/$defs/presentation"},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref"],
+      "properties": {
+        "source_ref": {"type": "string", "minLength": 1},
+        "check_id": {"type": ["string", "null"]},
+        "description": {"type": ["string", "null"]}
+      }
+    },
+    "dataBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "columns", "rows", "metrics", "text"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["key_value", "table", "metrics", "timeseries", "text", "none"]},
+        "columns": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/column"}
+        },
+        "rows": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "metrics": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/fact"}
+        },
+        "text": {"type": ["string", "null"]},
+        "total_rows": {"type": ["integer", "null"], "minimum": 0},
+        "note": {"type": ["string", "null"]}
+      }
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "type"],
+      "properties": {
+        "key": {"type": "string", "minLength": 1},
+        "label": {"type": "string", "minLength": 1},
+        "type": {"type": "string", "enum": ["string", "integer", "number", "boolean", "datetime", "date", "duration", "bytes", "percent"]},
+        "unit": {"type": ["string", "null"]},
+        "sensitive": {"type": "boolean", "default": false}
+      }
+    },
+    "jsonValue": {
+      "type": ["string", "number", "integer", "boolean", "object", "array", "null"]
+    },
+    "fact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "value": {"$ref": "#/$defs/jsonValue"},
+        "unit": {"type": ["string", "null"]},
+        "source_ref": {"type": ["string", "null"]}
+      }
+    },
+    "itemAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "conclusion", "impact", "recommendation"],
+      "properties": {
+        "status": {"type": "string", "enum": ["pass", "attention", "risk", "not_evaluated", "not_applicable"]},
+        "conclusion": {"type": ["string", "null"]},
+        "impact": {"type": ["string", "null"]},
+        "recommendation": {"type": ["string", "null"]}
+      }
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["location", "max_rows", "chart_refs"],
+      "properties": {
+        "location": {"type": "string", "enum": ["main", "appendix", "hidden"]},
+        "max_rows": {"type": ["integer", "null"], "minimum": 1},
+        "chart_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "risk_id",
+        "evaluation_ref",
+        "priority",
+        "severity",
+        "title",
+        "current_state",
+        "impact",
+        "recommendation",
+        "owner",
+        "target_window",
+        "verification",
+        "status"
+      ],
+      "properties": {
+        "risk_id": {"type": "string", "minLength": 1},
+        "evaluation_ref": {"type": "string", "minLength": 1},
+        "priority": {"type": "string", "enum": ["P1", "P2", "P3"]},
+        "severity": {"type": "string", "enum": ["critical", "high", "medium", "low", "info"]},
+        "title": {"type": "string", "minLength": 1},
+        "object_name": {"type": ["string", "null"]},
+        "current_state": {"type": "string", "minLength": 1},
+        "impact": {"type": "string", "minLength": 1},
+        "recommendation": {"type": "string", "minLength": 1},
+        "owner": {"type": ["string", "null"]},
+        "target_window": {"type": ["string", "null"]},
+        "verification": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["open", "planned", "in_progress", "resolved", "accepted"]}
+      }
+    },
+    "remediationPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phases"],
+      "properties": {
+        "phases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["phase_id", "title", "risk_refs"],
+            "properties": {
+              "phase_id": {"type": "string", "minLength": 1},
+              "title": {"type": "string", "minLength": 1},
+              "description": {"type": ["string", "null"]},
+              "risk_refs": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": true
+              }
+            }
+          }
+        }
+      }
+    },
+    "chart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chart_id", "title", "status"],
+      "properties": {
+        "chart_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["generated", "skipped", "error"]},
+        "file": {"type": ["string", "null"]},
+        "reason": {"type": ["string", "null"]},
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "appendix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_coverage", "methodology", "disclaimers"],
+      "properties": {
+        "rule_coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["total", "triggered", "passed", "not_evaluated", "not_applicable"],
+          "properties": {
+            "total": {"type": "integer", "minimum": 0},
+            "triggered": {"type": "integer", "minimum": 0},
+            "passed": {"type": "integer", "minimum": 0},
+            "not_evaluated": {"type": "integer", "minimum": 0},
+            "not_applicable": {"type": "integer", "minimum": 0}
+          }
+        },
+        "methodology": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "disclaimers": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "extensions": {"type": "object", "additionalProperties": true}
+      }
+    }
+  }
+}

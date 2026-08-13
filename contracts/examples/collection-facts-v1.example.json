@@ -1,0 +1,131 @@
+{
+  "contract": "db-inspection.collection-facts",
+  "schema_version": "1.0.0",
+  "hostname": "mysql-0-108",
+  "collect_time": "2026-04-28T10:29:27+08:00",
+  "db_type": "mysql",
+  "target": {
+    "target_id": "mysql-0-108_3306",
+    "display_name": "MySQL 生产实例",
+    "host": "mysql-0-108",
+    "ip": "192.168.100.108",
+    "port": 3306,
+    "topology_mode": "single_instance",
+    "database_target_is_local": true,
+    "observed_host": "mysql-0-108",
+    "collection_method": "local_shell"
+  },
+  "static": {
+    "server_type": "X86数据库服务器",
+    "server_environment": "Prod",
+    "server_location": null,
+    "server_vendor": null,
+    "server_model": null,
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-2620 v4 @ 2.10GHz",
+    "cpu_cores": 32,
+    "cpu_cores_per_cpu": 4,
+    "memory_bytes": 24696061952,
+    "os_name": "CentOS Linux",
+    "os_version": "7.2.1511 (Core)",
+    "kernel_version": "3.10.0-327.el7.x86_64",
+    "architecture": "x86_64",
+    "virtualization": null,
+    "disk_redundancy_type": null,
+    "disk_scheduler": {"sda": "deadline", "sdb": "deadline", "sdc": "deadline"},
+    "resource_limits": "This account is currently not available.",
+    "uptime_seconds": 50670836
+  },
+  "sysctl": {
+    "kernel.shmmax": "18446744073692774399",
+    "kernel.shmall": "18446744073692774399",
+    "kernel.shmmni": "4096",
+    "kernel.sem": "250 32000 32 128",
+    "fs.file-max": "2433957",
+    "net.ipv4.ip_local_port_range": "32768 61000",
+    "net.core.rmem_default": "212992",
+    "net.core.rmem_max": "212992",
+    "net.core.wmem_default": "212992",
+    "net.core.wmem_max": "212992"
+  },
+  "os_perf": {
+    "cpu": {
+      "usage_pct": 5.0,
+      "load_avg": {"one": 0.41, "five": 0.55, "fifteen": 0.76},
+      "iowait_pct": null
+    },
+    "memory": {
+      "total_bytes": 24696061952,
+      "used_bytes": 23214300000,
+      "available_bytes": 1481761952,
+      "usage_pct": 94.0,
+      "swap": {
+        "total_bytes": 4294967296,
+        "used_bytes": 2147483648,
+        "usage_pct": 50.0
+      }
+    },
+    "disk": {
+      "usage_pct": 67.0,
+      "filesystems": [
+        {"mount": "/", "total_bytes": 51539607552, "used_bytes": 16492674416, "usage_pct": 32.0},
+        {"mount": "/data", "total_bytes": 211527598080, "used_bytes": 141723490714, "usage_pct": 67.0},
+        {"mount": "/boot", "total_bytes": 521142272, "used_bytes": 166765527, "usage_pct": 32.0}
+      ]
+    }
+  },
+  "sar": {
+    "cpu": {
+      "unit": "percent",
+      "points": [
+        ["2026-04-28T10:05:00+08:00", 2.5],
+        ["2026-04-28T10:10:00+08:00", 3.2],
+        ["2026-04-28T10:15:00+08:00", 5.0],
+        ["2026-04-28T10:20:00+08:00", 7.1],
+        ["2026-04-28T10:25:00+08:00", 9.4],
+        ["2026-04-28T10:29:27+08:00", 11.2]
+      ]
+    },
+    "memory": {
+      "unit": "percent",
+      "points": [
+        ["2026-04-28T10:00:00+08:00", 93.0],
+        ["2026-04-28T10:29:27+08:00", 94.0]
+      ]
+    }
+  },
+  "db": {
+    "version": "8.0.26",
+    "uptime_seconds": 50670836,
+    "active_sessions": 4,
+    "total_connections": 68,
+    "max_connections": 1024,
+    "slow_queries": 5,
+    "database_count": 7,
+    "extensions": {
+      "version_comment": "MySQL Community Server - GPL",
+      "compile_os": "Linux",
+      "compile_machine": "x86_64",
+      "binary_log_enabled": true,
+      "table_count": 404,
+      "total_size_mb": 19559.5,
+      "data_size_mb": 16780.81,
+      "index_size_mb": 2778.69,
+      "server_charset": "utf8mb4",
+      "server_collation": "utf8mb4_0900_ai_ci",
+      "max_user_connections": 0,
+      "transaction_isolation": "REPEATABLE-READ",
+      "read_only": false,
+      "super_read_only": false,
+      "innodb_buffer_pool_pages_total": 524288,
+      "innodb_buffer_pool_pages_free": 31997,
+      "innodb_buffer_pool_read_requests": 1726697853135,
+      "innodb_buffer_pool_hit_pct": 99.2,
+      "large_tables": [
+        {"schema": "app", "table": "orders", "size_mb": 20480},
+        {"schema": "app", "table": "events", "size_mb": 5120}
+      ],
+      "max_connection_time_seconds": 50670836,
+      "replication_role": "primary"
+    }
+  }
+}

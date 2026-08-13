@@ -1,0 +1,307 @@
+{
+  "version": "2.0",
+  "globals": {
+    "quality_score_min": 80,
+    "cpu_peak_warning": 90,
+    "iowait_peak_warning": 15,
+    "disk_util_warning": 80,
+    "memory_usage_warning": 90,
+    "cache_hit_min": 95,
+    "connection_usage_warning": 80,
+    "dead_tuple_total_warning": 100000,
+    "bloat_count_warning": 5,
+    "lag_bytes_warning": 104857600,
+    "xid_age_warning": 200000000,
+    "partition_count_warning": 500
+  },
+  "rules": {
+    "COMMON.COLLECTION.QUALITY": {
+      "category": "collection",
+      "severity": "warning",
+      "title": "采集数据完整度不足",
+      "summary": "部分巡检采集项失败或不可用，可能影响分析准确性",
+      "recommendation": "检查采集日志 logs/collection.log，排查失败原因后重新采集",
+      "threshold": {}
+    },
+    "COMMON.COLLECTION.ERRORS": {
+      "category": "collection",
+      "severity": "critical",
+      "title": "存在采集错误",
+      "summary": "采集过程中有项目执行失败",
+      "recommendation": "查看 collection_status.json 中 status=error 的项目及其 reason，修复后重新采集",
+      "threshold": {}
+    },
+    "COMMON.SYSTEM.CPU": {
+      "category": "system",
+      "severity": "warning",
+      "title": "CPU 使用率过高",
+      "summary": "采样期间 CPU 峰值超过告警阈值",
+      "recommendation": "使用 top/htop 定位高 CPU 进程，检查慢查询和索引使用情况",
+      "threshold": {}
+    },
+    "COMMON.SYSTEM.IOWAIT": {
+      "category": "system",
+      "severity": "warning",
+      "title": "IO 等待过高",
+      "summary": "采样期间 IO wait 峰值超过告警阈值",
+      "recommendation": "使用 iostat 确认磁盘瓶颈，考虑优化 shared_buffers 或增加内存",
+      "threshold": {}
+    },
+    "COMMON.SYSTEM.DISK_UTIL": {
+      "category": "system",
+      "severity": "warning",
+      "title": "磁盘利用率过高",
+      "summary": "采样期间最繁忙磁盘的利用率超过告警阈值",
+      "recommendation": "结合 iostat 的 await、队列深度和读写吞吐定位瓶颈，确认底层存储时延及高 IO SQL",
+      "threshold": {}
+    },
+    "COMMON.SYSTEM.MEMORY": {
+      "category": "system",
+      "severity": "warning",
+      "title": "内存使用率过高",
+      "summary": "采样期间内存使用率峰值超过告警阈值",
+      "recommendation": "检查是否 shared_buffers 设置过大导致 OS 内存不足，或是否存在内存泄漏",
+      "threshold": {}
+    },
+    "PG.CACHE.HIT_RATIO": {
+      "category": "performance",
+      "severity": "warning",
+      "title": "Buffer 缓存命中率偏低",
+      "summary": "共享缓冲区命中率低于推荐值，磁盘读取偏多",
+      "recommendation": "增大 shared_buffers 参数（建议为物理内存的 25%-40%），注意不要超过 OS 可用内存",
+      "threshold": {}
+    },
+    "PG.CONNECTION.USAGE": {
+      "category": "connection",
+      "severity": "warning",
+      "title": "连接数使用率过高",
+      "summary": "当前连接数接近 max_connections 上限",
+      "recommendation": "排查是否有连接泄漏，考虑使用连接池（PgBouncer），或按需增大 max_connections",
+      "threshold": {}
+    },
+    "PG.VACUUM.DEAD_TUPLE": {
+      "category": "vacuum",
+      "severity": "warning",
+      "title": "死元组堆积",
+      "summary": "数据库中死元组总数超过阈值",
+      "recommendation": "调低 autovacuum_vacuum_scale_factor（建议 0.05），或增大 autovacuum_max_workers",
+      "threshold": {}
+    },
+    "PG.VACUUM.DEAD_RATIO": {
+      "category": "vacuum",
+      "severity": "warning",
+      "title": "单表死元组比例过高",
+      "summary": "存在死元组比例超过 10% 的表",
+      "recommendation": "先执行常规 VACUUM (ANALYZE) 并调优 autovacuum；仅在确认物理膨胀且有维护窗口时评估 pg_repack 或 VACUUM FULL",
+      "threshold": {}
+    },
+    "PG.VACUUM.STALE": {
+      "category": "vacuum",
+      "severity": "warning",
+      "title": "存在从未 VACUUM 的表",
+      "summary": "有表从未被 autovacuum 或手工 VACUUM 处理过",
+      "recommendation": "检查 autovacuum 是否正常工作，或手工执行 VACUUM",
+      "threshold": {}
+    },
+    "PG.BLOAT.TABLE": {
+      "category": "storage",
+      "severity": "warning",
+      "title": "表膨胀",
+      "summary": "超过阈值的表存在严重的空间浪费（死元组占用空间）",
+      "recommendation": "复核真实物理膨胀后，优先评估 pg_repack；VACUUM FULL 会持有排他锁，只能在审批后的维护窗口执行，同时应调整 autovacuum 参数",
+      "threshold": {}
+    },
+    "PG.INDEX.UNUSED": {
+      "category": "index",
+      "severity": "info",
+      "title": "存在未使用的索引",
+      "summary": "有索引从未被扫描过，占用磁盘空间并拖慢写入",
+      "recommendation": "评估后使用 DROP INDEX CONCURRENTLY 删除多余索引，释放空间并提升 DML 性能",
+      "threshold": {}
+    },
+    "PG.INDEX.DUPLICATE": {
+      "category": "index",
+      "severity": "warning",
+      "title": "存在重复索引",
+      "summary": "同一张表上存在定义完全相同的多个索引",
+      "recommendation": "使用 DROP INDEX CONCURRENTLY 删除重复的索引",
+      "threshold": {}
+    },
+    "PG.REPLICATION.LAG": {
+      "category": "replication",
+      "severity": "critical",
+      "title": "流复制延迟过大",
+      "summary": "备库 WAL 回放延迟超过阈值",
+      "recommendation": "检查备库磁盘 IO 和网络带宽，确认是否有大事务导致延迟；考虑启用 synchronous_commit",
+      "threshold": {}
+    },
+    "PG.WAL.ARCHIVE": {
+      "category": "replication",
+      "severity": "critical",
+      "title": "WAL 归档失败",
+      "summary": "存在归档失败的记录",
+      "recommendation": "检查 archive_command 是否可正常执行，归档目录空间是否充足",
+      "threshold": {}
+    },
+    "PG.AGE.XID": {
+      "category": "maintenance",
+      "severity": "critical",
+      "title": "事务 ID 年龄过高",
+      "summary": "数据库事务 ID 年龄接近回卷阈值",
+      "recommendation": "立即执行 VACUUM FREEZE，或增大 autovacuum_freeze_max_age",
+      "threshold": {}
+    },
+    "PG.LONG.TRANSACTION": {
+      "category": "performance",
+      "severity": "warning",
+      "title": "存在长时间运行的事务",
+      "summary": "有事务运行超过 5 分钟",
+      "recommendation": "检查长事务来源，考虑设置 idle_in_transaction_session_timeout 和 statement_timeout",
+      "threshold": {}
+    },
+    "PG.LOCK.WAIT": {
+      "category": "performance",
+      "severity": "warning",
+      "title": "存在锁等待",
+      "summary": "有会话正在等待其他事务释放锁",
+      "recommendation": "查询 lock_waits.tsv 定位阻塞源，考虑终止阻塞事务",
+      "threshold": {}
+    },
+    "PG.PARTITION.COUNT": {
+      "category": "storage",
+      "severity": "warning",
+      "title": "分区表分区数过多",
+      "summary": "个别分区表的分区数量超过阈值",
+      "recommendation": "考虑合并历史分区或使用分区裁剪策略",
+      "threshold": {}
+    },
+    "PG.BACKUP.CONFIGURED": {
+      "category": "backup",
+      "severity": "critical",
+      "title": "未检测到备份配置",
+      "summary": "未发现 pgbackrest、barman 或 crontab 备份任务",
+      "recommendation": "生产环境必须有定期备份策略。配置 pgbackrest 或 pg_dump crontab 定时任务",
+      "threshold": {}
+    },
+    "PG.SECURITY.AUTH": {
+      "category": "security",
+      "severity": "warning",
+      "title": "存在弱认证方式",
+      "summary": "pg_hba.conf 中包含 trust 或 password 认证方式",
+      "recommendation": "将认证方式改为 scram-sha-256，Unix socket 可保留 peer",
+      "threshold": {}
+    },
+    "PG.SECURITY.PASSWORD": {
+      "category": "security",
+      "severity": "warning",
+      "title": "密码加密算法不安全",
+      "summary": "password_encryption 设置为 md5",
+      "recommendation": "SET password_encryption='scram-sha-256'; 然后 ALTER ROLE 重新设置密码",
+      "threshold": {}
+    },
+    "PG.SETTINGS.AUTOVACUUM": {
+      "category": "configuration",
+      "severity": "critical",
+      "title": "autovacuum 已关闭",
+      "summary": "autovacuum 参数为 off",
+      "recommendation": "生产环境必须开启 autovacuum：ALTER SYSTEM SET autovacuum=on; SELECT pg_reload_conf();",
+      "threshold": {}
+    },
+    "PG.SETTINGS.WAL_LEVEL": {
+      "category": "configuration",
+      "severity": "warning",
+      "title": "WAL 级别过低",
+      "summary": "wal_level=minimal，不支持流复制和逻辑复制",
+      "recommendation": "如需复制或 PITR，设置 wal_level=replica 并重启实例",
+      "threshold": {}
+    },
+    "PG.SETTINGS.ARCHIVE": {
+      "category": "configuration",
+      "severity": "warning",
+      "title": "归档未开启",
+      "summary": "archive_mode=off，无法做 PITR",
+      "recommendation": "生产环境建议开启归档：设置 archive_mode=on 并配置 archive_command",
+      "threshold": {}
+    },
+    "PG.STORAGE.NO_PRIMARY_KEY": {
+      "category": "storage",
+      "severity": "warning",
+      "title": "存在无主键的表",
+      "summary": "数据库中存在未定义主键的表，影响复制和逻辑解码",
+      "recommendation": "为这些表添加主键。如无法添加，至少创建 UNIQUE NOT NULL 索引",
+      "threshold": {}
+    },
+    "PG.SECURITY.SSL": {
+      "category": "security",
+      "severity": "warning",
+      "title": "SSL 未开启",
+      "summary": "数据库连接未启用 SSL 加密",
+      "recommendation": "在 postgresql.conf 中设置 ssl=on，配置 ssl_cert_file 和 ssl_key_file，然后重启",
+      "threshold": {}
+    },
+    "PG.REPLICATION.SLOT_INACTIVE": {
+      "category": "replication",
+      "severity": "critical",
+      "title": "存在非活跃复制槽",
+      "summary": "有复制槽处于非活跃状态，持续积累 WAL 可能导致磁盘写满",
+      "recommendation": "检查对应的备库是否在线，如已废弃则使用 pg_drop_replication_slot() 删除",
+      "threshold": {}
+    },
+    "PG.SETTINGS.SLOW_QUERY_LOG": {
+      "category": "configuration",
+      "severity": "info",
+      "title": "慢查询日志未配置",
+      "summary": "log_min_duration_statement=-1，未记录慢查询",
+      "recommendation": "ALTER SYSTEM SET log_min_duration_statement='1s'; SELECT pg_reload_conf();",
+      "threshold": {}
+    },
+    "PG.SETTINGS.IDLE_TIMEOUT": {
+      "category": "configuration",
+      "severity": "info",
+      "title": "未设置空闲事务超时",
+      "summary": "idle_in_transaction_session_timeout 未设置",
+      "recommendation": "ALTER SYSTEM SET idle_in_transaction_session_timeout='10min'; SELECT pg_reload_conf();",
+      "threshold": {}
+    },
+    "PG.SETTINGS.STATEMENT_TIMEOUT": {
+      "category": "configuration",
+      "severity": "info",
+      "title": "未设置 SQL 超时",
+      "summary": "statement_timeout 为 0，未限制单条 SQL 执行时间",
+      "recommendation": "ALTER SYSTEM SET statement_timeout='30min'; 按业务需求调整阈值",
+      "threshold": {}
+    },
+    "PG.FILESYSTEM.DATA_DIR": {
+      "category": "storage",
+      "severity": "critical",
+      "title": "数据目录磁盘空间不足",
+      "summary": "PGDATA 所在文件系统使用率超过 80%",
+      "recommendation": "清理 WAL 归档、删除冗余日志，或扩容磁盘。紧急时临时增大 pg_wal 所在目录空间",
+      "threshold": {}
+    },
+    "PG.INDEX.INVALID": {
+      "category": "index",
+      "severity": "warning",
+      "title": "存在无效索引",
+      "summary": "有索引处于无效状态（CONCURRENTLY 创建失败后遗留）",
+      "recommendation": "使用 DROP INDEX CONCURRENTLY 删除无效索引，必要时重建",
+      "threshold": {}
+    },
+    "PG.ROLE.SUPERUSER_COUNT": {
+      "category": "security",
+      "severity": "info",
+      "title": "超级用户过多",
+      "summary": "超级用户角色数量超过 3 个，存在安全风险",
+      "recommendation": "遵循最小权限原则，将不必要的超级用户降权为普通角色",
+      "threshold": {}
+    },
+    "PG.LOG.CONFIG": {
+      "category": "configuration",
+      "severity": "info",
+      "title": "日志收集配置不完整",
+      "summary": "logging_collector 未开启或 log_destination 未包含 stderr",
+      "recommendation": "设置 logging_collector=on，log_destination='stderr'，配置 log_directory 和 log_filename",
+      "threshold": {}
+    }
+  }
+}

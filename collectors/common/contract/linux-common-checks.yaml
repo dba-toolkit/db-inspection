@@ -1,0 +1,181 @@
+catalog_version: "0.1"
+as_of: "2026-08-13"
+scope: "MySQL/PostgreSQL/Oracle 公共 Linux 系统采集语义与字段（阶段 C0 冻结）"
+status: frozen
+
+# 这些检查在两个及以上 Linux 采集器中共用，且输入输出不含数据库专属字段。
+# 数据库专属检查（mysql.* / postgresql.* / oracle.*）不进入本目录。
+common_system_checks:
+  - id: system.os_release
+    title: "操作系统与内核信息"
+    category: system.static
+    artifact: evidence/os_release.txt
+    format: text
+    notes: "os-release + uname + uptime"
+  - id: system.time_status
+    title: "时间与时区"
+    category: system.static
+    artifact: evidence/time_status.txt
+    format: key_value
+    fields: [local_time, utc_time, timezone, epoch_seconds]
+  - id: system.timedatectl
+    title: "timedatectl 状态"
+    category: system.static
+    artifact: evidence/timedatectl.txt
+    format: text
+  - id: system.chronyc_tracking
+    title: "Chrony 跟踪状态"
+    category: system.static
+    artifact: evidence/chronyc_tracking.txt
+    format: text
+  - id: system.chronyc_sources
+    title: "Chrony 时间源"
+    category: system.static
+    artifact: evidence/chronyc_sources.txt
+    format: text
+  - id: system.ntpq_peers
+    title: "NTP 对等节点"
+    category: system.static
+    artifact: evidence/ntpq_peers.txt
+    format: text
+  - id: system.lscpu
+    title: "CPU 拓扑"
+    category: system.static
+    artifact: evidence/lscpu.txt
+    format: text
+  - id: system.free
+    title: "内存快照"
+    category: system.static
+    artifact: tables/memory_snapshot.tsv
+    format: tsv
+  - id: system.filesystems
+    title: "文件系统容量"
+    category: system.static
+    artifact: tables/filesystems.tsv
+    format: tsv
+  - id: system.inodes
+    title: "inode 使用"
+    category: system.static
+    artifact: tables/inodes.tsv
+    format: tsv
+  - id: system.block_devices
+    title: "块设备"
+    category: system.static
+    artifact: tables/block_devices.tsv
+    format: tsv
+  - id: system.ip_address
+    title: "主机 IPv4"
+    category: system.static
+    artifact: evidence/ip_address.txt
+    format: text
+  - id: system.ip_route
+    title: "路由表"
+    category: system.static
+    artifact: evidence/ip_route.txt
+    format: text
+  - id: system.socket_summary
+    title: "网络套接字摘要"
+    category: system.static
+    artifact: evidence/socket_summary.txt
+    format: text
+  - id: system.numa
+    title: "NUMA 拓扑"
+    category: system.static
+    artifact: evidence/numa.txt
+    format: text
+  - id: system.sysctl_selected
+    title: "关键内核参数"
+    category: system.static
+    artifact: tables/kernel_parameters.tsv
+    format: tsv
+  - id: system.hugepages
+    title: "大页配置"
+    category: system.static
+    artifact: tables/hugepages.tsv
+    format: tsv
+  - id: system.iostat
+    title: "iostat 快照"
+    category: system.static
+    artifact: tables/iostat.tsv
+    format: tsv
+    notes: "自 PostgreSQL 实现提升"
+  - id: system.dmesg
+    title: "内核错误摘要"
+    category: system.static
+    artifact: evidence/dmesg_errors.txt
+    format: text
+    notes: "自 PostgreSQL 安全过滤实现提升"
+  - id: system.mounts
+    title: "挂载详情"
+    category: system.static
+    artifact: evidence/mounts.txt
+    format: text
+    notes: "自 PostgreSQL 实现提升"
+  - id: system.sar_history
+    title: "SAR 历史"
+    category: system.sar
+    artifact: history/
+    format: csv
+    fields: [first_timestamp, last_timestamp, coverage_hours, cpu_point_count]
+  - id: timeseries.realtime_sampling
+    title: "实时采样"
+    category: sampling
+    artifact: timeseries/
+    format: csv
+  - id: system.backup_cron
+    title: "备份 cron 线索"
+    category: backup
+    artifact: evidence/backup_cron.txt
+    format: text
+  - id: system.backup_timers
+    title: "备份 timer 线索"
+    category: backup
+    artifact: evidence/backup_timers.txt
+    format: text
+  - id: system.backup_processes
+    title: "备份进程线索"
+    category: backup
+    artifact: evidence/backup_processes.txt
+    format: text
+  - id: package.security_scan
+    title: "敏感内容扫描"
+    category: package
+    artifact: logs/security_scan_findings.txt
+    format: text
+
+# 公共模块（阶段 C1 抽取），输入输出不含数据库专属字段。
+common_modules:
+  - util
+  - runtime
+  - status
+  - security
+  - package
+  - system_static
+  - sampling
+  - sar
+
+# 数据库插件必须提供，公共模块不得硬编码。
+plugin_hooks:
+  - known_tsv_header
+  - cleanup_auth
+
+# 每个检查必须声明的契约字段（目标态，逐项补齐）。
+check_contract_fields:
+  - check_id
+  - title
+  - category
+  - schema_version
+  - applicable
+  - privilege
+  - cost
+  - timeout
+  - artifact
+  - empty_semantics
+  - sensitive_fields
+
+# 主机归属证据（所有 OS 指标必须能证明属于数据库目标主机）。
+host_attribution:
+  database_target_is_local: bool
+  observed_host: string
+  target_host: string
+  collection_method: string
