@@ -388,6 +388,30 @@ record_status() {
       "$output_file" "$(sanitize_text "$reason")" > "$f"
 }
 
+safe_relpath() { printf '%s' "${1#"$TASK_DIR"/}"; }
+
+capture_command() {
+    local item_id="$1" category="$2" outfile="$3"; shift 3
+    local start_iso end_iso start_ms end_ms rc status rows reason err
+    start_iso=$(iso_now); start_ms=$(epoch_ms)
+    err="${RUNTIME[STATUS_DIR]}/.$(sanitize_filename "$item_id").stderr"
+    mkdir -p "$(dirname "$outfile")"
+    "$@" > "$outfile" 2> "$err"; rc=$?
+    end_iso=$(iso_now); end_ms=$(epoch_ms)
+    status="ok"; reason=""
+    if [ "$rc" -ne 0 ]; then
+        if [ ! -s "$err" ] && [ -s "$outfile" ]; then
+            head -c 500 "$outfile" >> "$err" 2>/dev/null
+        fi
+        status=$(classify_failure "$rc" "$err"); reason=$(tail -n 5 "$err" 2>/dev/null | tr '\n' ' ')
+    elif [ ! -s "$outfile" ]; then status="empty"; fi
+    rows=$(wc -l < "$outfile" 2>/dev/null | tr -d ' '); rows=${rows:-0}
+    cat "$err" >> "${RUNTIME[LOG_FILE]}" 2>/dev/null
+    rm -f "$err"
+    record_status "$item_id" "$category" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "$rows" "$rc" "$(safe_relpath "$outfile")" "$reason"
+    return "$rc"
+}
+
 # 磁盘空间预检
 check_output_space() {
     local free_kb
@@ -868,6 +892,53 @@ collect_sys_info() {
     printf "LD_LIBRARY_PATH=%s\n" "${LD_LIBRARY_PATH:-未设置}" >> "${RUNTIME[REPORT_FILE]}"
     printf "PATH=%s\n"          "${PATH}" >> "${RUNTIME[REPORT_FILE]}"
     md_block_end
+}
+
+# ==================== 模块: 系统静态信息（结构化） ====================
+collect_system_static() {
+    [ "${CONFIG[STRUCTURED]}" -eq 1 ] || return 0
+    [ -n "$TASK_DIR" ] || return 0
+
+    capture_command "system.os_release" "system.static" "$EVIDENCE_DIR/os_release.txt" bash -c 'cat /etc/os-release 2>/dev/null; uname -a; uptime 2>/dev/null' || true
+    capture_command "system.time_status" "system.static" "$EVIDENCE_DIR/time_status.txt" bash -c 'printf "local_time="; date --iso-8601=seconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z; printf "utc_time="; date -u --iso-8601=seconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; printf "timezone="; cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || date +%Z; printf "epoch_seconds="; date +%s' || true
+    if has_cmd timedatectl; then capture_command "system.timedatectl" "system.static" "$EVIDENCE_DIR/timedatectl.txt" timedatectl status || true; fi
+    if has_cmd chronyc; then
+        capture_command "system.chronyc_tracking" "system.static" "$EVIDENCE_DIR/chronyc_tracking.txt" chronyc tracking || true
+        capture_command "system.chronyc_sources" "system.static" "$EVIDENCE_DIR/chronyc_sources.txt" chronyc sources -v || true
+    elif has_cmd ntpq; then
+        capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn || true
+    fi
+    has_cmd lscpu && capture_command "system.lscpu" "system.static" "$EVIDENCE_DIR/lscpu.txt" lscpu || record_status "system.lscpu" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "lscpu not installed"
+    has_cmd free && capture_command "system.free" "system.static" "$TABLES_DIR/memory_snapshot.tsv" free -b || true
+    has_cmd df && capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
+    has_cmd df && capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
+    has_cmd lsblk && capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL || true
+    has_cmd mount && capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount || true
+    if has_cmd ip; then
+        capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show || true
+        capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all || true
+    elif has_cmd ifconfig; then
+        capture_command "system.ifconfig" "system.static" "$EVIDENCE_DIR/ip_address.txt" ifconfig -a || true
+    else
+        record_status "system.ip_address" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "ip/ifconfig not installed"
+    fi
+    has_cmd ss && capture_command "system.socket_summary" "system.static" "$EVIDENCE_DIR/socket_summary.txt" ss -s || true
+    has_cmd numactl && capture_command "system.numa" "system.static" "$EVIDENCE_DIR/numa.txt" numactl --hardware || true
+    has_cmd sysctl && capture_command "system.sysctl_selected" "system.static" "$TABLES_DIR/kernel_parameters.tsv" bash -c '
+      for k in vm.swappiness vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes vm.overcommit_memory vm.zone_reclaim_mode fs.file-max fs.aio-max-nr kernel.shmmax kernel.shmall net.core.somaxconn net.ipv4.tcp_max_syn_backlog; do
+        v=$(sysctl -n "$k" 2>/dev/null) && printf "%s\t%s\n" "$k" "$v"
+      done
+      exit 0' || true
+    {
+        printf 'path\tvalue\n'
+        for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag /proc/sys/vm/nr_hugepages; do
+            [ -r "$f" ] && printf '%s\t%s\n' "$f" "$(tr '\n' ' ' < "$f")"
+        done
+    } > "$TABLES_DIR/hugepages.tsv"
+    record_status "system.hugepages" "system.static" "ok" "$(iso_now)" "$(iso_now)" 0 "$(awk 'END{print NR-1}' "$TABLES_DIR/hugepages.tsv")" 0 "tables/hugepages.tsv" ""
+    if has_cmd dmesg; then
+        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null || true
+    fi
 }
 
 # ==================== 模块2: Oracle 基础信息 ====================
@@ -3430,6 +3501,7 @@ printf "========================================\n"
 # 后台并行：SAR 历史 + 实时时序（两者独立于 Oracle 主流程，耗时约 30s）
 run_module "生成AWR性能报告"           collect_awr_report
 run_module "采集系统信息"              collect_sys_info
+run_module "采集系统静态信息"          collect_system_static
 start_module_bg "采集SAR历史"          collect_sar_history
 start_module_bg "实时时序采样"         collect_oracle_realtime_samples
 run_module "采集Oracle基础信息"        collect_oracle_info
