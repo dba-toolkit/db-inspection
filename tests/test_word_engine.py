@@ -16,7 +16,7 @@ from plugins.mysql.word_report import MYSQL_WORD_PROFILE, MySQLWordReportGenerat
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORT_MODEL = PROJECT_ROOT / "tests" / "baselines" / "mysql" / "current" / "report_model.json"
 LOGO = PROJECT_ROOT / "logo.png"
-PRE_SPLIT_NORMALIZED_DOCUMENT_XML = "C825B99396B1C43DE7899345BAF546B10CBD22DE3295C6B263AAB8544D23E028"
+PRE_SPLIT_NORMALIZED_DOCUMENT_XML = "F7B0D2457FB0F1BDB8BAF4E36263EEC17AC87884BF145871A7AAFF650543C915"
 
 
 def normalized_document_xml_hash(path: Path) -> str:
@@ -86,7 +86,7 @@ class WordEngineTests(unittest.TestCase):
             generated = Document(output)
             paragraphs = [paragraph.text for paragraph in generated.paragraphs]
             first_item = paragraphs.index("3.1 主机与操作系统信息")
-            chapter_analysis = paragraphs.index("3.5 本章分析结论")
+            chapter_analysis = paragraphs.index("3.7 本章分析结论")
             self.assertLess(first_item, chapter_analysis)
             self.assertFalse(
                 any(value.startswith("分析结论（") for value in paragraphs[first_item:chapter_analysis])

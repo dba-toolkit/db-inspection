@@ -109,6 +109,35 @@ class MySQLPresentationBuilder:
         return values
 
     @staticmethod
+    def _mount_rows(path: Path) -> list[dict[str, str]]:
+        if not path.exists():
+            return []
+        rows: list[dict[str, str]] = []
+        pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            matched = pattern.match(raw.strip())
+            if not matched:
+                continue
+            rows.append({
+                "设备": matched.group(1).strip(),
+                "挂载点": matched.group(2).strip(),
+                "类型": matched.group(3).strip(),
+                "挂载选项": matched.group(4).strip(),
+            })
+        return rows
+
+    @staticmethod
+    def _dmesg_error_rows(path: Path, limit: int = 20) -> list[dict[str, str]]:
+        if not path.exists():
+            return []
+        lines = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+        return [{"内核错误日志": line} for line in lines[:limit]]
+
+    @staticmethod
     def _kernel_recommendation(ctx: "PackageContext") -> str:
         """Check OS kernel parameters for database-specific recommendations."""
         path = ctx.root / "tables/kernel_parameters.tsv"
@@ -393,6 +422,8 @@ class MySQLPresentationBuilder:
             for row in metrics.get("capacity", {}).get("filesystems", [])
         ]
         kernel_rows = self._raw_key_value_rows(ctx.root / "tables/kernel_parameters.tsv")
+        mount_rows = self._mount_rows(ctx.root / "evidence/mounts.txt")
+        dmesg_rows = self._dmesg_error_rows(ctx.root / "evidence/dmesg_errors.txt")
         realtime = metrics.get("system_realtime", {})
         resource_rows = [
             {
@@ -753,6 +784,13 @@ class MySQLPresentationBuilder:
                                "已取得数据库相关内核参数；参数值需结合数据库内存预算和操作系统基线复核。",
                                recommendation=self._kernel_recommendation(ctx),
                                collection=collection("system.sysctl_selected"), total_rows=len(kernel_rows)),
+                    self._item("system.mounts", "挂载参数", "evidence/mounts.txt", mount_rows,
+                               "已取得挂载参数，可用于检查数据库数据目录所在文件系统的持久性选项。" if mount_rows else "未采集到挂载参数。",
+                               collection=collection("system.mounts"), total_rows=len(mount_rows)),
+                    self._item("system.dmesg_errors", "内核错误摘要", "evidence/dmesg_errors.txt", dmesg_rows,
+                               "存在内核错误级别日志，建议结合硬件与系统日志复核。" if dmesg_rows else "未发现内核错误级别日志。",
+                               status="attention" if dmesg_rows else "normal",
+                               collection=collection("system.dmesg_errors"), total_rows=len(dmesg_rows)),
                 ],
             },
             {

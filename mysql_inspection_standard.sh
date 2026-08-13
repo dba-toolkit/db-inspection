@@ -417,6 +417,7 @@ collect_system_static() {
     has_cmd df && capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
     has_cmd df && capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
     has_cmd lsblk && capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL || true
+    has_cmd mount && capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount || true
     if has_cmd ip; then
         capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show || true
         capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all || true
@@ -439,6 +440,9 @@ collect_system_static() {
         done
     } > "$TABLES_DIR/hugepages.tsv"
     record_status "system.hugepages" "system.static" "ok" "$(iso_now)" "$(iso_now)" 0 "$(awk 'END{print NR-1}' "$TABLES_DIR/hugepages.tsv")" 0 "tables/hugepages.tsv" ""
+    if has_cmd dmesg; then
+        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null || true
+    fi
 
     if has_cmd ps; then
         ps -eo pid,ppid,user,etimes,%cpu,%mem,args 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /[m]ysqld/ {print}' | redact_command_stream > "$EVIDENCE_DIR/mysql_processes.txt"

@@ -65,7 +65,7 @@ class ReportingModelTests(unittest.TestCase):
         items = [item for section in sections for item in section["items"]]
         item_ids = [item["item_id"] for item in items]
         self.assertEqual(len(sections), 9)
-        self.assertEqual(len(items), 33)
+        self.assertEqual(len(items), 35)
         self.assertEqual(len(item_ids), len(set(item_ids)))
         self.assertTrue(conclusions)
         for item in items:
