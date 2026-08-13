@@ -4,9 +4,11 @@
 
 ## 1. 环境准备
 
-项目依赖见 `requirements.txt`。本机已有可用 Python 环境时，用 `D:\python\python.exe`（已装 `python-docx` / `matplotlib` / `Pillow` / `PyYAML`）；否则先安装：
+推荐用独立虚拟环境：
 
 ```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
 
@@ -16,7 +18,9 @@ python -m pip install -r requirements.txt
 python -c "import docx, matplotlib, PIL, yaml; print('deps ok')"
 ```
 
-注意：如果直接运行 `python` 报 `ModuleNotFoundError: No module named 'docx'`，说明当前 `python` 不是项目环境，请改用 `D:\python\python.exe` 或先执行上面的安装命令。
+如果不想建虚拟环境，也可以直接用本机已装好依赖的 `D:\python\python.exe`（本项目开发时所用）。`run.ps1` 会优先使用 `.venv`，其次 `D:\python\python.exe`，最后系统 `python`。
+
+报告品牌信息（公司、编制人、复核人、logo）统一在 `report_config.json` 中配置；生成报告时的命令行参数会覆盖该默认值。
 
 ## 2. 最短使用流程
 

@@ -19,7 +19,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $python = "python"
-if (Test-Path "D:\python\python.exe") { $python = "D:\python\python.exe" }
+if (Test-Path ".\.venv\Scripts\python.exe") { $python = ".\.venv\Scripts\python.exe" }
+elseif (Test-Path "D:\python\python.exe") { $python = "D:\python\python.exe" }
 
 if (-not $OutputDir) {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($Package)

@@ -24,6 +24,20 @@ GENERATORS = {
 }
 
 
+def _load_config() -> dict:
+    path = Path(__file__).resolve().parent / "report_config.json"
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+REPORT_CONFIG = _load_config()
+
+
 def adapt_if_needed(contract: str, model: dict) -> dict:
     if contract == "oracle_inspection_report_model":
         from plugins.oracle.report_adapter import adapt_report_model
@@ -39,12 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="report_model.json 或其所在目录")
     parser.add_argument("--output", help="输出 .docx 路径")
     parser.add_argument("--customer", default="")
-    parser.add_argument("--company", default="")
+    parser.add_argument("--company", default=REPORT_CONFIG.get("company", ""))
     parser.add_argument("--target", default="")
-    parser.add_argument("--author", default="王劲松")
-    parser.add_argument("--reviewer", default="邓秋爽")
+    parser.add_argument("--author", default=REPORT_CONFIG.get("author", "自动生成"))
+    parser.add_argument("--reviewer", default=REPORT_CONFIG.get("reviewer", "待填写"))
     parser.add_argument("--report-version", default="")
-    parser.add_argument("--logo", default="logo.png")
+    parser.add_argument("--logo", default=REPORT_CONFIG.get("logo", "logo.png"))
     parser.add_argument("--layout", choices=("professional", "legacy"), default="professional")
     return parser.parse_args()
 
