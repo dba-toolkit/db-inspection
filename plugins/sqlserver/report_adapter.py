@@ -262,6 +262,10 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
     quality = source.get("collection_quality") or {}
 
     server_name = instance.get("server_name") or overview.get("server_name")
+    raw_ip = overview.get("ip") or instance.get("connection_ip")
+    ip_address = raw_ip if raw_ip not in (None, "", ".") else (instance.get("machine_name") or server_name)
+    raw_port = target.get("port") or instance.get("connection_port") or 0
+    port_value = raw_port or 1433
     version = instance.get("product_version") or overview.get("product_version")
     collection_time = (
         overview.get("collection_finished_at")
@@ -322,7 +326,7 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
         },
         "overview": {
             "host": server_name,
-            "ip": overview.get("ip") or instance.get("connection_ip") or ".",
+            "ip": ip_address,
             "database_version": version,
             "collection_time": collection_time,
             "data_quality": quality,
@@ -332,8 +336,8 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
             "nodes": [{
                 "instance_tag": server_name,
                 "hostname": instance.get("machine_name") or server_name,
-                "ip": overview.get("ip") or instance.get("connection_ip") or ".",
-                "port": target.get("port") or instance.get("connection_port") or 0,
+                "ip": ip_address,
+                "port": port_value,
                 "role_observed": "PRIMARY",
                 "version": version,
             }],
