@@ -654,8 +654,6 @@ ALTER SESSION SET nls_language='AMERICAN';
 $sql
 EXIT;
 EOF
-EXIT;
-EOF
         # 头保证：空结果时确保至少有一行header注释
         if [ ! -s "$tsv_file" ]; then
             printf '# no rows returned\n' > "$tsv_file"
