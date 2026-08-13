@@ -7,8 +7,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-import generate_report_docx_v3 as legacy_entry
 from docx import Document
+from inspection_core.package_io import read_json
 from inspection_core.word_engine import WordReportEngine
 from plugins.mysql.word_report import MYSQL_WORD_PROFILE, MySQLWordReportGenerator
 
@@ -30,7 +30,6 @@ def normalized_document_xml_hash(path: Path) -> str:
 
 class WordEngineTests(unittest.TestCase):
     def test_mysql_entry_is_a_thin_shared_engine_adapter(self) -> None:
-        self.assertIs(legacy_entry.ReportGenerator, MySQLWordReportGenerator)
         self.assertTrue(issubclass(MySQLWordReportGenerator, WordReportEngine))
         self.assertEqual(MySQLWordReportGenerator.__module__, "plugins.mysql.word_report")
 
@@ -104,7 +103,7 @@ class WordEngineTests(unittest.TestCase):
                 for row in table.rows
                 for cell in row.cells
             )
-            model = legacy_entry.load_json(REPORT_MODEL)
+            model = read_json(REPORT_MODEL)
             self.assertIn(f"{model['health_assessment']['score']} / 100", table_text)
             for finding in model["risk_register"]:
                 self.assertIn(finding["finding_id"], table_text)
