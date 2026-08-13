@@ -15,12 +15,9 @@ from typing import Any
 
 from dataclasses import dataclass, field
 
-from analyze_oracle_inspection_v2 import (
-    Finding,
-    PackageContext,
-    safe_float,
-    safe_int,
-)
+from .metrics import safe_float, safe_int
+from .package_adapter import OraclePackageContext as PackageContext
+from .presentation import Finding
 
 RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules_oracle.json"
 

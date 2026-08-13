@@ -15,7 +15,7 @@ from typing import Any
 
 from inspection_core.models import PackageContext as BasePackageContext
 from inspection_core.package_io import is_safe_member, read_json, safe_extract_tar, sha256_file
-from inspection_core.tabular import parse_csv, parse_delimited, parse_sadf
+from inspection_core.tabular import parse_sadf
 from inspection_core.values import safe_int
 
 
@@ -75,6 +75,40 @@ def _load_collection_status(status_dir: Path) -> dict[str, Any]:
                 if row:
                     items.append(dict(zip(fields, row[: len(fields)] + [""] * len(fields))))
     return {"items": items}
+
+
+def parse_delimited(path: Path, delimiter: str = "\t") -> list[dict[str, str]]:
+    """Oracle 表格解析：跳过 sqlplus 分隔线，并去除键/值两侧空白。"""
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    lines: list[str] = []
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            stripped = line.rstrip("\n\r")
+            if not stripped or stripped.startswith("#"):
+                continue
+            if all(c in "-| \t" for c in stripped):
+                continue
+            lines.append(stripped)
+    if not lines:
+        return []
+    reader = csv.DictReader(lines, delimiter=delimiter)
+    result: list[dict[str, str]] = []
+    for row in reader:
+        cleaned: dict[str, str] = {}
+        for key, value in row.items():
+            if key is not None:
+                clean_key = key.strip()
+                clean_value = value.strip() if value else ""
+                if clean_key:
+                    cleaned[clean_key] = clean_value
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def parse_csv(path: Path) -> list[dict[str, str]]:
+    return parse_delimited(path, ",")
 
 
 class OraclePackageAdapter:

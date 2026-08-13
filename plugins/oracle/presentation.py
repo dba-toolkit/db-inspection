@@ -13,6 +13,7 @@ from .package_adapter import parse_instance_tag
 
 VERSION = "2.0.0"
 CONTRACT = "oracle_inspection_report_model"
+ANALYSIS_SCHEMA_VERSION = "2.0"
 
 
 def now_iso() -> str:
