@@ -85,7 +85,7 @@ analyze_oracle.py / analyze_sqlserver.py             # 各库分析器
 inspection_core/                                     # 公共模型、Word 引擎、声明式规则引擎
 plugins/mysql/  plugins/postgresql/
 plugins/oracle/ plugins/sqlserver/                   # 四库插件
-contracts/  docs/  tests/  rules/  collectors/       # 契约、文档、测试、规则示例、采集层参考
+contracts/  docs/  tests/  rules/                    # 契约、文档、测试、规则示例
 inspection_rules.json                                # MySQL 24 条规则阈值
 ```
 
