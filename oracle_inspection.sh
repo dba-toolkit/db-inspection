@@ -406,7 +406,6 @@ capture_command() {
         status=$(classify_failure "$rc" "$err"); reason=$(tail -n 5 "$err" 2>/dev/null | tr '\n' ' ')
     elif [ ! -s "$outfile" ]; then status="empty"; fi
     rows=$(wc -l < "$outfile" 2>/dev/null | tr -d ' '); rows=${rows:-0}
-    cat "$err" >> "${RUNTIME[LOG_FILE]}" 2>/dev/null
     rm -f "$err"
     record_status "$item_id" "$category" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "$rows" "$rc" "$(safe_relpath "$outfile")" "$reason"
     return "$rc"
