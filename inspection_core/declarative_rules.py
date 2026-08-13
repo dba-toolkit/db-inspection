@@ -1,4 +1,4 @@
-"""声明式规则引擎原型（纯函数，不碰现有分析代码）。
+"""声明式规则引擎（通用纯函数，四库共享）。
 
 输入 collection-facts-v1 事实模型 + 解析后的 rules YAML，输出 RuleEvaluation 列表。
 """
