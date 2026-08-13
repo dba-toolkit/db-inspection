@@ -30,7 +30,7 @@ class OraclePluginTests(unittest.TestCase):
         self.assertEqual(len(result["risk_register"]), len(source["risk_register"]))
         self.assertEqual(len(result["risk_register"]), 10)
         self.assertEqual(len(result["inspection_sections"]), 9)
-        self.assertEqual(sum(len(section["items"]) for section in result["inspection_sections"]), 48)
+        self.assertEqual(sum(len(section["items"]) for section in result["inspection_sections"]), 52)
         self.assertEqual(len(result["appendix"]["rule_evaluations"]), 34)
         self.assertTrue(all("source_severity" in finding for finding in result["risk_register"]))
 
@@ -41,8 +41,8 @@ class OraclePluginTests(unittest.TestCase):
             for section in result["inspection_sections"]
             for item in section["items"]
         ]
-        self.assertEqual(len(item_ids), 48)
-        self.assertEqual(len(set(item_ids)), 48)
+        self.assertEqual(len(item_ids), 52)
+        self.assertEqual(len(set(item_ids)), 52)
         self.assertTrue(all(isinstance(value, str) and value for value in item_ids))
         self.assertEqual(item_ids[0], "system.host")
         self.assertIn("ORA.ARCHIVE.MODE", item_ids)
@@ -54,9 +54,9 @@ class OraclePluginTests(unittest.TestCase):
             for section in result["inspection_sections"]
             for item in section["items"]
         ]
-        # 16 fact-only items: 14 with rows become normal, 2 without rows stay not_evaluated.
-        self.assertEqual(statuses.count("normal"), 34)
-        self.assertEqual(statuses.count("not_evaluated"), 5)
+        # 20 fact-only items: 15 with rows become normal, 5 without rows stay not_evaluated.
+        self.assertEqual(statuses.count("normal"), 35)
+        self.assertEqual(statuses.count("not_evaluated"), 8)
         self.assertEqual(statuses.count("risk"), 3)
         self.assertEqual(statuses.count("attention"), 6)
         self.assertEqual(len(result["appendix"]["rule_evaluations"]), 34)

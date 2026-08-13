@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
 
 from .metrics import safe_float
@@ -18,6 +19,73 @@ ANALYSIS_SCHEMA_VERSION = "2.0"
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _colon_map(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    result: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ":" not in raw:
+            continue
+        name, value = raw.split(":", 1)
+        result[name.strip()] = value.strip()
+    return result
+
+
+def _kv_map(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    result: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in raw:
+            continue
+        name, value = raw.split("=", 1)
+        result[name.strip()] = value.strip()
+    return result
+
+
+def _key_value_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "\t" in line:
+            name, value = line.split("\t", 1)
+        elif "=" in line:
+            name, value = line.split("=", 1)
+        else:
+            continue
+        rows.append({"参数": name.strip(), "值": value.strip()})
+    return rows
+
+
+def _mount_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        matched = pattern.match(raw.strip())
+        if not matched:
+            continue
+        rows.append({
+            "设备": matched.group(1).strip(),
+            "挂载点": matched.group(2).strip(),
+            "类型": matched.group(3).strip(),
+            "挂载选项": matched.group(4).strip(),
+        })
+    return rows
+
+
+def _dmesg_rows(path: Path, limit: int = 20) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+    return [{"内核错误日志": line} for line in lines[:limit]]
 
 
 @dataclass
@@ -69,6 +137,20 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     ora = metrics.get("oracle_realtime", {})
     sys_rt = metrics.get("system_realtime", {})
     sys_hist = metrics.get("system_history", {})
+
+    root = ctx.root
+    lscpu = _colon_map(root / "evidence/lscpu.txt")
+    time_info = _kv_map(root / "evidence/time_status.txt")
+    kernel_rows = _key_value_rows(root / "tables/kernel_parameters.tsv")
+    mount_rows = _mount_rows(root / "evidence/mounts.txt")
+    dmesg_rows = _dmesg_rows(root / "evidence/dmesg_errors.txt")
+    os_name = env.get("os") or env.get("distribution") or ""
+    os_release_path = root / "evidence/os_release.txt"
+    if os_release_path.exists():
+        for line in os_release_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                os_name = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
 
     # ── build lookup indexes ──
     _finding_by_rule: dict[str, dict[str, Any]] = {}
@@ -141,7 +223,10 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         _item("主机信息", "system.host", [
             _val_row("主机名", s_hostname or env.get("host", ""), "采集目标主机"),
             _val_row("IP 地址", s_ip or env.get("host", ""), "数据库服务地址"),
-            _val_row("操作系统", env.get("os") or env.get("distribution", ""), ""),
+            _val_row("操作系统", os_name, ""),
+            _val_row("CPU 型号", lscpu.get("Model name", ""), "处理器型号"),
+            _val_row("CPU 核数", lscpu.get("CPU(s)", ""), "逻辑核心"),
+            _val_row("NUMA 节点", lscpu.get("NUMA node(s)", ""), "NUMA 拓扑"),
         ]),
         _item("数据库身份", "oracle.identity", [
             _val_row("数据库名", env.get("db_name")),
@@ -158,6 +243,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                analysis=_analysis("ORA.COLLECTION.INTEGRITY")),
         _item("采集数据质量", "ORA.COLLECTION.QUALITY",
                analysis=_analysis("ORA.COLLECTION.QUALITY")),
+        _data_item("时间与时区", "system.time", [
+            _val_row("本地时间", time_info.get("local_time", ""), ""),
+            _val_row("时区", time_info.get("timezone", ""), ""),
+        ]),
+        _data_item("关键内核参数", "system.kernel", kernel_rows),
+        _data_item("挂载参数", "system.mounts", mount_rows),
+        _data_item("内核错误摘要", "system.dmesg_errors", dmesg_rows),
     ]
     # ── DB config info (informational display) ──
     db_info_rows = ctx.tables.get("数据库基本信息", [])
