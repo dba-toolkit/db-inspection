@@ -215,6 +215,15 @@
       "recommendation": "检查复制错误、网络和源端状态，制定可回滚的恢复步骤。",
       "evidence_refs": ["tables/replica_status.tsv"]
     },
+    "MYSQL.REPLICATION.RESIDUAL_CHANNEL": {
+      "category": "availability",
+      "severity": "low",
+      "confidence": 0.9,
+      "title": "存在指向自身的残留复制通道",
+      "summary": "复制状态行的上游声明指向本机（Source_UUID 为空），属残留或未启动的通道，不构成真实主从关系，但会在巡检判断和切换演练中造成误判。",
+      "recommendation": "确认该通道为历史配置遗留后清理（RESET REPLICA ALL）或补全上游信息；清理前确认不影响现有下游复制链路。",
+      "evidence_refs": ["tables/replica_status.tsv"]
+    },
     "MYSQL.LOG.ERROR_EVENTS": {
       "category": "availability",
       "severity": "medium",

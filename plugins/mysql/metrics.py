@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from inspection_core import PackageContext, safe_float, safe_int
+from inspection_core.charts import disk_throughput_value
 from inspection_core.sampling import sar_history_quality
 from inspection_core.statistics import summarize
 from inspection_core.system_checks import is_persistent_fstype
@@ -280,8 +281,14 @@ class MySQLMetricProvider:
             bucket = sar_disk_by_device.setdefault(
                 device, {"util": [], "await": [], "read_kbps": [], "write_kbps": []}
             )
-            for key, target in (("%util", "util"), ("await", "await"), ("rkB/s", "read_kbps"), ("wkB/s", "write_kbps")):
+            for key, target in (("%util", "util"), ("await", "await")):
                 value = safe_float(row.get(key))
+                if value is not None:
+                    bucket[target].append(value)
+            # 吞吐列有两种拼法（rkB/s 与扇区/秒），归一在公共层做，
+            # 这里只负责取 KiB/s 的数（见 history.DISK_THROUGHPUT_ALIASES）。
+            for key, target in (("rkB/s", "read_kbps"), ("wkB/s", "write_kbps")):
+                value = disk_throughput_value(row, key)
                 if value is not None:
                     bucket[target].append(value)
 

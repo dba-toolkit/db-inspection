@@ -20,6 +20,7 @@ from inspection_core.charts import (
     apply_style,
     busy_percent,
     chart_colors,
+    disk_throughput_value,
     finite,
     gap_indices,
     generate_os_charts,
@@ -173,6 +174,24 @@ class ChartHistoryTests(unittest.TestCase):
         self.assertEqual(busy_percent(rows), [20.0, 30.0, None])
         self.assertIsNone(finite("nan"))
 
+    def test_disk_throughput_accepts_both_sar_spellings(self) -> None:
+        """`sadf -d` 给 rkB/s 还是给扇区/秒取决于 sysstat 是否认 `-p`，两种都要认。
+
+        只认 rkB/s 时，Anolis 7.9 这类忽略 `-p` 的机器上磁盘图"吞吐"面板会全空
+        （图照常生成、不报错，Y 轴退化成 ±0.04）。
+        """
+        self.assertEqual(disk_throughput_value({"rkB/s": "12"}, "rkB/s"), 12.0)
+        self.assertEqual(disk_throughput_value({"rd_sec/s": "8"}, "rkB/s"), 4.0)
+        # 规范列有值优先；规范列为空（未采到）时回落到扇区列。
+        self.assertEqual(
+            disk_throughput_value({"rkB/s": "12", "rd_sec/s": "999"}, "rkB/s"), 12.0
+        )
+        self.assertEqual(
+            disk_throughput_value({"rkB/s": "", "rd_sec/s": "8"}, "rkB/s"), 4.0
+        )
+        self.assertIsNone(disk_throughput_value({}, "rkB/s"))
+        self.assertIsNone(disk_throughput_value({"rd_sec/s": "8"}, "wkB/s"))
+
     def test_summarize_reports_none_for_empty_stream(self) -> None:
         from inspection_core.charts import summarize
 
@@ -232,6 +251,21 @@ class OsSpecTests(unittest.TestCase):
         self.assertIn("sdb", spec["title"])
         self.assertEqual(len(spec["panels"]), 3)
         self.assertEqual(len(spec["x"]), 4)
+
+    def test_disk_spec_plots_sector_throughput_in_kib(self) -> None:
+        """扇区拼法下"吞吐"面板必须有曲线，且换算成 KiB/s。"""
+        rows = [
+            {"DEV": "sdb", "timestamp": f"2026-08-11T10:{i:02d}:00", "%util": "60",
+             "await": "9", "rd_sec/s": str(1000 + i), "wr_sec/s": str(2000 + i)}
+            for i in range(4)
+        ]
+        spec = os_chart_specs(context({"sar_disk": rows}), TAG)[2]
+        self.assertIn("sdb", spec["title"])
+        panel_title, ylabel, series = spec["panels"][0]
+        self.assertEqual((panel_title, ylabel), ("吞吐", "KiB/s"))
+        values = dict(series)
+        self.assertEqual(values["读取"], [500.0, 500.5, 501.0, 501.5])
+        self.assertEqual(values["写入"], [1000.0, 1000.5, 1001.0, 1001.5])
 
     def test_spec_without_points_has_no_usable_data(self) -> None:
         spec = os_chart_specs(context(), TAG)[0]

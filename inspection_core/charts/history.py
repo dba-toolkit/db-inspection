@@ -21,8 +21,11 @@ from ..values import safe_float
 
 __all__ = [
     "CPU_SUMMARY_VALUES",
+    "DISK_THROUGHPUT_ALIASES",
     "SAR_CPU_ALIASES",
     "busy_percent",
+    "disk_throughput_value",
+    "disk_throughput_values",
     "display_timezone",
     "finite",
     "gap_indices",
@@ -45,6 +48,18 @@ CPU_SUMMARY_VALUES = ("-1", "all", "ALL")
 SAR_CPU_ALIASES: dict[str, tuple[str, ...]] = {
     "%user": ("%usr",),
     "%system": ("%sys",),
+}
+
+# Disk throughput has the same problem, plus a unit change.  `sadf -d` prints
+# `rkB/s`/`wkB/s` (KiB/s) only when the `-p` pretty flag is honoured; sysstat
+# builds that ignore it (seen on Anolis 7.9) print `rd_sec/s`/`wr_sec/s`
+# instead, i.e. sectors per second, 1 sector = 512 B = 0.5 KiB.  All three
+# collectors pass `sadf … -- -d -p`, so a spec that only reads `rkB/s` renders
+# an empty throughput panel whenever the flag is ignored — the chart is still
+# produced and nothing errors.  Normalise both spellings to KiB/s here, once.
+DISK_THROUGHPUT_ALIASES: dict[str, tuple[tuple[str, float], ...]] = {
+    "rkB/s": (("rd_sec/s", 0.5),),
+    "wkB/s": (("wr_sec/s", 0.5),),
 }
 
 _TIME_KEYS = ("timestamp", "ts", "time")
@@ -211,3 +226,26 @@ def series_values(rows: list[dict[str, Any]], key: str, scale: float = 1.0,
 def busy_percent(rows: list[dict[str, Any]], idle_key: str = "%idle") -> list[float | None]:
     """Convert a SAR ``%idle`` column into a busy percentage."""
     return series_values(rows, idle_key, scale=-1.0, offset=100.0)
+
+
+def disk_throughput_value(row: dict[str, Any], key: str) -> float | None:
+    """Read one disk throughput value in KiB/s, accepting either SAR spelling.
+
+    ``key`` is the canonical KiB/s column (``rkB/s`` / ``wkB/s``); the sector
+    spelling is converted when present.  The canonical column wins only when it
+    actually carries a number, so a collected file cannot end up with a defined
+    key and an empty series.
+    """
+    value = finite(row.get(key))
+    if value is not None:
+        return value
+    for alias, scale in DISK_THROUGHPUT_ALIASES.get(key, ()):
+        alias_value = finite(row.get(alias))
+        if alias_value is not None:
+            return alias_value * scale
+    return None
+
+
+def disk_throughput_values(rows: list[dict[str, Any]], key: str) -> list[float | None]:
+    """``disk_throughput_value`` over a SAR disk table, preserving None gaps."""
+    return [disk_throughput_value(row, key) for row in rows]

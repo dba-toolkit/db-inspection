@@ -18,8 +18,15 @@ from inspection_core import (
     safe_float,
     safe_int,
 )
-from plugins.mysql.metrics import row_number
 from inspection_core.system_checks import is_persistent_fstype
+from plugins.mysql.metrics import (
+    local_host_names,
+    replica_threads_running,
+    row_number,
+    split_self_referencing_replica_rows,
+)
+
+
 # MySQL 自带的系统库。判定"实例上有没有业务库"必须靠这份显式名单，
 # 不能靠"名字看起来像不像系统库"，否则新建的元数据库会被误判成业务库、
 # 或者业务库被误判成系统库（后者会直接把结论写成"无业务对象可评价"）。
@@ -316,17 +323,27 @@ class MySQLPresentationBuilder:
         limit: int = 20,
         preserve_empty: Sequence[str] = (),
     ) -> list[dict[str, Any]]:
+        """把原始表行投影成报告列。
+
+        同一个中文列名可以配多个来源拼写（复制状态表里 `Replica_IO_Running` 与
+        `Slave_IO_Running` 是 MySQL 8.0.22 改名前后的两种写法，只有一种会真的
+        出现在表里）。语义是「首个命中优先」：某个拼写已经取到值之后，后面的拼写
+        只做兜底，**不得把已找到的值覆盖成空**——否则新名有值、旧名不存在，同一列
+        会被回写成 None，报告里就出现一整行"未采集"。
+        """
         selected: list[dict[str, Any]] = []
         preserve_set = set(preserve_empty)
         for raw in rows[:limit]:
             lowered = {str(key).lower(): value for key, value in raw.items()}
             item: dict[str, Any] = {}
             for source, label in columns:
+                if item.get(label) is not None:
+                    continue
                 value = raw.get(source)
                 if value is None:
                     value = lowered.get(source.lower())
                 if label in preserve_set:
-                    item[label] = value if value is not None else None
+                    item[label] = value
                 else:
                     item[label] = value if value not in {"", "NULL"} else None
             selected.append(item)
@@ -706,6 +723,29 @@ class MySQLPresentationBuilder:
             {"检查项": "数据锁等待", "记录数": len(ctx.tables.get("data_lock_waits", [])), "证据文件": "tables/data_lock_waits.tsv"},
             {"检查项": "待授予元数据锁", "记录数": len(ctx.tables.get("metadata_locks_pending", [])), "证据文件": "tables/metadata_locks_pending.tsv"},
         ]
+        # 结论与证据必须和本页表格、风险台账同源。这里曾把结论和证据写死成
+        # 「未发现长事务…」「长事务 0 条」，而同一章表格里长事务是 270 条、
+        # MYSQL.TRANSACTION.LONG_RUNNING 也据此报了 high —— 报告自相矛盾，
+        # 客户对着表格就能看出结论在撒谎。
+        lock_counts = {str(row["检查项"]): int(row.get("记录数") or 0) for row in lock_rows}
+        lock_total = sum(lock_counts.values())
+        longest_lock_seconds = (metrics.get("activity") or {}).get("max_long_transaction_seconds")
+        lock_status = "risk" if lock_total else "normal"
+        lock_conclusion = (
+            "采集时未发现长事务、数据锁等待或待授予元数据锁；该结论仅代表采集时点。"
+            if not lock_total else
+            "采集时发现 " + "、".join(
+                f"{name} {count} 条" for name, count in lock_counts.items() if count
+            ) + "；长事务会放大锁等待、阻塞链和 Undo 膨胀，需先定位会话与业务调用链再处置。"
+        )
+        lock_evidence = [f"{name} {count} 条" for name, count in lock_counts.items()]
+        if lock_total and longest_lock_seconds is not None:
+            lock_evidence.append(f"最长事务 {float(longest_lock_seconds):.0f} 秒")
+        lock_recommendation = (
+            "定位会话和业务调用链，确认长事务来源后尽快提交或回滚；"
+            "处置前先确认对业务的影响，避免直接盲目终止会话。"
+            if lock_total else ""
+        )
 
         db_sizes = self._select_rows(
             ctx.tables.get("database_sizes", []),
@@ -852,6 +892,54 @@ class MySQLPresentationBuilder:
             ],
             10,
         )
+        # 复制结论同样由采集到的行算出来。指向自身的行（Source_UUID 为空、
+        # Source_Host 指向本机）是残留通道，既不算"副本在跑"也不算"复制异常"——
+        # 判据与拓扑层、规则层共用 plugins.mysql.metrics，避免同一份数据三处口径。
+        replica_source = ctx.tables.get("replica_status", [])
+        real_replica_rows, residual_replica_rows = split_self_referencing_replica_rows(
+            replica_source, local_host_names(ctx)
+        )
+        replica_states = [replica_threads_running(row) for row in real_replica_rows]
+        stopped_channels = sum(1 for io_ok, sql_ok in replica_states if io_ok is False or sql_ok is False)
+        residual_note = (
+            f"另有 {len(residual_replica_rows)} 条指向自身的残留复制通道，不构成真实主从关系。"
+            if residual_replica_rows else ""
+        )
+        if stopped_channels:
+            replica_status = "risk"
+            replica_conclusion = (
+                f"已配置 {len(real_replica_rows)} 条复制通道，其中 {stopped_channels} 条 IO/SQL 线程未运行；"
+                "复制中断会直接削弱高可用与数据保护能力。" + residual_note
+            )
+            replica_recommendation = "检查复制错误、网络和源端状态，制定可回滚的恢复步骤。"
+            replica_evidence = [
+                f"复制通道 {len(real_replica_rows)} 条",
+                f"线程未运行 {stopped_channels} 条",
+            ]
+        elif real_replica_rows:
+            replica_status = "normal"
+            replica_conclusion = (
+                f"已配置 {len(real_replica_rows)} 条复制通道，IO/SQL 线程均运行中。" + residual_note
+            )
+            replica_recommendation = "持续监控复制延迟和错误日志；变更前确认切换机制与演练记录。"
+            replica_evidence = [f"复制通道 {len(real_replica_rows)} 条，线程运行中"]
+        elif residual_replica_rows:
+            replica_status = "attention"
+            replica_conclusion = (
+                f"存在 {len(residual_replica_rows)} 条指向自身的复制状态行"
+                "（Source_UUID 为空、Source_Host 指向本机），属残留或未启动的通道，"
+                "不构成真实主从关系；本实例按复制源端处理。"
+            )
+            replica_recommendation = (
+                "确认该通道为历史配置遗留后清理（RESET REPLICA ALL）或补全上游信息；"
+                "清理前确认不影响现有下游复制链路。"
+            )
+            replica_evidence = [f"指向自身的残留复制通道 {len(residual_replica_rows)} 条"]
+        else:
+            replica_status = "attention"
+            replica_conclusion = "未发现下游复制、Group Replication 或 Galera 运行证据；当前按单实例或复制源端处理。"
+            replica_recommendation = "如业务要求高可用，应补充架构设计、下游节点采集包、切换机制和演练记录。"
+            replica_evidence = []
 
         plugin_source = ctx.tables.get("plugins", [])
         active_plugin_count = sum(
@@ -981,8 +1069,10 @@ class MySQLPresentationBuilder:
                                evidence=[f"会话记录 {len(process_rows)} 条"],
                                collection=collection("mysql.processlist"), total_rows=len(ctx.tables.get("processlist", []))),
                     self._item("mysql.runtime.locks", "事务与锁等待", "tables/long_transactions.tsv; tables/data_lock_waits.tsv; tables/metadata_locks_pending.tsv", lock_rows,
-                               "采集时未发现长事务、数据锁等待或待授予元数据锁；该结论仅代表采集时点。",
-                               evidence=["长事务 0 条", "数据锁等待 0 条", "元数据锁等待 0 条"]),
+                               lock_conclusion,
+                               status=lock_status,
+                               recommendation=lock_recommendation,
+                               evidence=lock_evidence),
                 ],
             },
             {
@@ -1071,10 +1161,11 @@ class MySQLPresentationBuilder:
                                f"已配置 {len(binary_logs)} 个 Binlog 文件。",
                                evidence=[f"expire_logs_days={role.get('expire_logs_days') or role.get('binlog_expire_logs_seconds')}"]),
                     self._item("mysql.replication.status", "复制与高可用状态", "tables/replica_status.tsv; tables/group_replication_members.tsv", replica_rows,
-                               "未发现下游复制、Group Replication 或 Galera 运行证据；当前按单实例或复制源端处理。",
-                               status="attention",
-                               recommendation="如业务要求高可用，应补充架构设计、下游节点采集包、切换机制和演练记录。",
-                               collection=collection("mysql.replica_status"), total_rows=len(ctx.tables.get("replica_status", []))),
+                               replica_conclusion,
+                               status=replica_status,
+                               recommendation=replica_recommendation,
+                               evidence=replica_evidence,
+                               collection=collection("mysql.replica_status"), total_rows=len(replica_source)),
                     self._item("mysql.backup", "备份可恢复性证据", "evidence/backup_*.txt", [],
                                backup_conclusion,
                                status=backup_status,

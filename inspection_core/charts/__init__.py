@@ -16,7 +16,10 @@ still belong to ``plugins/<db>/charts.py``.
 
 from .history import (
     CPU_SUMMARY_VALUES,
+    DISK_THROUGHPUT_ALIASES,
     busy_percent,
+    disk_throughput_value,
+    disk_throughput_values,
     display_timezone,
     finite,
     gap_indices,
@@ -53,6 +56,7 @@ __all__ = [
     "COLOR_MAP",
     "COLORS",
     "CPU_SUMMARY_VALUES",
+    "DISK_THROUGHPUT_ALIASES",
     "FLAT_PALETTE",
     "HISTORY_SCOPE",
     "REALTIME_SCOPE",
@@ -60,6 +64,8 @@ __all__ = [
     "busiest_history_device",
     "busy_percent",
     "chart_colors",
+    "disk_throughput_value",
+    "disk_throughput_values",
     "display_timezone",
     "duration_ms",
     "finite",

@@ -24,6 +24,12 @@ from inspection_core.system_checks import (
     os_pressure_report,
 )
 
+from .metrics import (
+    local_host_names,
+    replica_threads_running,
+    split_self_referencing_replica_rows,
+)
+
 RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules.json"
 
 
@@ -380,22 +386,43 @@ class RuleEngine:
     def _check_replication_health(self, ctx: PackageContext) -> None:
         rule = "MYSQL.REPLICATION.HEALTH"
         role = ctx.snapshot.get("role_evidence", {})
-        replica_rows = ctx.tables.get("replica_status", [])
-        applicable = bool(role.get("replica_status_present")) or "replica" in str(
-            role.get("role_observed", "")
+
+        # 先按「上游是否指向本机」拆行：指向自身的行是残留通道，不是主从关系。
+        # 它既不能算作"副本在跑"，也不能算作"复制异常"——把它当异常会让复制源端
+        # 背上一条 high（还进 P1 整改），而拓扑层同一份数据已经把它记进
+        # self_reference_edges 了。这条判据和拓扑层共用 plugins.mysql.metrics。
+        real_rows, residual_rows = split_self_referencing_replica_rows(
+            ctx.tables.get("replica_status", []), local_host_names(ctx)
         )
+        if residual_rows:
+            self._evaluate(
+                "MYSQL.REPLICATION.RESIDUAL_CHANNEL", True, True, True,
+                "复制状态行的上游声明指向本机，不构成真实主从关系",
+                [f"指向自身的复制状态行：{len(residual_rows)} 条"],
+            )
+
         lag = safe_float(role.get("replica_lag_seconds"))
         t = self._threshold(rule, "replication_lag_seconds", 60)
+        # 没有真实上游行就没有可评价的复制关系（源端/单实例是正常状态），
+        # 不再拿 role_observed 里的 "replica" 当判据 —— 那个观测值正是残留行造成的。
+        applicable = bool(real_rows)
         repl_bad = False
+        facts: list[str] = []
         if applicable:
-            io_ok = str(role.get("replica_io_running", "")).lower() in {"yes", "on", "1"}
-            sql_ok = str(role.get("replica_sql_running", "")).lower() in {"yes", "on", "1"}
-            repl_bad = not io_ok or not sql_ok or (lag is not None and lag > t)
+            states = [replica_threads_running(row) for row in real_rows]
+            # False 才是"明确在停"；None 是这一列没采到，不能当异常报。
+            repl_bad = any(
+                io_ok is False or sql_ok is False for io_ok, sql_ok in states
+            ) or (lag is not None and lag > t)
+            facts = [
+                f"复制通道：{len(real_rows)} 条",
+                f"IO/SQL 线程正常：{sum(1 for io_ok, sql_ok in states if io_ok and sql_ok)} 条",
+                f"lag={lag}",
+            ]
         self._evaluate(
-            rule, applicable, bool(replica_rows) or applicable, repl_bad,
+            rule, applicable, applicable, repl_bad,
             "检查复制线程状态及延迟",
-            [f"IO={role.get('replica_io_running')}", f"SQL={role.get('replica_sql_running')}", f"lag={lag}"]
-            if applicable else [],
+            facts,
         )
 
     def _check_error_log(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:

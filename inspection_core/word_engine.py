@@ -1221,11 +1221,21 @@ class WordReportEngine:
         for section in self._ordered_sections():
             for item in section.get("items") or []:
                 collection = item.get("collection") or {}
+                analysis = item.get("analysis") or {}
+                # 采集正常（ok）的条目，状态列取分析结论（normal/attention/risk/…），
+                # 与正文「本章分析结论」和风险登记册同源；否则整列恒为"正常"，
+                # 而风险登记册里同一实例却是 risk，读者会以为报告自相矛盾。
+                # 未采集/无记录/权限不足等一律原样展示采集状态——不得把"空结果"显示成"正常"。
+                collection_status = collection.get("status")
+                if str(collection_status or "").lower() in {"", "ok"}:
+                    status = analysis.get("status") or collection_status
+                else:
+                    status = collection_status
                 inspection_rows.append([
                     text(item.get("item_id")),
                     text(item.get("title")),
                     text(item.get("source"), "报告模型"),
-                    self.display_status(collection.get("status")),
+                    self.display_status(status),
                 ])
         risk_rows: list[list[str]] = []
         for finding in self.model.get("risk_register") or []:

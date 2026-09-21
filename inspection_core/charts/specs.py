@@ -14,7 +14,7 @@ from typing import Any
 
 from ..models import PackageContext
 from ..system_checks import host_identity, memory_total_kb
-from .history import finite, sar_cpu_summary_rows
+from .history import disk_throughput_values, finite, sar_cpu_summary_rows
 
 __all__ = [
     "busiest_history_device",
@@ -176,8 +176,10 @@ def os_disk_spec(ctx: PackageContext, instance_tag: str) -> dict[str, Any]:
         scope = HISTORY_SCOPE
         device = busiest_history_device(sar_rows)
         rows = [row for row in sar_rows if row.get("DEV") == device] if device else []
-        read_values = [row.get("rkB/s") for row in rows]
-        write_values = [row.get("wkB/s") for row in rows]
+        # 读写吞吐走公共归一：sysstat 只认 `-p` 时给 rkB/s、否则给扇区/秒，
+        # 两种拼法都要能画出来（见 history.DISK_THROUGHPUT_ALIASES）。
+        read_values = disk_throughput_values(rows, "rkB/s")
+        write_values = disk_throughput_values(rows, "wkB/s")
         util_values = [row.get("%util") for row in rows]
         await_values = [row.get("await") for row in rows]
         title = f"磁盘 I/O（{device}，SAR 历史）" if device else "磁盘 I/O（SAR 历史）"
