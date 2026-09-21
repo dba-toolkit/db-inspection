@@ -151,6 +151,7 @@ report_sections:
       - {id: mysql.capacity.schemas, source: tables/database_sizes.tsv}
       - {id: mysql.capacity.objects, source: tables/object_counts.tsv}
       - {id: mysql.capacity.risks, source: "tables/no_primary_key_summary.tsv; tables/non_innodb_tables.tsv; tables/auto_increment_usage.tsv; tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; tables/unused_indexes.tsv"}
+      - {id: mysql.capacity.risk_details, source: "tables/no_primary_key_top.tsv; tables/non_innodb_tables.tsv; tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; tables/unused_indexes.tsv; tables/auto_increment_usage.tsv"}
   - id: sql_io
     title: "SQL、等待与文件 I/O 检查"
     items:

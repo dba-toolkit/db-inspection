@@ -39,6 +39,9 @@ from .values import safe_float
 __all__ = [
     "CANONICAL_RULE_IDS",
     "DEFAULT_THRESHOLDS",
+    "DISK_MEDIA_HDD",
+    "DISK_MEDIA_MIXED",
+    "DISK_MEDIA_SSD",
     "MEMORY_CRITERION",
     "NON_PERSISTENT_FSTYPES",
     "OS_CHECK_LABELS",
@@ -46,10 +49,12 @@ __all__ = [
     "RETIRED_RULE_IDS",
     "RULE_FOR_METRIC",
     "canonical_rule_id",
+    "disk_media",
     "empty_summary",
     "format_bytes",
     "host_identity",
     "is_persistent_fstype",
+    "lsblk_entries",
     "memory_total_kb",
     "normalize_os_metrics",
     "os_disk_rows",
@@ -180,6 +185,115 @@ def is_persistent_fstype(fstype: Any) -> bool:
     excluded from the number while still being shown as the reason for it.
     """
     return str(fstype or "").strip().lower() not in NON_PERSISTENT_FSTYPES
+
+
+# ---------------------------------------------------------------------------
+# 磁盘介质（HDD / SSD）
+# ---------------------------------------------------------------------------
+#
+# 数据目录落在旋转盘还是固态盘，决定 innodb_io_capacity、IO 延迟这类结论怎么
+# 落点：机械盘上 await 偏高属正常，SSD 上同样数字才是真问题。lsblk 已经把
+# 答案采了下来（ROTA：1 = 旋转盘/HDD，0 = 非旋转盘/SSD），但采集端落盘的是
+# 人眼对齐的空格表格，不是制表符分隔——通用 ``parse_delimited`` 只能把整行
+# 塞进"唯一一个键"下，按列访问根本拿不到 ROTA。
+#
+# 还原列**不能**按表头列宽切位：SIZE 是右对齐数字，会侵占前一列的空白
+# （`disk  107374182400` 按 TYPE 列宽切出来是 `disk  10737418`）。这里改用
+# **TYPE 锚点**：NAME/KNAME 恒非空、TYPE 恒紧随其后，于是 TYPE 之后的第一个
+# token 是 SIZE，之后首个裸 `0`/`1` 就是 ROTA（FSTYPE、MOUNTPOINT 里不会出现
+# 裸的 0/1，SERIAL 之类是多字符）。
+_LSBLK_DEVICE_TYPES: frozenset[str] = frozenset({
+    "disk", "part", "lvm", "rom", "loop", "crypt", "mpath", "raid0", "raid1",
+    "raid4", "raid5", "raid6", "raid10",
+})
+
+DISK_MEDIA_HDD = "机械磁盘（HDD）"
+DISK_MEDIA_SSD = "固态硬盘（SSD）"
+DISK_MEDIA_MIXED = "混合介质（HDD+SSD）"
+
+_ROTA_LABELS: dict[str, str] = {"1": DISK_MEDIA_HDD, "0": DISK_MEDIA_SSD}
+
+
+def lsblk_entries(rows: Any) -> list[dict[str, str]]:
+    """把 lsblk 采集结果规范成 ``[{NAME, KNAME, TYPE, SIZE, ROTA, MOUNTPOINT}]``。
+
+    两种形态都接受：采集端当前落盘的空格对齐整行（整行文本是行里唯一的值），
+    以及将来改用 ``lsblk -P`` 后已按字段拆开的行。解析不出来的行直接丢弃——
+    "读不出来"必须是缺席，不能默认成某个介质。
+
+    设备名请用 ``KNAME``：``NAME`` 在 lsblk 里带树形前缀（``|-sda1``、
+    ``|-ao-root``），只有 ``KNAME`` 是干净设备名（``sda1``、``dm-0``）。
+    """
+    entries: list[dict[str, str]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if "ROTA" in row and ("NAME" in row or "KNAME" in row):
+            entries.append({
+                key: str(row.get(key) or "").strip()
+                for key in ("NAME", "KNAME", "TYPE", "SIZE", "ROTA", "MOUNTPOINT")
+            })
+            continue
+        line = next((value for value in row.values() if isinstance(value, str)), "")
+        tokens = line.split()
+        if len(tokens) < 4:
+            continue
+        type_index = next(
+            (index for index, token in enumerate(tokens) if token in _LSBLK_DEVICE_TYPES), None
+        )
+        if type_index is None:
+            continue
+        tail = tokens[type_index + 1:]
+        entries.append({
+            "NAME": tokens[type_index - 2] if type_index >= 2 else tokens[0],
+            "KNAME": tokens[type_index - 1] if type_index >= 1 else "",
+            "TYPE": tokens[type_index],
+            "SIZE": tail[0] if tail else "",
+            "ROTA": next((token for token in tail if token in _ROTA_LABELS), ""),
+            "MOUNTPOINT": next((token for token in tail if token.startswith("/")), ""),
+        })
+    return entries
+
+
+def _mount_is_prefix(mountpoint: str, path: str) -> bool:
+    mount = mountpoint.rstrip("/") or "/"
+    if mount == "/":
+        # 根挂载能覆盖所有绝对路径，但优先级最低——调用处取最长匹配。
+        return path.startswith("/")
+    return path == mount or path.startswith(mount + "/")
+
+
+def disk_media(rows: Any, *, data_path: str | None = None) -> str | None:
+    """判定数据库数据目录所在磁盘的介质。
+
+    给了 ``data_path`` 且能定位到它的挂载点时，按该设备判定；定位不到时，只有
+    在所有物理盘（``TYPE == disk``）介质一致的情况下才下结论，混合则显式报
+    "混合"。任何一步读不出来都返回 ``None``——报告里宁可不显示这一行，也不把
+    "没读出来"写成"正常"（见 analysis contracts 的缺失值策略）。
+    """
+    entries = lsblk_entries(rows)
+    if not entries:
+        return None
+    path = str(data_path or "").strip()
+    if path:
+        candidates = [
+            entry for entry in entries
+            if entry.get("MOUNTPOINT") and _mount_is_prefix(entry["MOUNTPOINT"], path)
+        ]
+        if candidates:
+            target = max(candidates, key=lambda entry: len(entry["MOUNTPOINT"].rstrip("/")))
+            return _ROTA_LABELS.get(target.get("ROTA", ""))
+    labels = {
+        _ROTA_LABELS.get(entry.get("ROTA", ""))
+        for entry in entries
+        if entry.get("TYPE") == "disk"
+    }
+    labels.discard(None)
+    if len(labels) == 1:
+        return labels.pop()
+    if len(labels) > 1:
+        return DISK_MEDIA_MIXED
+    return None
 
 
 HISTORY_LABEL = "SAR 24h 历史"

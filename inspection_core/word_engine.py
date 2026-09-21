@@ -90,6 +90,7 @@ PROFESSIONAL_ROW_LIMITS = {
     "mysql.file_io": 8,
     "mysql.plugins": 20,
     "mysql.config.file": 20,
+    "mysql.capacity.risk_details": 30,
 }
 
 

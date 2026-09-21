@@ -18,7 +18,7 @@ from inspection_core import (
     safe_float,
     safe_int,
 )
-from inspection_core.system_checks import is_persistent_fstype
+from inspection_core.system_checks import disk_media, is_persistent_fstype
 from plugins.mysql.metrics import (
     local_host_names,
     replica_threads_running,
@@ -36,6 +36,10 @@ MYSQL_SYSTEM_SCHEMAS = frozenset({
     "performance_schema",
     "sys",
 })
+
+# 对象候选项明细每类的展示条数。汇总表只给计数，客户拿到报告还得回采集包翻 TSV
+# 才知道是哪几张表；这里把各类前 N 项直接落到正文，其余留在证据文件里。
+OBJECT_DETAIL_PER_KIND = 5
 
 
 def business_schema_names(rows: list[dict[str, Any]]) -> list[str]:
@@ -467,6 +471,13 @@ class MySQLPresentationBuilder:
             backup_evidence = ["未采集到 evidence/backup_*.txt"]
 
         lscpu = self._colon_key_values(ctx.root / "evidence/lscpu.txt")
+        # 磁盘介质（HDD/SSD）：数据目录落在哪块盘上，决定 io_capacity、IO 延迟这类
+        # 结论怎么落点——机械盘上 await 偏高是常态，SSD 上同样数字才是真问题。
+        # 采集端已用 lsblk 记录 ROTA，但落盘的是空格对齐表格（见
+        # system_checks.lsblk_entries）；读不出来就不加这一行，不把"没读到"写成某种介质。
+        disk_media_label = disk_media(
+            ctx.tables.get("block_devices") or [], data_path=ctx.variables.get("datadir")
+        )
         host_rows = [
             value_row("主机名", host.get("hostname"), "数据库所在主机"),
             value_row("主机 IP", host.get("primary_ip"), "采集识别的主机地址"),
@@ -478,6 +489,7 @@ class MySQLPresentationBuilder:
             value_row("每 Socket 核数", lscpu.get("Core(s) per socket"), "物理核心"),
             value_row("NUMA 节点", lscpu.get("NUMA node(s)"), "NUMA 拓扑"),
             value_row("物理内存", self._format_bytes(host.get("memory_total_bytes")), "主机总内存"),
+            *([value_row("磁盘介质", disk_media_label, "数据目录所在磁盘的介质类型")] if disk_media_label else []),
             value_row("本地目标", "是" if host.get("database_target_is_local") else "否", "主机指标是否适用于数据库实例"),
         ]
         ntp_value = str(time_info.get("ntp_synchronized", "")).lower()
@@ -1096,6 +1108,7 @@ class MySQLPresentationBuilder:
                                status=capacity_risk_status,
                                evidence=[f"业务 Schema {len(business_schemas)} 个", f"候选项合计 {object_risk_total} 项"],
                                collection=collection("mysql.object_counts"), total_rows=len(object_risk_rows)),
+                    *self._object_detail_item(ctx),
                 ],
             },
             {
@@ -1485,6 +1498,92 @@ class MySQLPresentationBuilder:
             io_text = "实时采样未观察到显著磁盘 I/O 压力。"
 
         return {"cpu": cpu_text, "memory": mem_text, "mysql": mysql_text, "io": io_text}
+
+    def _object_detail_item(self, ctx: PackageContext) -> list[dict[str, Any]]:
+        """把对象候选项落成可定位的明细行；无数据时返回空列表（不产出这张表）。
+
+        措辞严格贴合采集口径：冗余索引取自 ``sys.schema_redundant_indexes``（自带
+        ``sql_drop_index``）；未使用索引取自 ``sys.schema_unused_indexes``，其语义是
+        "**实例启动以来**未见使用"，不等于"永远不该存在"——所以只写"未见使用"，
+        不写成删除结论，删除留给业务确认后的整改环节。
+        """
+        per_kind = OBJECT_DETAIL_PER_KIND
+
+        def pick(record: dict[str, Any], *keys: str) -> Any:
+            lowered = {str(key).lower(): value for key, value in record.items()}
+            for key in keys:
+                value = record.get(key)
+                if value in (None, ""):
+                    value = lowered.get(key.lower())
+                if value not in (None, ""):
+                    return value
+            return None
+
+        def safe(value: Any, suffix: str = "") -> str:
+            return f"{value}{suffix}" if value not in (None, "") else "未采集"
+
+        def number(value: Any) -> str:
+            try:
+                return f"{float(value):.2f}"
+            except (TypeError, ValueError):
+                return safe(value)
+
+        rows: list[dict[str, Any]] = []
+
+        def add(kind: str, records: Any, describe: Any, index_key: str = "") -> None:
+            for record in (records or [])[:per_kind]:
+                if not isinstance(record, dict):
+                    continue
+                schema = pick(record, "TABLE_SCHEMA", "object_schema")
+                table = pick(record, "TABLE_NAME", "object_name")
+                if not schema or not table:
+                    continue
+                label = f"{schema}.{table}"
+                index_name = pick(record, index_key) if index_key else None
+                if index_name:
+                    label = f"{label}（{index_name}）"
+                rows.append({"类型": kind, "对象": label, "关键信息": describe(record)})
+
+        add("无主键表", ctx.tables.get("no_primary_key_top"),
+            lambda r: f"行数 {safe(pick(r, 'TABLE_ROWS'))}，共 {safe(pick(r, 'total_mb'), ' MB')}")
+        add("非 InnoDB 表", ctx.tables.get("non_innodb_tables"),
+            lambda r: f"引擎 {safe(pick(r, 'ENGINE'))}，行数 {safe(pick(r, 'TABLE_ROWS'))}")
+        add("高碎片表", ctx.tables.get("fragmentation_top"),
+            lambda r: f"碎片率 {safe(pick(r, 'fragmentation_pct'), '%')}，可回收 {safe(pick(r, 'data_free_mb'), ' MB')}")
+        add("冗余索引", ctx.tables.get("redundant_indexes"),
+            lambda r: f"被 {safe(pick(r, 'dominant_index_name'))} 覆盖，可用 sql_drop_index 删除",
+            index_key="redundant_index_name")
+        add("未使用索引", ctx.tables.get("unused_indexes"),
+            lambda r: "实例启动以来未见使用", index_key="index_name")
+        add("自增容量", ctx.tables.get("auto_increment_usage"),
+            lambda r: f"已用 {number(pick(r, 'used_pct'))}%（{safe(pick(r, 'COLUMN_TYPE'))}）")
+
+        if not rows:
+            return []
+        counts: dict[str, int] = {}
+        for row in rows:
+            counts[row["类型"]] = counts.get(row["类型"], 0) + 1
+        summary = "、".join(f"{kind} {count}" for kind, count in counts.items())
+        return [self._item(
+            "mysql.capacity.risk_details",
+            "对象候选项明细",
+            "tables/no_primary_key_top.tsv; tables/non_innodb_tables.tsv; "
+            "tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; "
+            "tables/unused_indexes.tsv; tables/auto_increment_usage.tsv",
+            rows,
+            f"按类别列出对象候选项明细（{summary}）；完整清单见同目录证据文件，纳入整改前需结合业务确认。",
+            status="attention",
+            recommendation=(
+                "无主键表补主键前先确认业务写入路径；非 InnoDB 表转 InnoDB 需评估锁与容量；"
+                "冗余与未使用索引先确认非唯一约束或业务依赖，再按 sql_drop_index 逐条删除。"
+            ),
+            evidence=[f"候选项明细 {len(rows)} 条", summary],
+            total_rows=len(rows),
+            note=(
+                f"每类最多展示前 {per_kind} 项；完整清单保留在采集包 tables/ 目录。"
+                "碎片率仅指可回收空间占比，本表不构成任何删除或重建判定。"
+            ),
+        )]
 
     def build_report_model(self, analysis: dict[str, Any]) -> dict[str, Any]:
         instances = analysis.get("instances", [])

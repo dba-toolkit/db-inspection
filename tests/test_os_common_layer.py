@@ -43,8 +43,10 @@ from inspection_core.system_checks import (
     OS_RULE_KEYS,
     RETIRED_RULE_IDS,
     canonical_rule_id,
+    disk_media,
     format_bytes,
     is_persistent_fstype,
+    lsblk_entries,
     normalize_os_metrics,
     os_disk_rows,
     os_network_rows,
@@ -1027,6 +1029,86 @@ class PersistentFilesystemCapacityTests(unittest.TestCase):
         engine = self._evaluate_capacity(100.0)
         self.assertEqual(engine._evaluations[0].status, "triggered")
         self.assertEqual(len(engine._findings), 1)
+
+
+class DiskMediaTests(unittest.TestCase):
+    """磁盘介质（HDD/SSD）判定。
+
+    采集端落盘的是 lsblk 的**空格对齐表格**，不是制表符分隔：通用
+    ``parse_delimited`` 只能把整行塞进唯一一个字段，按列访问根本拿不到 ROTA。
+    还原列必须走 TYPE 锚点——SIZE 是右对齐数字，会侵占前一列的空白，按表头
+    列宽切位会把 TYPE 切成 ``part 32212233``。这里把两种错法都钉死。
+    """
+
+    HEADER = ("NAME        KNAME TYPE          SIZE FSTYPE      MOUNTPOINT ROTA "
+              "SCHED    MODEL            SERIAL")
+
+    # 真实 lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL 输出
+    HDD_HOST = (
+        "sda         sda   disk  107374182400                           1 deadline Virtual disk     ",
+        "|-sda1      sda1  part    1073741824 xfs         /boot         1 deadline                  ",
+        "`-sda2      sda2  part  106299392000 LVM2_member               1 deadline                  ",
+        "  |-ao-root dm-0  lvm    97706311680 xfs         /             1                           ",
+        "sdb         sdb   disk 3221225472000                           1 deadline Virtual disk     ",
+        "`-sdb1      sdb1  part 3221223374848 xfs         /data         1 deadline                  ",
+        "sr0         sr0   rom     1073741312                           1 deadline VMware SATA CD00 ",
+    )
+
+    def _rows(self, *lines: str) -> list[dict[str, str]]:
+        return [{self.HEADER: line} for line in lines]
+
+    def test_type_anchor_beats_fixed_width_slicing(self) -> None:
+        # 设备名一律用 KNAME：NAME 在 lsblk 里带树形前缀（`|-sda1`、`|-ao-root`），
+        # 只有 KNAME 是干净设备名（sda1、dm-0）。
+        entries = {entry["KNAME"]: entry for entry in lsblk_entries(self._rows(*self.HDD_HOST))}
+        self.assertEqual(entries["sdb1"]["TYPE"], "part")
+        self.assertEqual(entries["sda"]["TYPE"], "disk")
+        self.assertEqual(entries["sdb1"]["ROTA"], "1")
+        self.assertEqual(entries["sdb1"]["MOUNTPOINT"], "/data")
+        self.assertEqual(entries["dm-0"]["MOUNTPOINT"], "/")
+        self.assertEqual(entries["dm-0"]["NAME"], "|-ao-root")
+
+    def test_locates_data_mount_and_reads_rota(self) -> None:
+        media = disk_media(self._rows(*self.HDD_HOST), data_path="/data/mysql-data/")
+        self.assertEqual(media, "机械磁盘（HDD）")
+
+    def test_ssd_data_mount(self) -> None:
+        lines = (
+            "sda   sda   disk  107374182400 1 deadline Virtual disk",
+            "`-sda1 sda1 part 1073741824 xfs /boot 1 deadline",
+            "sdb   sdb   disk 3221225472000 0 deadline Virtual disk",
+            "`-sdb1 sdb1 part 3221223374848 xfs /data 0 deadline",
+        )
+        self.assertEqual(disk_media(self._rows(*lines), data_path="/data/mysql-data"), "固态硬盘（SSD）")
+
+    def test_mixed_media_is_reported_as_mixed(self) -> None:
+        lines = (
+            "sda sda disk 100 0 deadline SSD-vendor",
+            "sdb sdb disk 200 1 deadline HDD-vendor",
+        )
+        self.assertEqual(disk_media(self._rows(*lines)), "混合介质（HDD+SSD）")
+
+    def test_optical_drive_does_not_pollute_fallback(self) -> None:
+        # sr0 是 rom：ROTA 对它无意义，不能参与"物理盘介质"兜底判断。
+        lines = (
+            "sda sda disk 100 0 deadline SSD-vendor",
+            "sr0 sr0 rom   1 1 deadline VMware-SATA-CD00",
+        )
+        self.assertEqual(disk_media(self._rows(*lines)), "固态硬盘（SSD）")
+
+    def test_unreadable_input_yields_none_not_a_default(self) -> None:
+        # 读不出来必须是缺席，不能默认成某种介质。
+        self.assertIsNone(disk_media([]))
+        self.assertIsNone(disk_media([{"whatever": "not a lsblk line"}]))
+        self.assertIsNone(disk_media(self._rows("sda sda unknown 100 1 deadline")))
+
+    def test_pre_split_rows_are_accepted(self) -> None:
+        # 采集端改用 lsblk -P 后行会带具名键，同一函数必须照样能读。
+        rows = [
+            {"NAME": "sdb", "KNAME": "sdb", "TYPE": "disk", "SIZE": "3221225472000", "ROTA": "0", "MOUNTPOINT": ""},
+            {"NAME": "sdb1", "KNAME": "sdb1", "TYPE": "part", "SIZE": "3221223374848", "ROTA": "0", "MOUNTPOINT": "/data"},
+        ]
+        self.assertEqual(disk_media(rows, data_path="/data/mysql-data"), "固态硬盘（SSD）")
 
 
 if __name__ == "__main__":
