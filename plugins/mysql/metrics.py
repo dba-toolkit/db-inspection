@@ -15,6 +15,7 @@ from typing import Any
 from inspection_core import PackageContext, safe_float, safe_int
 from inspection_core.sampling import sar_history_quality
 from inspection_core.statistics import summarize
+from inspection_core.system_checks import is_persistent_fstype
 
 
 MYSQL_COUNTERS = (
@@ -37,6 +38,83 @@ def row_number(row: dict[str, str], *keys: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+# ----------------------------------------------------------------------
+# 复制状态口径
+#
+# 「上游指向自己」的复制状态行不是真实的主从关系。它在源端也可能存在：有人执行过
+# CHANGE REPLICATION SOURCE TO，或通道被停用后残留配置，`SHOW REPLICA STATUS` 就会
+# 留一行 `Source_UUID` 为空、`Source_Host` 指向本机的记录。采集端以「有行」当作
+# replica 判据，于是这行会把复制源端误标成副本。拓扑层必须把它丢进
+# `self_reference_edges`（不能画成自环边），规则层和报告层也必须用同一判据排除它，
+# 否则同一份采集数据会同时产出「源节点 = 目标节点」的关系表和「复制状态异常」的
+# 误报。判据只能在这里写一份 —— 三个消费方各自实现过一次就已经出现过口径漂移。
+# ----------------------------------------------------------------------
+
+_REPLICA_THREAD_UP = {"yes", "on", "1", "true"}
+
+
+def local_host_names(ctx: PackageContext) -> set[str]:
+    """本机可能出现的名字（IP / 主机名 / 连接主机），用于识别"上游指向自己"。"""
+    identity = ctx.snapshot.get("instance_identity") or {}
+    host = ctx.snapshot.get("host_identity") or {}
+    names = [
+        identity.get("instance_ip"),
+        identity.get("mysql_hostname"),
+        identity.get("connect_host"),
+        identity.get("connect_ip"),
+        host.get("hostname"),
+        host.get("short_hostname"),
+        host.get("primary_ip"),
+    ]
+    return {str(name).strip() for name in names if str(name or "").strip()}
+
+
+def is_self_referencing_replica_row(row: dict[str, Any], local_names: set[str]) -> bool:
+    """该复制状态行的上游声明是否指向本机（残留/未启动的通道）。
+
+    兼容 MySQL 8.0.22 改名前后的两套列名（Source_* / Master_*）。
+    """
+    source_uuid = str(row.get("Source_UUID") or row.get("Master_UUID") or "").strip()
+    if source_uuid:
+        return False
+    source_host = str(row.get("Source_Host") or row.get("Master_Host") or "").strip()
+    return bool(source_host) and source_host in local_names
+
+
+def split_self_referencing_replica_rows(
+    rows: list[dict[str, Any]], local_names: set[str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """拆成 ``(真实上游行, 指向自身的残留行)``，保持原有先后顺序。"""
+    real: list[dict[str, Any]] = []
+    residual: list[dict[str, Any]] = []
+    for row in rows:
+        target = residual if is_self_referencing_replica_row(row, local_names) else real
+        target.append(row)
+    return real, residual
+
+
+def replica_threads_running(row: dict[str, Any]) -> tuple[bool | None, bool | None]:
+    """``(IO 线程在跑, SQL 线程在跑)``，兼容 8.0.22 改名前后的两种列名。
+
+    该列没采到（键不存在或值为空）时返回 None，与"明确是 No"区分开：前者是
+    证据不足，后者才是复制线程停了。把两者混在一起会把"没采到"报成"复制异常"。
+    """
+
+    def flag(*keys: str) -> bool | None:
+        for key in keys:
+            if key not in row:
+                continue
+            value = str(row.get(key) or "").strip().lower()
+            if value:
+                return value in _REPLICA_THREAD_UP
+        return None
+
+    return (
+        flag("Replica_IO_Running", "Slave_IO_Running"),
+        flag("Replica_SQL_Running", "Slave_SQL_Running"),
+    )
 
 
 def filesystem_rows(path: Path) -> list[dict[str, Any]]:
@@ -268,7 +346,15 @@ class MySQLMetricProvider:
             "history": sar_history_quality(ctx),
         }
 
-        filesystems = filesystem_rows(ctx.root / "tables/filesystems.tsv")
+        all_filesystems = filesystem_rows(ctx.root / "tables/filesystems.tsv")
+        # Capacity is judged on the same set of mounts the report shows.  Kernel
+        # pseudo filesystems (proc/tmpfs/hugetlbfs), read-only media (iso9660) and
+        # container overlays are dropped first: an optical drive is permanently
+        # 100% full with 0 bytes free, so counting it would raise a capacity risk
+        # the customer can neither confirm nor fix.  The predicate lives in the
+        # shared layer so all three plugins filter on the same rule.
+        filesystems = [row for row in all_filesystems if is_persistent_fstype(row.get("type"))]
+        excluded_filesystems = [row for row in all_filesystems if not is_persistent_fstype(row.get("type"))]
         database_rows = ctx.tables.get("database_sizes", [])
         database_bytes = 0.0
         for row in database_rows:
@@ -294,6 +380,7 @@ class MySQLMetricProvider:
             "database_count": len(database_rows) if database_rows else None,
             "table_count": table_count if object_rows else None,
             "filesystems": filesystems,
+            "excluded_filesystems": excluded_filesystems,
             "max_filesystem_usage_percent": max(
                 (row["usage_percent"] for row in filesystems if row["usage_percent"] is not None),
                 default=None,

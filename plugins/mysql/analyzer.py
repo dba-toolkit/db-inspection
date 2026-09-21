@@ -33,6 +33,7 @@ from plugins.mysql import (
     MySQLPackageAdapter,
     MySQLPresentationBuilder,
     MySQLRuleProvider,
+    is_self_referencing_replica_row,
 )
 
 ANALYZER_VERSION = "2.1.0"
@@ -147,6 +148,36 @@ class Analyzer:
         return self.chart_provider.generate_base(ctx, metrics)
 
     @staticmethod
+    def _self_referencing_upstream(node: dict[str, Any]) -> bool:
+        """判断某节点的上游声明是否指向它自己（残留/未运行的复制通道）。
+
+        判据与规则层、报告层共用同一份实现（``plugins.mysql.metrics``），
+        否则同一份采集数据会在关系表里被当成残留、在风险台账里被当成真实复制故障。
+        """
+        return is_self_referencing_replica_row(
+            {"Source_UUID": node.get("source_uuid"), "Source_Host": node.get("source_host")},
+            {str(node.get("ip") or ""), str(node.get("hostname") or "")},
+        )
+
+    @staticmethod
+    def _topology_sort_key(node: dict[str, Any]) -> tuple[int, tuple[int, ...], str]:
+        """Order topology rows for rendering: replication source first, then by IP.
+
+        报告 2.2 的节点表直接按 ``nodes`` 的顺序出，因此"主库在第一行"不能依赖
+        调用者传包的先后顺序 —— 否则同样的三台机器换个传参顺序，报告就换了个样子。
+        """
+        role = str(node.get("role_effective") or node.get("role_observed") or "").lower()
+        octets: list[int] = []
+        for part in str(node.get("ip") or "").split("."):
+            try:
+                octets.append(int(part))
+            except ValueError:
+                octets.append(999)
+        while len(octets) < 4:
+            octets.append(999)
+        return (0 if role == "source" else 1, tuple(octets[:4]), str(node.get("instance_tag") or ""))
+
+    @staticmethod
     def topology(contexts: list[PackageContext]) -> dict[str, Any]:
         nodes = []
         by_uuid: dict[str, str] = {}
@@ -169,29 +200,64 @@ class Analyzer:
                 "source_uuid": role.get("source_uuid"),
                 "source_host": role.get("source_host"),
                 "source_port": role.get("source_port"),
+                "version": identity.get("version"),
             })
         edges = []
         unresolved = []
+        self_reference: list[dict[str, Any]] = []
         for node in nodes:
             source_uuid = str(node.get("source_uuid") or "")
             if source_uuid:
                 source_node = by_uuid.get(source_uuid)
                 edge = {"source_node_id": source_node, "target_node_id": node["node_id"], "source_uuid": source_uuid}
-                if source_node:
-                    edges.append(edge)
-                else:
+                if not source_node:
                     unresolved.append(edge)
-            elif node.get("source_host"):
-                candidates = [n for n in nodes if n.get("hostname") == node.get("source_host") or n.get("ip") == node.get("source_host")]
-                if len(candidates) == 1:
-                    edges.append({"source_node_id": candidates[0]["node_id"], "target_node_id": node["node_id"], "source_uuid": None})
+                elif source_node == node["node_id"]:
+                    # source_uuid 指向自己：该复制通道不是真实上游，丢弃（不得画成自环边）
+                    self_reference.append(edge)
                 else:
-                    unresolved.append({"source_node_id": None, "target_node_id": node["node_id"], "source_host": node.get("source_host")})
+                    edges.append(edge)
+                continue
+            source_host = str(node.get("source_host") or "")
+            if not source_host:
+                continue  # 未声明上游：源端/单机，正常情况
+            if Analyzer._self_referencing_upstream(node):
+                self_reference.append({"source_node_id": None, "target_node_id": node["node_id"], "source_host": source_host})
+                continue
+            candidates = [
+                item for item in nodes
+                if item["node_id"] != node["node_id"]
+                and (item.get("hostname") == source_host or item.get("ip") == source_host)
+            ]
+            if len(candidates) == 1:
+                edges.append({"source_node_id": candidates[0]["node_id"], "target_node_id": node["node_id"], "source_uuid": None})
+            else:
+                unresolved.append({"source_node_id": None, "target_node_id": node["node_id"], "source_host": source_host})
+
+        # 角色校正：被下游节点声明为上游、且自身上游声明指向自己的节点，观测值不可信，按复制源端处理。
+        upstream_count: dict[str, int] = {}
+        for edge in edges:
+            upstream_id = edge.get("source_node_id")
+            if upstream_id:
+                upstream_count[upstream_id] = upstream_count.get(upstream_id, 0) + 1
+        for node in nodes:
+            count = upstream_count.get(node["node_id"], 0)
+            node["upstream_node_count"] = count
+            node["role_effective"] = node.get("role_observed")
+            if count and Analyzer._self_referencing_upstream(node):
+                node["role_effective"] = "source"
+                node["role_note"] = (
+                    f"该实例的复制状态行未声明上游（source_uuid 为空，source_host 指向本机），"
+                    f"而另有 {count} 个节点声明以它为上游，故按复制源端处理；"
+                    f"采集端原始观测值 {node.get('role_observed')} 保留在 role_observed。"
+                )
+        nodes.sort(key=Analyzer._topology_sort_key)
         return {
             "mode": "single_instance" if len(nodes) == 1 else "multi_instance",
             "nodes": nodes,
             "edges": edges,
             "unresolved_edges": unresolved,
+            "self_reference_edges": self_reference,
             "completeness": "complete" if not unresolved else "partial",
         }
 

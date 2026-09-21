@@ -19,6 +19,26 @@ from inspection_core import (
     safe_int,
 )
 from plugins.mysql.metrics import row_number
+from inspection_core.system_checks import is_persistent_fstype
+# MySQL 自带的系统库。判定"实例上有没有业务库"必须靠这份显式名单，
+# 不能靠"名字看起来像不像系统库"，否则新建的元数据库会被误判成业务库、
+# 或者业务库被误判成系统库（后者会直接把结论写成"无业务对象可评价"）。
+MYSQL_SYSTEM_SCHEMAS = frozenset({
+    "information_schema",
+    "mysql",
+    "performance_schema",
+    "sys",
+})
+
+
+def business_schema_names(rows: list[dict[str, Any]]) -> list[str]:
+    """Return the non-system schema names present in ``tables/schemas.tsv``."""
+    names: list[str] = []
+    for row in rows:
+        name = str(row.get("SCHEMA_NAME") or "").strip()
+        if name and name.lower() not in MYSQL_SYSTEM_SCHEMAS and name not in names:
+            names.append(name)
+    return names
 
 
 class MySQLPresentationBuilder:
@@ -110,14 +130,10 @@ class MySQLPresentationBuilder:
 
     @staticmethod
     def _mount_rows(path: Path) -> list[dict[str, str]]:
-        # 只剔除已知伪/虚拟文件系统；必须用黑名单而非白名单——
-        # 白名单会把 nfs/cifs 一并藏掉，而"数据目录落在网络文件系统"正是要报的风险。
-        pseudo_fstypes = {
-            "sysfs", "proc", "cgroup", "cgroup2", "tmpfs", "devtmpfs", "devpts",
-            "securityfs", "pstore", "bpf", "tracefs", "configfs", "debugfs",
-            "mqueue", "autofs", "binfmt_misc", "fusectl", "rpc_pipefs", "iso9660",
-            "fuse.vmware-vmblock", "fuse.gvfsd-fuse", "fuse.gvfs-fuse-daemon",
-        }
+        # 判据来自公共层（inspection_core.system_checks）：本地维护的黑名单
+        # 曾在 hugetlbfs 上漏过一次，/dev/hugepages 因此被当成"真实块设备挂载"
+        # 写进报告。仍是黑名单而非白名单——白名单会把 nfs/cifs 一并藏掉，
+        # 而"数据目录落在网络文件系统"正是要报的风险。
         if not path.exists():
             return []
         rows: list[dict[str, str]] = []
@@ -127,7 +143,7 @@ class MySQLPresentationBuilder:
             if not matched:
                 continue
             fstype = matched.group(3).strip()
-            if fstype in pseudo_fstypes:
+            if not is_persistent_fstype(fstype):
                 continue
             rows.append({
                 "设备": matched.group(1).strip(),
@@ -454,6 +470,10 @@ class MySQLPresentationBuilder:
             value_row("时区", time_info.get("timezone"), "主机时区"),
             value_row("NTP 同步", time_info.get("ntp_synchronized"), "系统时间同步状态"),
         ]
+        capacity = metrics.get("capacity", {})
+        # 指标层已按公共判据过滤过一次；这里再筛一次，是为了让"旧分析产物"
+        # （analysis.json 里仍带着全量挂载点）重新生成报告时同样干净。
+        # 两处调用的是同一个判据，因此不会出现"数字剔了、表格没剔"的口径分叉。
         fs_rows = [
             {
                 "文件系统": row.get("filesystem"),
@@ -462,8 +482,13 @@ class MySQLPresentationBuilder:
                 "使用率": f"{row['usage_percent']:.1f}%" if row.get("usage_percent") is not None else None,
                 "可用空间": self._format_bytes((row.get("available_kb") or 0) * 1024),
             }
-            for row in metrics.get("capacity", {}).get("filesystems", [])
+            for row in capacity.get("filesystems", [])
+            if is_persistent_fstype(row.get("type"))
         ]
+        excluded_fs_count = len(capacity.get("excluded_filesystems") or [])
+        if not excluded_fs_count:
+            # 旧产物没有 excluded_filesystems 键，退回按行数差反推剔除数量。
+            excluded_fs_count = max(len(capacity.get("filesystems", [])) - len(fs_rows), 0)
         kernel_rows = self._raw_key_value_rows(ctx.root / "tables/kernel_parameters.tsv")
         mount_rows = self._mount_rows(ctx.root / "evidence/mounts.txt")
         dmesg_rows = self._dmesg_error_rows(ctx.root / "evidence/dmesg_errors.txt")
@@ -542,6 +567,11 @@ class MySQLPresentationBuilder:
                 ("DEFAULT_CHARACTER_SET_NAME", "默认字符集"),
                 ("DEFAULT_COLLATION_NAME", "默认排序规则"),
             ],
+        )
+        business_schemas = business_schema_names(ctx.tables.get("schemas", []))
+        business_schema_text = (
+            "、".join(business_schemas[:6]) + (" 等" if len(business_schemas) > 6 else "")
+            if business_schemas else ""
         )
         engines = self._select_rows(
             [row for row in ctx.tables.get("engines", []) if str(row.get("Support", "")).upper() in {"YES", "DEFAULT"}],
@@ -695,6 +725,21 @@ class MySQLPresentationBuilder:
             {"检查项": "冗余索引候选", "数量": metrics.get("schema", {}).get("redundant_index_count"), "证据文件": "tables/redundant_indexes.tsv"},
             {"检查项": "未使用索引候选", "数量": metrics.get("schema", {}).get("unused_index_candidate_count"), "证据文件": "tables/unused_indexes.tsv"},
         ]
+        object_risk_total = sum(int(row.get("数量") or 0) for row in object_risk_rows)
+        object_risk_detail = "、".join(
+            f"{row['检查项']} {int(row.get('数量') or 0)}" for row in object_risk_rows
+        )
+        if business_schemas:
+            capacity_risk_status = "attention" if object_risk_total else "normal"
+            capacity_risk_conclusion = (
+                f"业务 Schema {len(business_schemas)} 个；对象检查候选项合计 {object_risk_total} 项"
+                f"（{object_risk_detail}），需结合业务确认后纳入整改。"
+                if object_risk_total else
+                f"业务 Schema {len(business_schemas)} 个；无主键、非 InnoDB、碎片、自增容量与索引类检查均未发现候选项。"
+            )
+        else:
+            capacity_risk_status = "not_applicable"
+            capacity_risk_conclusion = "本实例未发现业务 Schema；无主键、非 InnoDB、碎片和自增容量检查没有业务对象可评价。"
 
         digest_source = ctx.tables.get("sql_digests_top", [])
         has_sql_text = digest_source and any(
@@ -713,6 +758,10 @@ class MySQLPresentationBuilder:
             preserve_empty=["Schema"],
         )
         digest_note = "已采集 SQL 正文；按总耗时排序，最多展示 15 行。" if has_sql_text else "SQL 正文未采���；按总耗时排序，最多展示 15 行。"
+        no_index_exec = sum(
+            int(self._row_number(row, "SUM_NO_INDEX_USED") or 0) for row in digest_source
+        )
+
         wait_source = ctx.tables.get("wait_events_top", [])
         wait_rows = self._select_rows(
             wait_source,
@@ -827,6 +876,7 @@ class MySQLPresentationBuilder:
                                "已取得主要文件系统容量；个别失效挂载点读取失败，不影响已展示挂载点。" if collection("system.filesystems").get("status") == "partial" else "已取得文件系统容量信息。",
                                status="attention" if collection("system.filesystems").get("status") == "partial" else "normal",
                                recommendation="清理或卸载失效挂载点，并确认 MySQL 数据目录所在文件系统的容量告警。",
+                               note=(f"已排除 {excluded_fs_count} 个 tmpfs/devtmpfs/光驱等非持久化挂载点") if excluded_fs_count else "",
                                collection=collection("system.filesystems"), total_rows=len(fs_rows)),
                     self._item("system.kernel", "关键内核参数", "tables/kernel_parameters.tsv", kernel_rows,
                                "已取得数据库相关内核参数；参数值需结合数据库内存预算和操作系统基线复核。",
@@ -835,7 +885,8 @@ class MySQLPresentationBuilder:
                                collection=collection("system.sysctl_selected"), total_rows=len(kernel_rows)),
                     self._item("system.mounts", "挂载参数", "evidence/mounts.txt", mount_rows,
                                "已取得挂载参数，可用于检查数据库数据目录所在文件系统的持久性选项。" if mount_rows else "未采集到挂载参数。",
-                               evidence=[f"真实块设备挂载 {len(mount_rows)} 项：" + "、".join(str(row.get("挂载点", "")) for row in mount_rows)] if mount_rows else [],
+                               evidence=[f"持久化挂载点 {len(mount_rows)} 项：" + "、".join(str(row.get("挂载点", "")) for row in mount_rows)] if mount_rows else [],
+                               note="已排除 proc/tmpfs/大页内存/光驱等虚拟或只读挂载点",
                                collection=collection("system.mounts"), total_rows=len(mount_rows)),
                     self._item("system.dmesg_errors", "内核错误摘要", "evidence/dmesg_errors.txt", dmesg_rows,
                                "存在内核错误级别日志，建议结合硬件与系统日志复核。" if dmesg_rows else "未发现内核错误级别日志。",
@@ -852,11 +903,19 @@ class MySQLPresentationBuilder:
                                f"实例版本为 MySQL {identity.get('version')}，当前观测角色为 {role.get('role_observed')}。",
                                evidence=[f"{identity.get('mysql_hostname')}:{identity.get('port')}", f"Server UUID={identity.get('server_uuid')}"]),
                     self._item("mysql.schemas", "Schema 与默认字符集", "tables/schemas.tsv", schemas,
-                               "本次仅发现系统 Schema，未发现业务 Schema；因此容量、对象结构等检查没有业务对象可评价。",
-                               status="not_applicable",
-                               evidence=[f"Schema 数量 {len(schemas)}"], collection=collection("mysql.schemas"), total_rows=len(ctx.tables.get("schemas", []))),
+                               (
+                                   f"共 {len(schemas)} 个 Schema，其中业务 Schema {len(business_schemas)} 个"
+                                   f"（{business_schema_text}），字符集与排序规则见下表。"
+                               ) if business_schemas else (
+                                   f"共 {len(schemas)} 个 Schema，均为系统 Schema，未发现业务 Schema；"
+                                   "因此容量、对象结构等检查没有业务对象可评价。"
+                               ),
+                               status="normal" if business_schemas else "not_applicable",
+                               evidence=[f"Schema 数量 {len(schemas)}", f"业务 Schema {len(business_schemas)} 个"],
+                               collection=collection("mysql.schemas"), total_rows=len(ctx.tables.get("schemas", []))),
                     self._item("mysql.engines", "可用存储引擎", "tables/engines.tsv", engines,
-                               "InnoDB 等受支持存储引擎已加载；业务表引擎合规性因未发现业务 Schema 而不适用。",
+                               "InnoDB 等受支持存储引擎已加载；业务表引擎合规性见「容量与对象检查」。" if business_schemas
+                               else "InnoDB 等受支持存储引擎已加载；未发现业务 Schema，业务表引擎合规性不适用。",
                                evidence=[f"已加载存储引擎 {len(ctx.tables.get('engines', []))} 个"],
                                collection=collection("mysql.engines"), total_rows=len(ctx.tables.get("engines", []))),
                     self._item("mysql.plugins", "活动插件", "tables/plugins.tsv", plugins,
@@ -943,9 +1002,10 @@ class MySQLPresentationBuilder:
                                collection=collection("mysql.object_counts"),
                                total_rows=len(ctx.tables.get("object_counts", []))),
                     self._item("mysql.capacity.risks", "对象结构与容量候选项", "tables/*capacity*.tsv", object_risk_rows,
-                               "本实例未发现业务 Schema；无主键、非 InnoDB、碎片和自增容量检查未发现候选对象，未使用索引仅含系统 Schema，不作为业务整改项。",
-                               status="not_applicable",
-                               evidence=["业务 Schema 0 个"]),
+                               capacity_risk_conclusion,
+                               status=capacity_risk_status,
+                               evidence=[f"业务 Schema {len(business_schemas)} 个", f"候选项合计 {object_risk_total} 项"],
+                               collection=collection("mysql.object_counts"), total_rows=len(object_risk_rows)),
                 ],
             },
             {
@@ -953,8 +1013,14 @@ class MySQLPresentationBuilder:
                 "title": "SQL、等待与文件 I/O 检查",
                 "items": [
                     self._item("mysql.sql.digest", "SQL 摘要 Top", "tables/sql_digests_top.tsv", digest_rows,
-                               "已采集脱敏 SQL 摘要及执行统计；存在未使用索引计数的摘要，但累计耗时较低，需结合业务 Schema 与更长窗口复核。",
-                               status="attention",
+                               (
+                                   f"已采集脱敏 SQL 摘要 {len(digest_source)} 条；其中未用索引累计执行 {no_index_exec} 次，"
+                                   "需结合业务 SQL 正文和执行计划复核，不能直接认定为问题 SQL。"
+                               ) if no_index_exec else (
+                                   f"已采集脱敏 SQL 摘要 {len(digest_source)} 条；本次窗口内未出现未用索引的执行记录，"
+                                   "该结论仅覆盖采集窗口的摘要统计。"
+                               ),
+                               status="attention" if no_index_exec else "normal",
                                recommendation="按总耗时、扫描行数和未用索引次数筛选摘要，再由授权人员结合 SQL 正文和 EXPLAIN 验证。",
                                collection=collection("mysql.sql_digests"), total_rows=len(digest_source),
                                note=digest_note),

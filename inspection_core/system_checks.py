@@ -40,6 +40,7 @@ __all__ = [
     "CANONICAL_RULE_IDS",
     "DEFAULT_THRESHOLDS",
     "MEMORY_CRITERION",
+    "NON_PERSISTENT_FSTYPES",
     "OS_CHECK_LABELS",
     "OS_RULE_KEYS",
     "RETIRED_RULE_IDS",
@@ -48,6 +49,7 @@ __all__ = [
     "empty_summary",
     "format_bytes",
     "host_identity",
+    "is_persistent_fstype",
     "memory_total_kb",
     "normalize_os_metrics",
     "os_disk_rows",
@@ -143,6 +145,42 @@ _THRESHOLD_KEYS: dict[str, str] = {
     "memory_used": "memory_usage_warning",
     "disk_util": "disk_util_warning",
 }
+
+# ---------------------------------------------------------------------------
+# filesystem filtering — one judgement for "is this mount worth judging"
+# ---------------------------------------------------------------------------
+# A host reports far more mounts than it has storage.  ``df`` and ``mount`` both
+# list kernel pseudo filesystems (proc/tmpfs/hugetlbfs), read-only media and
+# container overlays.  Their "usage" says nothing about the database host: an
+# optical drive is permanently 100% full with 0 bytes free, so feeding it into a
+# capacity check manufactures a risk the customer cannot act on.
+#
+# Network filesystems are deliberately absent — "the data directory lives on
+# NFS/CIFS" is exactly the risk the report exists to surface.
+NON_PERSISTENT_FSTYPES: frozenset[str] = frozenset({
+    # kernel pseudo filesystems: no capacity concept at all
+    "sysfs", "proc", "cgroup", "cgroup2", "tmpfs", "devtmpfs", "devpts",
+    "securityfs", "pstore", "bpf", "tracefs", "configfs", "debugfs", "mqueue",
+    "autofs", "binfmt_misc", "fusectl", "rpc_pipefs", "hugetlbfs", "ramfs",
+    "nsfs", "efivarfs",
+    # read-only media and images: always 100% used, never growable
+    "iso9660", "squashfs", "udf",
+    # container overlay
+    "overlay",
+    # desktop / hypervisor FUSE mounts
+    "fuse.gvfsd-fuse", "fuse.gvfs-fuse-daemon", "fuse.vmware-vmblock",
+})
+
+
+def is_persistent_fstype(fstype: Any) -> bool:
+    """True when a mount can hold data whose capacity must be planned for.
+
+    Both the metric layer (which picks the worst usage figure) and the report
+    tables (which list mounts) filter on this predicate, so a mount can never be
+    excluded from the number while still being shown as the reason for it.
+    """
+    return str(fstype or "").strip().lower() not in NON_PERSISTENT_FSTYPES
+
 
 HISTORY_LABEL = "SAR 24h 历史"
 REALTIME_LABEL = "现场短时采样"

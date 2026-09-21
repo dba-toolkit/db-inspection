@@ -933,7 +933,7 @@ class WordReportEngine:
                     "单实例",
                     text(node.get("hostname") or node.get("instance_tag")),
                     f"{text(node.get('ip'))}:{text(node.get('port'))}",
-                    text(node.get("role_observed")),
+                    text(node.get("role_effective") or node.get("role_observed")),
                 ]],
                 [1500, 2300, 2500, 3060],
             )
@@ -943,7 +943,7 @@ class WordReportEngine:
                 [[
                     text(node.get("hostname") or node.get("instance_tag")),
                     f"{text(node.get('ip'))}:{text(node.get('port'))}",
-                    text(node.get("role_observed")),
+                    text(node.get("role_effective") or node.get("role_observed")),
                     text(node.get("version")),
                 ] for node in nodes],
                 [2300, 2200, 2500, 2360],
@@ -960,6 +960,24 @@ class WordReportEngine:
                     [3300, 3300, 2760],
                     compact=True,
                 )
+            self.render_topology_notes(topology)
+
+    def render_topology_notes(self, topology: dict[str, Any]) -> None:
+        """把角色校正与丢弃的自引用边讲清楚，避免 2.2 与后文观测值看起来互相矛盾。"""
+        nodes = topology.get("nodes") or []
+        notes = [
+            f"{text(node.get('hostname') or node.get('instance_tag'))}：{text(node.get('role_note'))}"
+            for node in nodes
+            if node.get("role_note")
+        ]
+        self_reference = topology.get("self_reference_edges") or []
+        if self_reference:
+            notes.append(
+                f"另有 {len(self_reference)} 条复制状态行的上游声明指向节点自身（无 source_uuid 的残留通道），"
+                "不构成真实主从关系，未计入拓扑边。"
+            )
+        if notes:
+            self.note_box("拓扑口径校正", "".join(notes), accent=COLOR_TEXT)
 
     def render_section_charts(self, section_id: str, main_number: int,
                               subsection_number: int) -> bool:

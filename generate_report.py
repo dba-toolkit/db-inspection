@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from inspection_core.package_io import read_json, write_json
+from inspection_core.preflight import preflight_report_dependencies
 from inspection_core.word_engine import GENERATOR_VERSION, default_output_path
 from plugins.mysql.word_report import MYSQL_WORD_PROFILE, MySQLWordReportGenerator
 from plugins.postgresql.word_report import POSTGRESQL_WORD_PROFILE, PostgreSQLWordReportGenerator
@@ -68,6 +69,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if preflight_report_dependencies(ROOT / "requirements.txt"):
+        return 1
     source = Path(args.input).expanduser().resolve()
     model_path = source / "report_model.json" if source.is_dir() else source
     if not model_path.exists():

@@ -45,8 +45,17 @@ powershell -File inspection/sqlserver_inspection.ps1 -Server 10.0.0.10 ...
 ### 第二步：本地分析（1 个入口，自动识别数据库类型）
 
 ```powershell
+# 单实例
 python analyze.py <采集包.zip/tar.gz> -o output\<实例名>
+
+# 多实例 / 主从：把同一套环境的采集包一起传，拓扑由分析器自动合并
+python analyze.py <主包> <从包1> <从包2> -o output\<环境名>
 ```
+
+多包输入时，分析器会按 `server_uuid` / `source_uuid` / `source_host` 自动合并出节点与复制关系，
+输出 `topology`（`mode` / `nodes` / `edges`），报告 2.2 节据此渲染架构拓扑。
+也可以直接传一个**目录**（目录下的 `*.tar.gz` 全部纳入），此时需显式加 `--db-type`。
+MySQL / PostgreSQL / Oracle 支持多包；SQL Server 一次只接受一个采集包。
 
 主要输出：
 

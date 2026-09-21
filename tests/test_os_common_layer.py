@@ -43,6 +43,7 @@ from inspection_core.system_checks import (
     RETIRED_RULE_IDS,
     canonical_rule_id,
     format_bytes,
+    is_persistent_fstype,
     normalize_os_metrics,
     os_disk_rows,
     os_network_rows,
@@ -899,6 +900,99 @@ class MysqlSystemResourceWiringTests(unittest.TestCase):
         evaluations = self._run(metrics)
         for evaluation in evaluations.values():
             self.assertEqual(evaluation.status, "not_evaluated")
+
+
+class PersistentFilesystemCapacityTests(unittest.TestCase):
+    """容量口径：报告表格与判定共用同一个「持久化挂载点」判据。
+
+    真实包（db01 的 2026-08 与 2026-09 两份）的 `df -PT` 输出都是 10 行：
+    7 行 devtmpfs/tmpfs，外加一行恒为 100% 的光驱。旧代码取全局最大值，
+    于是 `/dev/sr0` 的 100% 被当成「文件系统使用率过高」报给客户，还生成
+    了一条没法执行的整改项——光驱既不是数据目录，也无法扩容。
+    """
+
+    DF_PT = (
+        "Filesystem          Type      1024-blocks     Used Available Capacity Mounted on\n"
+        "/dev/mapper/rhel-root xfs     104806400 34567890  70290110      33% /\n"
+        "devtmpfs             devtmpfs   1964712        0   1964712       0% /dev\n"
+        "tmpfs                tmpfs      4194304     4096   4190208       1% /dev/shm\n"
+        "hugetlbfs            hugetlbfs        0        0         0       0% /dev/hugepages\n"
+        "/dev/sr0             iso9660     133120   133120         0     100% /mnt\n"
+        "nfs-server:/data     nfs4     209715200 10485760 199229440       5% /backup\n"
+    )
+
+    def test_predicate_hides_pseudo_and_read_only_mounts(self) -> None:
+        for fstype in ("hugetlbfs", "tmpfs", "devtmpfs", "proc", "sysfs",
+                       "cgroup2", "iso9660", "squashfs", "overlay"):
+            with self.subTest(fstype=fstype):
+                self.assertFalse(is_persistent_fstype(fstype))
+
+    def test_predicate_never_hides_network_filesystems(self) -> None:
+        # 判据只能是黑名单：白名单会把 nfs/cifs 一并藏掉，而
+        # 「数据目录落在网络文件系统」正是报告要报的风险。
+        for fstype in ("nfs", "nfs4", "cifs", "ceph", "glusterfs", "xfs", "ext4", "btrfs"):
+            with self.subTest(fstype=fstype):
+                self.assertTrue(is_persistent_fstype(fstype))
+
+    def test_predicate_ignores_case_and_padding(self) -> None:
+        self.assertFalse(is_persistent_fstype("  HUGETLBFS "))
+        self.assertTrue(is_persistent_fstype(" NFS4 "))
+
+    def _metrics(self) -> dict:
+        """按真实包的形状跑一遍 MySQL 指标层（只是把 df 输出换成合成数据）。"""
+        from plugins.mysql import MySQLMetricProvider
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tables").mkdir()
+            (root / "tables" / "filesystems.tsv").write_text(self.DF_PT, encoding="utf-8")
+            package = context()
+            package.root = root
+            return MySQLMetricProvider().build(package)
+
+    def _evaluate_capacity(self, max_percent: float):
+        from plugins.mysql.rules import RuleEngine
+
+        engine = RuleEngine()
+        engine._evaluations = []
+        engine._check_filesystem_usage(context(), {
+            "scope": {"database_target_is_local": True},
+            "capacity": {"max_filesystem_usage_percent": max_percent},
+        })
+        return engine
+
+    def test_mysql_metric_layer_counts_only_persistent_mounts(self) -> None:
+        capacity = self._metrics()["capacity"]
+        self.assertEqual(
+            [row["mountpoint"] for row in capacity["filesystems"]],
+            ["/", "/backup"],
+        )
+        self.assertEqual(capacity["max_filesystem_usage_percent"], 33.0)
+        self.assertEqual(
+            [row["mountpoint"] for row in capacity["excluded_filesystems"]],
+            ["/dev", "/dev/shm", "/dev/hugepages", "/mnt"],
+        )
+
+    def test_optical_drive_can_no_longer_raise_a_capacity_risk(self) -> None:
+        from plugins.mysql.rules import RuleEngine
+
+        engine = RuleEngine()
+        engine._evaluations = []
+        engine._check_filesystem_usage(context(), self._metrics())
+        evaluation = engine._evaluations[0]
+        self.assertEqual(evaluation.rule_id, "COMMON.CAPACITY.FILESYSTEM_USAGE")
+        self.assertEqual(evaluation.status, "passed")
+        # 既不报风险，也不该留下整改项。
+        self.assertEqual(engine._findings, [])
+        # 理由里必须写明口径，否则读者无法解释光驱为什么没被算进来。
+        self.assertIn("持久化", evaluation.reason)
+
+    def test_unfiltered_worst_value_would_still_trigger(self) -> None:
+        # 反向控制：把光驱的 100% 手工塞回去，规则立刻触发——说明本包不触发
+        # 是因为指标层剔除了它，而不是阈值被放宽了。
+        engine = self._evaluate_capacity(100.0)
+        self.assertEqual(engine._evaluations[0].status, "triggered")
+        self.assertEqual(len(engine._findings), 1)
 
 
 if __name__ == "__main__":

@@ -276,13 +276,16 @@ class RuleEngine:
     def _check_filesystem_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
         rule = CANONICAL_RULE_IDS["filesystem_usage"]
         local = metrics["scope"]["database_target_is_local"]
+        # Persistent mounts only: metrics dropped pseudo filesystems, read-only
+        # media and container overlays before taking the maximum, so the number
+        # and the table in the report describe the same set of mounts.
         max_fs = metrics["capacity"].get("max_filesystem_usage_percent")
         t = DEFAULT_THRESHOLDS["filesystem_usage_critical"]
         self._evaluate(
             rule, local, max_fs is not None,
             max_fs is not None and max_fs >= t,
-            "检查所有已成功读取的文件系统",
-            [f"最高文件系统使用率：{max_fs:.1f}%"] if max_fs is not None else [],
+            "检查所有已成功读取的持久化文件系统",
+            [f"最高文件系统使用率：{max_fs:.1f}%（已排除虚拟/只读挂载点）"] if max_fs is not None else [],
         )
 
     def _check_schema_items(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
