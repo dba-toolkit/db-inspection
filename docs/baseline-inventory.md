@@ -1,6 +1,8 @@
 # 阶段 0 基线清单
 
 > 冻结日期：2026-08-11。SHA256 用于后续确认输入和代码是否与本次盘点一致。
+>
+> ⚠️ 本清单是**整理前的历史快照**。阶段 13 仓库整理后部分文件位置已变更：`analyze_inspection_v2.py` → `plugins/mysql/analyzer.py`、`chart_style.py` → `plugins/mysql/chart_style.py`、`inspection_rules.json` → `plugins/mysql/inspection_rules.json`、`enhance_report.py` → `tools/enhance_report.py`、`logo.png` → `assets/logo.png`；根 `rules.py` 兼容壳已删除。表中的字节数与 SHA256 反映整理前状态，未随搬迁改写。
 
 ## 1. MySQL 阶段 0 冻结代码基线
 
@@ -149,8 +151,9 @@ collector、规则配置、Word 生成器、增强器和图表样式仍保持阶
 - 大小：35,083 字节；SHA256：`99FD8CACC7956121A583FEE18D9E570DA992C3CC43366B8B5430B4744B8E5DE3`
 - 旧流程冻结：`tests/baselines/postgresql/legacy_2_0_1/`
 - 公共核心接入基线：`tests/baselines/postgresql/current_v2/`
-- 结果：1 个实例、完整度 93.5%、健康分 90、36 条规则（2 触发/32 通过/2 未评价）、14 章节、14 项、5 张图。
-- Word：公共 4.2.0 专业引擎生成 23 页报告；逐页视觉检查和可访问性审计通过。
+- 结果：1 个实例、完整度 93.5%、健康分 **80**、36 条规则（2 触发/32 通过/2 未评价）、14 章节、14 项、6 张图（阶段 14 第④步由 5 张改为 6 张：系统章节 3 张并成 4 张公共 OS 图）。健康分旧记录写的是 90，那是从过期的 `current/` 基线抄来的值，第⑤步按实测修正为 80。
+- 阶段 14 第⑤步：OS 四条（CPU/IO wait/内存/磁盘 util）的判据、阈值、理由与置信度改由 `inspection_core/system_checks.py` 统一给出，rule_id 由 `COMMON.SYSTEM.{CPU,IOWAIT,MEMORY}` 收口为 `*_PRESSURE`；本基线已就地重跑刷新。
+- Word：公共 4.2.0 专业引擎生成 23 页报告；逐页视觉检查和可访问性审计通过。（阶段 14 第④步改为 6 张图后未重新逐页复核页数，详见 `current_v2/baseline.json` 的 `professional_word_pages_note`。）
 - 详细输出指纹、代码指纹和预期差异见 `tests/baselines/postgresql/current_v2/baseline.json`。
 - `report_model_legacy.json` 永久保留旧 PG envelope；`report_model.json` 使用 `postgresql_inspection_report_model` 标准契约。
 
@@ -160,7 +163,9 @@ collector、规则配置、Word 生成器、增强器和图表样式仍保持阶
 - 大小：44,351 字节；SHA256：`9EDE9635A440908FEF77F919B46134ACAE515F245430415788A453C72E68A82C`
 - 外部分析器/规则指纹见 `tests/baselines/oracle/current/baseline.json`。
 - 契约适配器与 Word 基线：`tests/baselines/oracle/current/`
-- 结果：1 个实例、完整度 100%、健康分 43、34 条规则（10 触发/20 通过/4 未评价）、9 章节、48 项、9 张图、10 条风险（1 critical/2 high/5 medium/2 low）。
+- 结果：1 个实例、完整度 100%、健康分 26、34 条规则（10 触发/20 通过/4 未评价，与规则包条数一致）、9 章节、**52 项**、**8 张图**、10 条风险（2 critical/2 high/4 medium/2 low）。健康分与 critical 数在第⑦步 severity 分级后变化（43 → 26、1 → 2）；旧记录写「48 项 / 9 张图」，是阶段 14 第③步（IO Wait 图并回 CPU 图、系统环境章节补 4 项）之前的值。
+- 阶段 14 第⑤步：OS 三条（CPU/IO wait/内存）改由公共层判定，rule_id 由 `ORA.SYSTEM.*` / `ORA.CAPACITY.FILESYSTEM_USAGE` 收口为 `COMMON.*`；同时删除从未被上报的死规则 `ORA.SYSTEM.SAR_CPU_PEAK` / `ORA.SYSTEM.SAR_IOWAIT_PEAK`（规则包 36 → 34 条）。本基线已就地重跑刷新。
+- 阶段 14 第⑦步：`_evaluate` 新增 `severity_override` 形参，二级严重度阈值真正落地。`ORA.PERFORMANCE.LIBRARY_CACHE` 命中率 79.2% 低于严重档，severity `medium` → `critical`，findings 按严重度重排（F-006 → F-002），健康分 **43 → 26**、critical 1 → 2；`ORA.CONFIG.REDO_MEMBER` 判定改读 `redo_member_min`（触发集合不变，文案与 fact 键更新）。8 张图 PNG 逐字节不变。本基线已就地重跑刷新。
 - Word：公共 4.2.0 专业引擎生成 Oracle 专业版报告（含 9 张技术图表）；逐页 PNG 视觉验收待具备 LibreOffice 的环境补做。
 - `report_model.json` 保留外部事实来源；`report_model_standard.json` 为 `plugins/oracle/report_adapter.py` 适配后的标准报告模型。
 

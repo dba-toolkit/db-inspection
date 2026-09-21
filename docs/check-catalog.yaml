@@ -23,7 +23,7 @@ contracts:
   word_renderer: inspection_core/word_engine.py
   word_profile: plugins/mysql/word_report.py
 
-# 采集项由 mysql_inspection_standard.sh 的 item_id 汇总。
+# 采集项由 inspection/mysql_inspection_standard.sh 的 item_id 汇总。
 # artifact 是采集包内路径；同一个 item 在不同能力分支下可能成功、跳过或不适用。
 collector_items:
   system_static:
@@ -196,11 +196,11 @@ rules:
   - {id: MYSQL.LOCK.WAITING, category: performance, severity: high}
   - {id: MYSQL.REPLICATION.HEALTH, category: availability, severity: high, threshold: {replication_lag_seconds: 60}}
   - {id: MYSQL.LOG.ERROR_EVENTS, category: availability, severity: medium}
-  - {id: MYSQL.BACKUP.RECENT_SUCCESS, category: backup, severity: high}
+  - {id: MYSQL.BACKUP.TASK_VISIBILITY, category: backup, severity: low, note: "仅评价备份任务配置可见性；备份有效性需备份平台结果与恢复演练证据"}
 
 known_mapping_gaps:
   - "采集项、规则和报告项尚无统一 check manifest；本文件目前是人工冻结目录。"
-  - "inspection_rules.json 只配置元数据和阈值，新增规则仍需修改 plugins/mysql/rules.py。"
+  - "plugins/mysql/inspection_rules.json 只配置元数据和阈值，新增规则仍需修改 plugins/mysql/rules.py。"
   - "部分采集项只用于能力判断或派生指标，不直接出现在 Word。"
   - "events、routines、triggers、schema_privileges、table_io_top、open_tables 等已采集，但当前没有独立报告 item。"
   - "备份检查只能看到主机侧线索，不能证明备份成功或可恢复。"

@@ -1,5 +1,5 @@
 catalog_version: "0.1"
-as_of: "2026-08-11"
+as_of: "2026-09-20"
 database: postgresql
 scope: "PostgreSQL 2.0.1 分析插件、36 条规则、14 个报告项和公共 Word 契约"
 
@@ -31,10 +31,10 @@ report_sections:
 rules:
   - COMMON.COLLECTION.QUALITY
   - COMMON.COLLECTION.ERRORS
-  - COMMON.SYSTEM.CPU
-  - COMMON.SYSTEM.IOWAIT
+  - COMMON.SYSTEM.CPU_PRESSURE
+  - COMMON.SYSTEM.IOWAIT_PRESSURE
   - COMMON.SYSTEM.DISK_UTIL
-  - COMMON.SYSTEM.MEMORY
+  - COMMON.SYSTEM.MEMORY_PRESSURE
   - PG.CACHE.HIT_RATIO
   - PG.CONNECTION.USAGE
   - PG.VACUUM.DEAD_TUPLE
@@ -67,7 +67,9 @@ rules:
   - PG.LOG.CONFIG
 
 known_boundaries:
-  - "当前只接入分析和报告；D:\\AI\\PG\\GPT\\pg_inspection_standard.sh 仍是独立采集器，尚未改写。"
+  - "当前只接入分析和报告；采集脚本已随其他三库移入仓库 inspection/pg_inspection_standard.sh，但仍是独立单文件采集器，尚未按公共 Linux 模块目标改写。"
   - "旧 PG 报告严重性 critical/warning/info 在标准报告契约中映射为 high/medium/low，同时保留 source_severity。"
   - "旧报告模型不携带 manifest 校验明细，公共报告明确显示 not_evaluated，不伪造为完整。"
   - "备份主机线索缺失只形成 not_evaluated；需补充备份平台、成功记录和恢复演练证据。"
+  - "OS 压力类四条（CPU/IO wait/内存/磁盘 util）的窗口、判据、阈值与结论文案由 inspection_core/system_checks.py 统一给出，本规则包只声明 title/summary/recommendation，不再声明阈值。"
+  - "旧拼写 COMMON.SYSTEM.CPU / IOWAIT / MEMORY 已退役，读到旧报告时按 system_checks.RETIRED_RULE_IDS 解析为 *_PRESSURE。"
