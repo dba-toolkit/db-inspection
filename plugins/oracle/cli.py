@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+# 直接以脚本方式运行本文件时把项目根补回 sys.path，保证 plugins.* 可导入。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from plugins.oracle.analyzer import OracleAnalyzer
 
 

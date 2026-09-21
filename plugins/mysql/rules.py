@@ -18,8 +18,13 @@ from inspection_core import (
     RuleEvaluation,
     safe_float,
 )
+from inspection_core.system_checks import (
+    CANONICAL_RULE_IDS,
+    DEFAULT_THRESHOLDS,
+    os_pressure_report,
+)
 
-RULES_CONFIG = Path(__file__).resolve().parents[2] / "inspection_rules.json"
+RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules.json"
 
 
 def load_rules_config(path: Path | None = None) -> dict[str, Any]:
@@ -96,6 +101,8 @@ class RuleEngine:
         triggered: bool,
         reason: str,
         facts: list[str],
+        confidence_override: float | None = None,
+        severity_override: str | None = None,
     ) -> None:
         """Core evaluation dispatcher — mirrors the original evaluate() closure."""
         cfg = self._cfg(rule_id)
@@ -106,6 +113,14 @@ class RuleEngine:
         recommendation: str = cfg.get("recommendation", "")
         evidence: list[str] = cfg.get("evidence_refs", [])
         confidence: float = float(cfg.get("confidence", 1.0))
+        if confidence_override is not None:
+            # Data-source driven (SAR history vs. a short live sample), so it
+            # cannot live in the rule pack.
+            confidence = confidence_override
+        if severity_override is not None:
+            # Two-tier rule: the pack declares the base level, the caller
+            # promotes it when the harder threshold is crossed.
+            severity = severity_override
         requires_restart: bool | None = cfg.get("requires_restart", False)
 
         if not applicable:
@@ -156,7 +171,7 @@ class RuleEngine:
         )
 
     def _check_time_sync(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
-        rule = "COMMON.SYSTEM.TIME_SYNC"
+        rule = CANONICAL_RULE_IDS["time_sync"]
         local = metrics["scope"]["database_target_is_local"]
         ntp = str(ctx.snapshot.get("time_evidence", {}).get("ntp_synchronized", "")).lower()
         self._evaluate(
@@ -167,48 +182,25 @@ class RuleEngine:
         )
 
     def _check_system_resources(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
+        """CPU / IO wait / memory pressure, judged by the shared OS layer.
+
+        MySQL ships three of the four OS checks (no standalone disk-util rule),
+        which is the only thing it still decides here — the window, the peak
+        criterion, the thresholds and the verdict semantics all come from
+        ``inspection_core.system_checks``.
+        """
         local = metrics["scope"]["database_target_is_local"]
-        history_usable = metrics["sampling_context"]["history"]["usable_for_trend_rules"]
-        source = metrics["system_history"] if history_usable else metrics["system_realtime"]
-        conf = 0.9 if history_usable else 0.65
-        reason_note = "使用有效 SAR 历史" if history_usable else "仅使用现场短时样本，结论置信度较低"
-
-        # CPU
-        cpu_max = source.get("cpu_busy_percent", {}).get("max")
-        threshold = self._threshold("COMMON.SYSTEM.CPU_PRESSURE", "cpu_peak_warning", 90)
-        self._evaluate(
-            "COMMON.SYSTEM.CPU_PRESSURE", local, cpu_max is not None,
-            cpu_max is not None and cpu_max >= threshold,
-            reason_note,
-            [f"CPU 峰值：{cpu_max}%"] if cpu_max is not None else [],
+        source, verdicts = os_pressure_report(
+            metrics, include=("cpu_pressure", "iowait_pressure", "memory_pressure"),
         )
-        # override confidence for system rules based on data source
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
-
-        # IO wait
-        iowait_max = source.get("cpu_iowait_percent", {}).get("max")
-        threshold = self._threshold("COMMON.SYSTEM.IOWAIT_PRESSURE", "iowait_peak_warning", 20)
-        self._evaluate(
-            "COMMON.SYSTEM.IOWAIT_PRESSURE", local, iowait_max is not None,
-            iowait_max is not None and iowait_max >= threshold,
-            reason_note,
-            [f"IO wait 峰值：{iowait_max}%"] if iowait_max is not None else [],
-        )
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
-
-        # Memory
-        mem_avg = source.get("memory_used_percent", {}).get("average")
-        threshold = self._threshold("COMMON.SYSTEM.MEMORY_PRESSURE", "memory_usage_warning", 90)
-        self._evaluate(
-            "COMMON.SYSTEM.MEMORY_PRESSURE", local, mem_avg is not None,
-            mem_avg is not None and mem_avg >= threshold,
-            reason_note,
-            [f"内存平均使用率：{mem_avg}%"] if mem_avg is not None else [],
-        )
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
+        reason_note = source["reason"]
+        for verdict in verdicts:
+            self._evaluate(
+                verdict["rule_id"], local, verdict["available"], verdict["triggered"],
+                reason_note,
+                [verdict["fact"]] if verdict["fact"] else [],
+                confidence_override=source["confidence"],
+            )
 
     def _check_security_root_remote(self, ctx: PackageContext) -> None:
         rule = "MYSQL.SECURITY.ROOT_REMOTE"
@@ -282,10 +274,10 @@ class RuleEngine:
         )
 
     def _check_filesystem_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
-        rule = "COMMON.CAPACITY.FILESYSTEM_USAGE"
+        rule = CANONICAL_RULE_IDS["filesystem_usage"]
         local = metrics["scope"]["database_target_is_local"]
         max_fs = metrics["capacity"].get("max_filesystem_usage_percent")
-        t = self._threshold(rule, "filesystem_usage_critical", 90)
+        t = DEFAULT_THRESHOLDS["filesystem_usage_critical"]
         self._evaluate(
             rule, local, max_fs is not None,
             max_fs is not None and max_fs >= t,
@@ -414,13 +406,39 @@ class RuleEngine:
         )
 
     def _check_backup(self, ctx: PackageContext) -> None:
-        rule = "MYSQL.BACKUP.RECENT_SUCCESS"
-        backup_rows = ctx.tables.get("backup_evidence", [])
-        self._evaluate(
-            rule, True, bool(backup_rows), False,
-            "采集包未包含可验证的最近备份成功记录" if not backup_rows else "检查最近备份成功记录",
-            [],
-        )
+        """备份任务配置可见性。
+
+        采集端只产出备份任务的**配置证据**（cron / systemd timer / 备份进程），
+        不包含"最近一次备份是否成功"的结果数据；因此本条只评价配置可见性，
+        备份有效性仍需接入备份平台任务结果与恢复演练记录后才能判定。
+        """
+        rule = "MYSQL.BACKUP.TASK_VISIBILITY"
+        evidence_dir = ctx.root / "evidence"
+        sources = [
+            evidence_dir / "backup_cron.txt",
+            evidence_dir / "backup_timers.txt",
+            evidence_dir / "backup_processes.txt",
+        ]
+        present = [path for path in sources if path.exists()]
+        if not present:
+            self._evaluate(rule, True, False, False, "采集包未包含备份任务证据文件", [])
+            return
+        found = 0
+        for path in present:
+            found += sum(
+                1 for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()
+            )
+        if found:
+            self._evaluate(
+                rule, True, True, False,
+                f"发现 {found} 条备份相关任务配置", [f"备份任务配置 {found} 条"],
+            )
+        else:
+            self._evaluate(
+                rule, True, True, True,
+                "未发现任何备份任务配置（cron / systemd timer / 备份进程）",
+                ["备份任务配置 0 条"],
+            )
 
 class MySQLRuleProvider:
     """Database plugin facade for evaluating the MySQL rule pack."""

@@ -1,11 +1,8 @@
 {
   "version": "2.0",
+  "_comment": "OS 压力类阈值（CPU/iowait/内存/磁盘 util）不在此配置，统一由 inspection_core/system_checks.py 的 DEFAULT_THRESHOLDS 提供。",
   "globals": {
     "quality_score_min": 80,
-    "cpu_peak_warning": 90,
-    "iowait_peak_warning": 15,
-    "disk_util_warning": 80,
-    "memory_usage_warning": 90,
     "cache_hit_min": 95,
     "connection_usage_warning": 80,
     "dead_tuple_total_warning": 100000,
@@ -31,7 +28,7 @@
       "recommendation": "查看 collection_status.json 中 status=error 的项目及其 reason，修复后重新采集",
       "threshold": {}
     },
-    "COMMON.SYSTEM.CPU": {
+    "COMMON.SYSTEM.CPU_PRESSURE": {
       "category": "system",
       "severity": "warning",
       "title": "CPU 使用率过高",
@@ -39,7 +36,7 @@
       "recommendation": "使用 top/htop 定位高 CPU 进程，检查慢查询和索引使用情况",
       "threshold": {}
     },
-    "COMMON.SYSTEM.IOWAIT": {
+    "COMMON.SYSTEM.IOWAIT_PRESSURE": {
       "category": "system",
       "severity": "warning",
       "title": "IO 等待过高",
@@ -55,7 +52,7 @@
       "recommendation": "结合 iostat 的 await、队列深度和读写吞吐定位瓶颈，确认底层存储时延及高 IO SQL",
       "threshold": {}
     },
-    "COMMON.SYSTEM.MEMORY": {
+    "COMMON.SYSTEM.MEMORY_PRESSURE": {
       "category": "system",
       "severity": "warning",
       "title": "内存使用率过高",

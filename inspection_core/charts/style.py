@@ -1,28 +1,39 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""Unified matplotlib chart style for Oracle inspection reports — mirrors MySQL chart_style.
+"""Database-neutral chart style: palette, semantic aliases and rcParams.
 
-Import ``apply_style()`` before creating any figures; the module-level
-constants provide a shared colour palette, dimension presets, and semantic aliases.
+This module is the single source of truth for chart colours.  Every database
+plugin must read colours from here instead of defining its own constants, so a
+MySQL chart and an Oracle chart of the same OS metric look identical.
+
+matplotlib is optional: the report pipeline must still produce PNG charts on
+hosts where only Pillow is available (see ``render.py`` for the fallback).
 """
 from __future__ import annotations
 
-try:
-    import matplotlib
-    import matplotlib.pyplot as plt
-    matplotlib.use("Agg")
-    _HAS_MPL = True
-except ImportError:
-    _HAS_MPL = False
-
 import warnings
 
-# ensure non-GUI backend before any figure creation
+try:  # pragma: no cover - exercised through apply_style() return value
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.use("Agg")
+    _HAS_MPL = True
+except ImportError:  # pragma: no cover
+    matplotlib = None  # type: ignore[assignment]
+    plt = None  # type: ignore[assignment]
+    _HAS_MPL = False
+
 # suppress "Glyph X missing from font" noise when some glyphs aren't in every font
 warnings.filterwarnings("ignore", message="Glyph.*missing from font")
 
 # ── CJK font support ──
-_CJK_FONTS = ["Microsoft YaHei", "SimHei", "WenQuanYi Micro Hei", "Noto Sans CJK SC"]
+CJK_FONTS = [
+    "Microsoft YaHei",
+    "SimHei",
+    "Noto Sans CJK SC",
+    "Noto Sans SC",
+    "WenQuanYi Micro Hei",
+    "WenQuanYi Zen Hei",
+]
 
 # ---------------------------------------------------------------------------
 # colour palette — 8 distinguishable colours for multi-line charts
@@ -43,7 +54,7 @@ BACKGROUND = "#FFFFFF"   # chart background
 COLORS = [C0, C1, C2, C3, C4, C5, C6, C7]
 
 # ---------------------------------------------------------------------------
-# series colour aliases for semantic use
+# series colour aliases for semantic use (14 OS series)
 # ---------------------------------------------------------------------------
 CPU_USER = C0
 CPU_SYSTEM = C2
@@ -61,7 +72,7 @@ NET_RX = C0
 NET_TX = C2
 
 # ---------------------------------------------------------------------------
-# semantic colour map (backward-compatible with old COLOR_MAP usage)
+# severity / status colour map (shared by risk and status rendering)
 # ---------------------------------------------------------------------------
 COLOR_MAP = {
     "blue": C0, "red": C1, "orange": C2, "green": C3,
@@ -70,6 +81,17 @@ COLOR_MAP = {
     "low": "#2E90FA", "healthy": "#12B76A", "muted": GREY,
     "navy": "#123B5D", "light": "#EAF2F5",
 }
+
+# ---------------------------------------------------------------------------
+# fallback palette for the dependency-light Pillow renderer
+# (matplotlib rcParams are unavailable there, so colours are passed explicitly)
+# ---------------------------------------------------------------------------
+FLAT_PALETTE = ("#1D4ED8", "#C2410C", "#9B1C1C", "#0F766E", "#6D28D9", "#4B5563")
+FALLBACK_TITLE_COLOUR = "#171717"
+FALLBACK_LABEL_COLOUR = "#555555"
+FALLBACK_TICK_COLOUR = "#777777"
+FALLBACK_NOTE_COLOUR = "#666666"
+FALLBACK_PANEL_TITLE_COLOUR = "#333333"
 
 # ---------------------------------------------------------------------------
 # figure presets
@@ -84,20 +106,26 @@ FONT_SIZE_AXIS = 10
 FONT_SIZE_TICK = 8.5
 DATE_ROTATION = 30
 
-# ---------------------------------------------------------------------------
-# style application
-# ---------------------------------------------------------------------------
 _STYLE_APPLIED = False
 
 
-def apply_style() -> None:
+def has_matplotlib() -> bool:
+    """Return True when matplotlib could be imported."""
+    return _HAS_MPL
+
+
+def apply_style() -> bool:
     """Apply the unified chart style to matplotlib rcParams.
 
-    Idempotent — safe to call multiple times.
+    Idempotent and safe to call from any plugin.  Returns True when the style
+    was applied, False when matplotlib is unavailable — callers that cannot
+    work without matplotlib should check ``has_matplotlib()`` first.
     """
     global _STYLE_APPLIED
+    if not _HAS_MPL:
+        return False
     if _STYLE_APPLIED:
-        return
+        return True
     rc = {
         # figure
         "figure.facecolor": BACKGROUND,
@@ -122,7 +150,7 @@ def apply_style() -> None:
         "lines.markersize": 0,
         # text
         "font.family": FONT_FAMILY,
-        "font.sans-serif": _CJK_FONTS,
+        "font.sans-serif": CJK_FONTS,
         "axes.unicode_minus": False,
         "axes.titlesize": FONT_SIZE_TITLE,
         "axes.titleweight": "normal",
@@ -143,6 +171,7 @@ def apply_style() -> None:
     }
     matplotlib.rcParams.update(rc)
     _STYLE_APPLIED = True
+    return True
 
 
 def chart_colors() -> dict[str, str]:

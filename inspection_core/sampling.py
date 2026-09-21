@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .models import PackageContext
 from .values import safe_float
+
+# A SAR history is written at a fixed interval; anything wider than this is a
+# collection gap, not a sampling interval, and must not be counted as coverage.
+_MAX_SAMPLE_GAP_SECONDS = 3600.0
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -22,6 +26,29 @@ def parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def effective_coverage_hours(rows: list[dict[str, Any]], window_hours: float = 24.0) -> float:
+    """Measure the span actually covered inside the latest window.
+
+    The collectors report a ``coverage_hours`` number of their own, but the
+    analyzer must be able to verify it from the timestamps: a file that spans
+    three hours with a two-hour hole does not describe those three hours.
+    Gaps wider than one hour are treated as missing time.
+    """
+    timestamps = sorted({
+        moment for row in rows
+        if (moment := parse_time(row.get("timestamp"))) is not None
+    })
+    if len(timestamps) < 2:
+        return 0.0
+    cutoff = timestamps[-1] - timedelta(hours=window_hours)
+    timestamps = [moment for moment in timestamps if moment >= cutoff]
+    covered_seconds = sum(
+        gap for earlier, later in zip(timestamps, timestamps[1:])
+        if 0 < (gap := (later - earlier).total_seconds()) <= _MAX_SAMPLE_GAP_SECONDS
+    )
+    return round(covered_seconds / 3600, 2)
 
 
 def sar_history_quality(ctx: PackageContext) -> dict[str, Any]:

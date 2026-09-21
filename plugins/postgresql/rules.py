@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from inspection_core.system_checks import os_pressure_report
+
 RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules.json"
 
 
@@ -78,7 +80,8 @@ class RuleEngine:
         fid_counter = 0
 
         def evaluate(rule_id: str, applicable: bool, available: bool, triggered: bool,
-                     reason: str, facts: list[str], evidence_refs: list[str] | None = None) -> None:
+                     reason: str, facts: list[str], evidence_refs: list[str] | None = None,
+                     severity_override: str | None = None) -> None:
             nonlocal fid_counter
             rule = self._rules.get(rule_id, {})
             category = rule.get("category", "")
@@ -86,6 +89,10 @@ class RuleEngine:
             title = rule.get("title", rule_id)
             summary = rule.get("summary", "")
             recommendation = rule.get("recommendation", "")
+            if severity_override is not None:
+                # Two-tier rule: the pack declares the base level, the caller
+                # promotes it when the harder threshold is crossed.
+                severity = severity_override
 
             if not applicable:
                 ev = RuleEvaluation(rule_id=rule_id, category=category, status="not_evaluated",
@@ -127,29 +134,15 @@ class RuleEngine:
                  err_count > 0, f"采集错误项: {err_count}", [f"错误项数量：{err_count}"])
 
         # === System resources ===
-        cpu = metrics.get("cpu_busy_max")
-        cpu_limit = threshold("COMMON.SYSTEM.CPU", "cpu_peak_warning", 90)
-        evaluate("COMMON.SYSTEM.CPU", cpu is not None, True,
-                 cpu is not None and cpu >= cpu_limit,
-                 f"阈值 {cpu_limit}%", [f"CPU 峰值使用率：{cpu:.1f}%"] if cpu else [])
-
-        iowait = metrics.get("iowait_max")
-        iowait_limit = threshold("COMMON.SYSTEM.IOWAIT", "iowait_peak_warning", 15)
-        evaluate("COMMON.SYSTEM.IOWAIT", iowait is not None, True,
-                 iowait is not None and iowait >= iowait_limit,
-                 f"阈值 {iowait_limit}%", [f"IO wait 峰值：{iowait:.1f}%"] if iowait else [])
-
-        disk_util = metrics.get("disk_util_max")
-        disk_limit = threshold("COMMON.SYSTEM.DISK_UTIL", "disk_util_warning", 80)
-        evaluate("COMMON.SYSTEM.DISK_UTIL", disk_util is not None, True,
-                 disk_util is not None and disk_util >= disk_limit,
-                 f"阈值 {disk_limit}%", [f"磁盘利用率峰值：{disk_util:.1f}%"] if disk_util else [])
-
-        mem = metrics.get("memory_used_max")
-        mem_limit = threshold("COMMON.SYSTEM.MEMORY", "memory_usage_warning", 90)
-        evaluate("COMMON.SYSTEM.MEMORY", mem is not None, True,
-                 mem is not None and mem >= mem_limit,
-                 f"阈值 {mem_limit}%", [f"内存使用率峰值：{mem:.1f}%"] if mem else [])
+        # 判据、阈值、数据窗口全部来自 inspection_core.system_checks；
+        # PG 只决定自己上报四条（含 DISK_UTIL）。
+        source, verdicts = os_pressure_report(metrics)
+        for verdict in verdicts:
+            evaluate(
+                verdict["rule_id"], verdict["available"], True, verdict["triggered"],
+                f"阈值 {verdict['threshold']:g}%；{source['reason']}",
+                [verdict["fact"]] if verdict["fact"] else [],
+            )
 
         # === Cache hit ratio ===
         cache = metrics.get("cache_hit_ratio")

@@ -7,6 +7,10 @@ import argparse
 import sys
 from pathlib import Path
 
+# 直接以脚本方式运行本文件时把项目根补回 sys.path，保证 plugins.* 可导入。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from plugins.sqlserver.analyzer import analyze_sqlserver
 
 
@@ -14,7 +18,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze SQL Server inspection package")
     parser.add_argument("input", help="snapshot.json, extracted directory, or zip package")
     parser.add_argument("--output", default="analysis_output")
-    parser.add_argument("--rules-config", default=str(Path(__file__).parent / "plugins" / "sqlserver" / "inspection_rules.json"))
+    parser.add_argument("--rules-config", default=str(Path(__file__).resolve().with_name("inspection_rules.json")))
     args = parser.parse_args()
     try:
         output = Path(args.output).resolve()

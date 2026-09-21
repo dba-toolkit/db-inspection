@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-import rules
 from inspection_core import Finding, PackageContext, RuleEvaluation, safe_float, safe_int
+from plugins.mysql import rules
 
 
 class InspectionCoreTests(unittest.TestCase):

@@ -110,6 +110,14 @@ class MySQLPresentationBuilder:
 
     @staticmethod
     def _mount_rows(path: Path) -> list[dict[str, str]]:
+        # 只剔除已知伪/虚拟文件系统；必须用黑名单而非白名单——
+        # 白名单会把 nfs/cifs 一并藏掉，而"数据目录落在网络文件系统"正是要报的风险。
+        pseudo_fstypes = {
+            "sysfs", "proc", "cgroup", "cgroup2", "tmpfs", "devtmpfs", "devpts",
+            "securityfs", "pstore", "bpf", "tracefs", "configfs", "debugfs",
+            "mqueue", "autofs", "binfmt_misc", "fusectl", "rpc_pipefs", "iso9660",
+            "fuse.vmware-vmblock", "fuse.gvfsd-fuse", "fuse.gvfs-fuse-daemon",
+        }
         if not path.exists():
             return []
         rows: list[dict[str, str]] = []
@@ -118,10 +126,13 @@ class MySQLPresentationBuilder:
             matched = pattern.match(raw.strip())
             if not matched:
                 continue
+            fstype = matched.group(3).strip()
+            if fstype in pseudo_fstypes:
+                continue
             rows.append({
                 "设备": matched.group(1).strip(),
                 "挂载点": matched.group(2).strip(),
-                "类型": matched.group(3).strip(),
+                "类型": fstype,
                 "挂载选项": matched.group(4).strip(),
             })
         return rows
@@ -389,6 +400,38 @@ class MySQLPresentationBuilder:
 
         def value_row(name: str, value: Any, description: str = "") -> dict[str, Any]:
             return {"检查项": name, "采集值": value, "说明": description}
+
+        def evidence_line_count(name: str) -> int:
+            path = ctx.root / "evidence" / name
+            if not path.exists():
+                return 0
+            return sum(
+                1
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.strip()
+            )
+
+        # 备份：采集端只提供"任务配置可见性"（cron / systemd timer / 备份进程），
+        # 现场证据无法证明"最近一次备份成功"或"可恢复"。三者按实际内容分档，
+        # 与规则 MYSQL.BACKUP.TASK_VISIBILITY 保持同一事实来源。
+        backup_sources = ("backup_cron.txt", "backup_processes.txt", "backup_timers.txt")
+        backup_lines = sum(evidence_line_count(name) for name in backup_sources)
+        backup_seen = any((ctx.root / "evidence" / name).exists() for name in backup_sources)
+        if backup_lines:
+            backup_status = "attention"
+            backup_conclusion = (
+                "已取得备份任务配置线索，但任务配置不等同于最近一次备份成功；"
+                "备份可恢复性仍需备份平台结果与恢复演练证据确认。"
+            )
+            backup_evidence = [f"备份任务配置 {backup_lines} 条（cron / systemd timer / 备份进程）"]
+        elif backup_seen:
+            backup_status = "not_evaluated"
+            backup_conclusion = "已取得备份任务配置文件但内容为空，既无法判定备份任务是否存在，也不能判定备份有效。"
+            backup_evidence = ["备份任务配置文件存在但无有效内容（cron / systemd timer / 备份进程）"]
+        else:
+            backup_status = "not_evaluated"
+            backup_conclusion = "采集包未包含可验证的最近备份成功记录与恢复演练证据，因此不能判定备份有效。"
+            backup_evidence = ["未采集到 evidence/backup_*.txt"]
 
         lscpu = self._colon_key_values(ctx.root / "evidence/lscpu.txt")
         host_rows = [
@@ -761,6 +804,11 @@ class MySQLPresentationBuilder:
             10,
         )
 
+        plugin_source = ctx.tables.get("plugins", [])
+        active_plugin_count = sum(
+            1 for row in plugin_source if str(row.get("Status", "")).upper() == "ACTIVE"
+        )
+
         sections = [
             {
                 "section_id": "system_environment",
@@ -783,13 +831,16 @@ class MySQLPresentationBuilder:
                     self._item("system.kernel", "关键内核参数", "tables/kernel_parameters.tsv", kernel_rows,
                                "已取得数据库相关内核参数；参数值需结合数据库内存预算和操作系统基线复核。",
                                recommendation=self._kernel_recommendation(ctx),
+                               evidence=[f"已采集内核参数 {len(kernel_rows)} 项"],
                                collection=collection("system.sysctl_selected"), total_rows=len(kernel_rows)),
                     self._item("system.mounts", "挂载参数", "evidence/mounts.txt", mount_rows,
                                "已取得挂载参数，可用于检查数据库数据目录所在文件系统的持久性选项。" if mount_rows else "未采集到挂载参数。",
+                               evidence=[f"真实块设备挂载 {len(mount_rows)} 项：" + "、".join(str(row.get("挂载点", "")) for row in mount_rows)] if mount_rows else [],
                                collection=collection("system.mounts"), total_rows=len(mount_rows)),
                     self._item("system.dmesg_errors", "内核错误摘要", "evidence/dmesg_errors.txt", dmesg_rows,
                                "存在内核错误级别日志，建议结合硬件与系统日志复核。" if dmesg_rows else "未发现内核错误级别日志。",
                                status="attention" if dmesg_rows else "normal",
+                               evidence=([f"内核错误日志 {len(dmesg_rows)} 条"] + [str(row.get("内核错误日志", ""))[:80] for row in dmesg_rows[:3]]) if dmesg_rows else [],
                                collection=collection("system.dmesg_errors"), total_rows=len(dmesg_rows)),
                 ],
             },
@@ -806,10 +857,12 @@ class MySQLPresentationBuilder:
                                evidence=[f"Schema 数量 {len(schemas)}"], collection=collection("mysql.schemas"), total_rows=len(ctx.tables.get("schemas", []))),
                     self._item("mysql.engines", "可用存储引擎", "tables/engines.tsv", engines,
                                "InnoDB 等受支持存储引擎已加载；业务表引擎合规性因未发现业务 Schema 而不适用。",
+                               evidence=[f"已加载存储引擎 {len(ctx.tables.get('engines', []))} 个"],
                                collection=collection("mysql.engines"), total_rows=len(ctx.tables.get("engines", []))),
                     self._item("mysql.plugins", "活动插件", "tables/plugins.tsv", plugins,
-                               f"已识别 {sum(1 for row in ctx.tables.get('plugins', []) if str(row.get('Status', '')).upper() == 'ACTIVE')} 个活动插件，报告仅展示活动组件。",
-                               collection=collection("mysql.plugins"), total_rows=len(ctx.tables.get("plugins", [])),
+                               f"已识别 {active_plugin_count} 个活动插件，报告仅展示活动组件。",
+                               evidence=[f"活动插件 {active_plugin_count} 个", f"插件记录共 {len(plugin_source)} 条"],
+                               collection=collection("mysql.plugins"), total_rows=len(plugin_source),
                                note="仅展示 ACTIVE 插件，最多 30 行。"),
                 ],
             },
@@ -866,6 +919,7 @@ class MySQLPresentationBuilder:
                                evidence=runtime_evidence, collection=collection("timeseries.realtime_sampling")),
                     self._item("mysql.runtime.sessions", "当前会话", "tables/processlist.tsv", process_rows,
                                f"采集时共取得 {len(process_rows)} 条会话记录；系统会话（system user/event_scheduler）无当前 SQL 属正常现象。",
+                               evidence=[f"会话记录 {len(process_rows)} 条"],
                                collection=collection("mysql.processlist"), total_rows=len(ctx.tables.get("processlist", []))),
                     self._item("mysql.runtime.locks", "事务与锁等待", "tables/long_transactions.tsv; tables/data_lock_waits.tsv; tables/metadata_locks_pending.tsv", lock_rows,
                                "采集时未发现长事务、数据锁等待或待授予元数据锁；该结论仅代表采集时点。",
@@ -878,11 +932,15 @@ class MySQLPresentationBuilder:
                 "items": [
                     self._item("mysql.capacity.schemas", "Schema 容量", "tables/database_sizes.tsv", db_sizes,
                                "已采集各 Schema 数据与索引大小；请结合磁盘使用率和增长趋势评估容量规划。" if db_sizes else "未发现业务 Schema 容量记录，本项不适用。",
-                               status="ok" if db_sizes else "not_applicable", collection=collection("mysql.database_sizes"),
+                               status="ok" if db_sizes else "not_applicable",
+                               evidence=[f"Schema 容量记录 {len(db_sizes)} 条"],
+                               collection=collection("mysql.database_sizes"),
                                total_rows=len(ctx.tables.get("database_sizes", []))),
                     self._item("mysql.capacity.objects", "数据库对象统计", "tables/object_counts.tsv", object_counts,
                                "已采集各 Schema 表、视图及引擎分布。" if object_counts else "未发现业务数据库对象，本项不适用。",
-                               status="ok" if object_counts else "not_applicable", collection=collection("mysql.object_counts"),
+                               status="ok" if object_counts else "not_applicable",
+                               evidence=[f"对象统计记录 {len(object_counts)} 条"],
+                               collection=collection("mysql.object_counts"),
                                total_rows=len(ctx.tables.get("object_counts", []))),
                     self._item("mysql.capacity.risks", "对象结构与容量候选项", "tables/*capacity*.tsv", object_risk_rows,
                                "本实例未发现业务 Schema；无主键、非 InnoDB、碎片和自增容量检查未发现候选对象，未使用索引仅含系统 Schema，不作为业务整改项。",
@@ -902,6 +960,7 @@ class MySQLPresentationBuilder:
                                note=digest_note),
                     self._item("mysql.waits", "等待事件 Top", "tables/wait_events_top.tsv", wait_rows,
                                "等待事件以 idle 为主，采集时未见明显锁等待；短窗口不能排除业务高峰期阻塞。",
+                               evidence=([f"等待事件 {len(wait_source)} 类", f"Top1：{wait_rows[0].get('等待事件')}（{wait_rows[0].get('次数')} 次）"] if wait_rows else []),
                                collection=collection("mysql.wait_events_top"), total_rows=len(wait_source)),
                     self._item("mysql.file_io", "文件 I/O Top", "tables/file_io_top.tsv", file_io_rows,
                                "已取得 Performance Schema 文件 I/O 累计统计；该数据为实例启动以来累计值，不等同于当前实时吞吐。",
@@ -933,9 +992,11 @@ class MySQLPresentationBuilder:
                 "items": [
                     self._item("mysql.logs.files", "日志文件元数据", "tables/log_files.tsv", log_rows,
                                "日志文件路径、可读性、大小和修改时间已取得；默认未采集日志正文。",
+                               evidence=[f"日志文件 {len(log_rows)} 个"],
                                collection=collection("mysql.log_file_metadata"), total_rows=len(ctx.tables.get("log_files", []))),
                     self._item("mysql.logs.summary", "错误日志汇总", "tables/error_log_summary.tsv", error_rows,
                                f"采集窗口内错误日志汇总未发现 Error/Critical/System 级事件；共展示 {len(error_rows)} 类事件。",
+                               evidence=[f"错误事件类型 {len(error_rows)} 类"],
                                collection=collection("mysql.error_log_summary"), total_rows=len(ctx.tables.get("error_log_summary", []))),
                     self._item("mysql.replication.binlog", "Binary Log 状态", "tables/binary_log_status.tsv", binary_status,
                                f"Binary Log 已启用；当前 Binlog {binary_status[0].get('当前 Binlog', '-') if binary_status else '-'}，GTID 模式 {role.get('gtid_mode')}。",
@@ -949,8 +1010,9 @@ class MySQLPresentationBuilder:
                                recommendation="如业务要求高可用，应补充架构设计、下游节点采集包、切换机制和演练记录。",
                                collection=collection("mysql.replica_status"), total_rows=len(ctx.tables.get("replica_status", []))),
                     self._item("mysql.backup", "备份可恢复性证据", "evidence/backup_*.txt", [],
-                               "采集包未包含可验证的最近备份成功记录与恢复演练证据，因此不能判定备份有效。",
-                               status="not_evaluated",
+                               backup_conclusion,
+                               status=backup_status,
+                               evidence=backup_evidence,
                                recommendation="接入备份平台任务结果、备份保留策略以及最近一次恢复演练记录。",
                                collection=collection("system.backup_cron")),
                 ],
@@ -1200,7 +1262,7 @@ class MySQLPresentationBuilder:
             ).to_legacy_gap())
         if any(
             item.get("item_id") == "mysql.backup"
-            and item.get("analysis", {}).get("status") == "not_evaluated"
+            and item.get("analysis", {}).get("status") in {"not_evaluated", "attention"}
             for section in primary.get("inspection_sections", [])
             for item in section.get("items", [])
         ):

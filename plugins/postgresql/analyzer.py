@@ -24,10 +24,10 @@ from inspection_core.package_io import write_json
 from inspection_core.statistics import summarize
 from inspection_core.values import safe_float, safe_int
 from .package_adapter import PostgreSQLPackageAdapter, PostgreSQLPackageError
-from . import parsers as evidence_parsers
 from .charts import PostgreSQLChartProvider
 from .metrics import PostgreSQLMetricProvider
 from .presentation import PostgreSQLPresentationBuilder
+from .report_adapter import chart_section
 from .rule_provider import PostgreSQLRuleProvider
 from .rules import Finding, RuleEvaluation
 
@@ -54,7 +54,7 @@ class Analyzer:
         self.rules_config = rules_config
         self.package_adapter = PostgreSQLPackageAdapter(self.work)
         self.metric_provider = PostgreSQLMetricProvider(self.package_adapter.collection_quality)
-        self.chart_provider = PostgreSQLChartProvider(self.charts_dir)
+        self.chart_provider = PostgreSQLChartProvider(self.output, self.charts_dir)
         self.rule_provider = PostgreSQLRuleProvider(rules_config)
         self.presentation_builder = PostgreSQLPresentationBuilder(
             ANALYZER_VERSION, ANALYSIS_SCHEMA, now_iso
@@ -288,20 +288,19 @@ class Analyzer:
             findings, evaluations = self.run_rules(ctx, metrics, quality)
             print(f"    规则评估 {len(evaluations)} 条 → 触发 {len(findings)} 项风险", file=sys.stderr)
             charts = self.generate_charts(ctx, metrics)
-            if charts and charts[0].get("status") != "skipped":
-                print(f"    图表生成 {len(charts)} 张", file=sys.stderr)
-                # Tag charts with section_id for inline rendering
-                _chart_section_map = {
-                    "system_cpu": "filesystem_capacity", "system_memory": "filesystem_capacity",
-                    "system_disk": "filesystem_capacity",
-                    "pg_sessions": "connections", "pg_stats": "performance",
-                }
-                for c in charts:
-                    sid = _chart_section_map.get(c.get("chart_id", ""), "")
-                    if sid:
-                        c["section_id"] = sid
+            generated = [chart for chart in charts if chart.get("status") == "generated"]
+            if generated:
+                print(f"    图表生成 {len(generated)} 张", file=sys.stderr)
+                # Tag charts with their report section for the audit trail.  The
+                # mapping lives in the report adapter so it cannot drift from the
+                # one the adapter applies to legacy models.
+                for chart in charts:
+                    section_id = chart_section(str(chart.get("chart_id")))
+                    if section_id:
+                        chart["section_id"] = section_id
             else:
-                print(f"    图表跳过 (matplotlib 未安装)", file=sys.stderr)
+                print(f"    图表跳过 ({charts[0].get('reason') if charts else 'no_charts'})",
+                      file=sys.stderr)
             health = self.health_summary(findings)
             report = self.build_report_model(ctx, metrics, findings, evaluations, quality, charts, health)
 
@@ -470,40 +469,6 @@ class Analyzer:
             conclusions.append({"topic": "整体状态", "status": "ok",
                 "conclusion": f"共检查 {len(contexts)} 个节点，未发现严重风险或警告项，数据库运行状态良好"})
         return conclusions
-
-
-# ---------------------------------------------------------------------------
-# SAR history parsing helpers
-# sadf -d output format: hostname;interval;timestamp;type;metric;value
-# ---------------------------------------------------------------------------
-
-_read_sar_csv = evidence_parsers._read_sar_csv
-
-
-_parse_sar_timestamp = evidence_parsers._parse_sar_timestamp
-
-
-_parse_sar_cpu = evidence_parsers._parse_sar_cpu
-
-
-_effective_sar_coverage_hours = evidence_parsers._effective_sar_coverage_hours
-
-
-_parse_sar_memory = evidence_parsers._parse_sar_memory
-
-
-_parse_sar_metric_by_metric = evidence_parsers._parse_sar_metric_by_metric
-
-
-_parse_sar_disk = evidence_parsers._parse_sar_disk
-
-
-_parse_sar_network = evidence_parsers._parse_sar_network
-
-_parse_df_pt = evidence_parsers._parse_df_pt
-
-
-_parse_free_b = evidence_parsers._parse_free_b
 
 
 # ---------------------------------------------------------------------------

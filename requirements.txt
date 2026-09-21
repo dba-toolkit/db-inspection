@@ -3,3 +3,6 @@ Pillow>=10.0
 python-docx>=1.1
 openai>=1.0
 PyYAML>=6.0
+# 时区数据库。Linux 由系统 tzdata 提供，Windows 上 zoneinfo 必须靠这个包；
+# 缺了它 ZoneInfo("Asia/Shanghai") 会抛错，图轴时区静默降级成 UTC+08:00。
+tzdata>=2024.1

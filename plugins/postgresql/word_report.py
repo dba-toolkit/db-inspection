@@ -30,9 +30,13 @@ POSTGRESQL_WORD_PROFILE = WordReportProfile(
         "system_info": SectionChartProfile(
             model_field="postgresql_analysis",
             charts=(
-                ChartDefinition("system_cpu", "CPU 使用率趋势"),
-                ChartDefinition("system_memory", "内存使用率趋势"),
-                ChartDefinition("system_disk", "磁盘利用率趋势"),
+                # The four host charts come from the shared OS layer
+                # (ids match plugins/postgresql/charts.py).  The earlier
+                # system_cpu / system_memory / system_disk trio is superseded.
+                ChartDefinition("SYSTEM_CPU", "CPU 使用率趋势"),
+                ChartDefinition("SYSTEM_MEMORY", "内存使用率趋势"),
+                ChartDefinition("SYSTEM_DISK", "磁盘 I/O 趋势"),
+                ChartDefinition("SYSTEM_NETWORK_REALTIME", "网络吞吐趋势"),
             ),
         ),
         "connections": SectionChartProfile(

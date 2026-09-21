@@ -13,7 +13,7 @@ from plugins.sqlserver.word_report import SQLSERVER_WORD_PROFILE, SQLServerWordR
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "baselines" / "sqlserver" / "current" / "report_model.json"
-LOGO = ROOT / "logo.png"
+LOGO = ROOT / "assets" / "logo.png"
 
 
 def load_source() -> dict:

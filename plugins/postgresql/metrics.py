@@ -8,16 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from inspection_core.charts import busiest_history_device, busy_percent, series_values
 from inspection_core.models import PackageContext
+from inspection_core.sampling import effective_coverage_hours
 from inspection_core.values import safe_float, safe_int
-from .parsers import (
-    _effective_sar_coverage_hours,
-    _parse_df_pt,
-    _parse_sar_cpu,
-    _parse_sar_disk,
-    _parse_sar_metric_by_metric,
-    _read_sar_csv,
-)
+from .parsers import _parse_df_pt
 
 
 class PostgreSQLMetricProvider:
@@ -132,34 +127,45 @@ class PostgreSQLMetricProvider:
 
         # Prefer the widest available observation window: merge SAR history peaks
         # with the short realtime sample instead of evaluating only ~30 seconds.
-        sar_cpu_rows = _read_sar_csv(ctx.root / "history" / "sar_cpu.csv") if (ctx.root / "history" / "sar_cpu.csv").exists() else None
-        sar_cpu = _parse_sar_cpu(sar_cpu_rows or [])
-        if sar_cpu:
-            for label, _, values in sar_cpu:
-                if label == "idle":
-                    hist_busy = max((100 - v for v in values), default=None)
-                    if hist_busy is not None:
-                        cpu_busy_max = max(v for v in (cpu_busy_max, hist_busy) if v is not None)
-                elif label == "iowait":
-                    hist_iowait = max(values, default=None)
-                    if hist_iowait is not None:
-                        iowait_max = max(v for v in (iowait_max, hist_iowait) if v is not None)
+        # All four host series come from the shared SAR normaliser, so the column
+        # aliases (%usr/%sys vs %user/%system) and the "whole host" row marker are
+        # decided once rather than re-derived here.
+        sar_cpu_rows = ctx.history.get("sar_cpu", [])
+        if sar_cpu_rows:
+            hist_busy = max(
+                (value for value in busy_percent(sar_cpu_rows) if value is not None),
+                default=None,
+            )
+            if hist_busy is not None:
+                cpu_busy_max = max(v for v in (cpu_busy_max, hist_busy) if v is not None)
+            hist_iowait = max(
+                (value for value in series_values(sar_cpu_rows, "%iowait") if value is not None),
+                default=None,
+            )
+            if hist_iowait is not None:
+                iowait_max = max(v for v in (iowait_max, hist_iowait) if v is not None)
 
-        sar_mem_file = ctx.root / "history" / "sar_memory.csv"
-        sar_mem = _parse_sar_metric_by_metric(sar_mem_file, {"%memused"}) if sar_mem_file.exists() else None
-        if sar_mem:
-            hist_mem = max((v for _, _, values in sar_mem for v in values), default=None)
+        sar_mem_rows = ctx.history.get("sar_memory", [])
+        if sar_mem_rows:
+            hist_mem = max(
+                (value for value in series_values(sar_mem_rows, "%memused") if value is not None),
+                default=None,
+            )
             if hist_mem is not None:
                 mem_used_max = max(v for v in (mem_used_max, hist_mem) if v is not None)
 
-        sar_disk_file = ctx.root / "history" / "sar_disk.csv"
-        sar_disk = _parse_sar_disk(sar_disk_file) if sar_disk_file.exists() else None
-        if sar_disk:
-            hist_disk = max((v for label, _, values in sar_disk if label.endswith("util%") for v in values), default=None)
+        sar_disk_rows = ctx.history.get("sar_disk", [])
+        if sar_disk_rows:
+            busiest_device = busiest_history_device(sar_disk_rows)
+            busiest_rows = [row for row in sar_disk_rows if row.get("DEV") == busiest_device]
+            hist_disk = max(
+                (value for value in series_values(busiest_rows, "%util") if value is not None),
+                default=None,
+            )
             if hist_disk is not None:
                 disk_util_max = max(v for v in (disk_util_max, hist_disk) if v is not None)
 
-        sar_coverage_hours = _effective_sar_coverage_hours(sar_cpu)
+        sar_coverage_hours = effective_coverage_hours(sar_cpu_rows)
 
         # --- PG timeseries ---
         pg_act = ts.get("pg_activity", [])
@@ -249,12 +255,15 @@ class PostgreSQLMetricProvider:
             "max_transaction_seconds": max_xact_sec,
             "lock_wait_count": len(lock_waits),
             "max_partitions": max_partitions,
-            "cpu_busy_max": round(cpu_busy_max, 2) if cpu_busy_max else None,
-            "iowait_max": round(iowait_max, 2) if iowait_max else None,
-            "memory_used_max": round(mem_used_max, 2) if mem_used_max else None,
+            # ``if x`` would turn a genuine 0.0 reading (idle CPU, zero iowait)
+            # into "not collected", and the rule engine would report
+            # not_evaluated instead of passed.
+            "cpu_busy_max": round(cpu_busy_max, 2) if cpu_busy_max is not None else None,
+            "iowait_max": round(iowait_max, 2) if iowait_max is not None else None,
+            "memory_used_max": round(mem_used_max, 2) if mem_used_max is not None else None,
             "disk_util_max": round(disk_util_max, 2) if disk_util_max is not None else None,
             "sar_effective_coverage_hours": sar_coverage_hours,
-            "system_metric_source": "sar+realtime" if sar_cpu else "realtime",
+            "system_metric_source": "sar+realtime" if sar_cpu_rows else "realtime",
             "max_active_sessions": int(max_active) if max_active else None,
             "has_pg_stat_statements": has_pgss,
             "has_backup_tool": has_backup_tool,

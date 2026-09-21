@@ -13,7 +13,7 @@ from plugins.oracle.word_report import ORACLE_WORD_PROFILE, OracleWordReportGene
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "baselines" / "oracle" / "current" / "report_model.json"
-LOGO = ROOT / "logo.png"
+LOGO = ROOT / "assets" / "logo.png"
 
 
 def load_source() -> dict:
@@ -26,7 +26,8 @@ class OraclePluginTests(unittest.TestCase):
         result = adapt_report_model(source)
         self.assertEqual(result["generator_contract"], REPORT_CONTRACT)
         self.assertEqual(result["health_assessment"]["score"], source["health_assessment"]["score"])
-        self.assertEqual(result["health_assessment"]["score"], 43)
+        # 第⑦步 severity 二级分级后 LIBRARY_CACHE 升为 critical，健康分由 43 变为 26。
+        self.assertEqual(result["health_assessment"]["score"], 26)
         self.assertEqual(len(result["risk_register"]), len(source["risk_register"]))
         self.assertEqual(len(result["risk_register"]), 10)
         self.assertEqual(len(result["inspection_sections"]), 9)
@@ -57,8 +58,9 @@ class OraclePluginTests(unittest.TestCase):
         # 20 fact-only items: 15 with rows become normal, 5 without rows stay not_evaluated.
         self.assertEqual(statuses.count("normal"), 35)
         self.assertEqual(statuses.count("not_evaluated"), 8)
-        self.assertEqual(statuses.count("risk"), 3)
-        self.assertEqual(statuses.count("attention"), 6)
+        # LIBRARY_CACHE 在第⑦步升为 critical，对应巡检项由 attention 变 risk（3→4 / 6→5）。
+        self.assertEqual(statuses.count("risk"), 4)
+        self.assertEqual(statuses.count("attention"), 5)
         self.assertEqual(len(result["appendix"]["rule_evaluations"]), 34)
 
     def test_adapter_is_idempotent(self) -> None:
@@ -76,11 +78,29 @@ class OraclePluginTests(unittest.TestCase):
     def test_adapter_normalizes_charts(self) -> None:
         result = adapt_report_model(load_source())
         charts = result["oracle_analysis"]["charts"]
-        self.assertEqual(len(charts), 9)
+        # 系统四张来自公共 OS 层，Oracle 专属四张留在插件：共 8 张。
+        self.assertEqual([chart["chart_id"] for chart in charts], [
+            "SYSTEM_CPU", "SYSTEM_MEMORY", "SYSTEM_DISK", "SYSTEM_NETWORK_REALTIME",
+            "oracle_physical_io", "oracle_logical_vs_physical",
+            "oracle_redo_rate", "oracle_parse_ratio",
+        ])
         self.assertTrue(all(chart["status"] == "generated" for chart in charts))
         self.assertTrue(all(chart["file"].startswith("charts/") for chart in charts))
-        self.assertTrue(any(chart["source_scope"] == "historical" for chart in charts))
-        self.assertTrue(any(chart["source_scope"] == "realtime_snapshot" for chart in charts))
+        # 图题必须命中登记表，否则会静默退化成 chart_id。
+        self.assertTrue(all(chart["caption"] != chart["chart_id"] for chart in charts))
+        self.assertEqual(
+            {chart["chart_id"]: chart["source_scope"] for chart in charts},
+            {
+                "SYSTEM_CPU": "historical",
+                "SYSTEM_MEMORY": "historical",
+                "SYSTEM_DISK": "historical",
+                "SYSTEM_NETWORK_REALTIME": "realtime_snapshot",
+                "oracle_physical_io": "realtime_snapshot",
+                "oracle_logical_vs_physical": "realtime_snapshot",
+                "oracle_redo_rate": "realtime_snapshot",
+                "oracle_parse_ratio": "realtime_snapshot",
+            },
+        )
 
     def test_professional_word_renders_sections_and_risk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -110,9 +130,10 @@ class OraclePluginTests(unittest.TestCase):
             for finding in adapt_report_model(load_source())["risk_register"]:
                 self.assertIn(finding["finding_id"], table_text)
                 self.assertIn(finding["title"], table_text)
-            self.assertIn("43 / 100", table_text)
+            self.assertIn("26 / 100", table_text)
             self.assertIn("NOARCHIVELOG", table_text)
-            self.assertGreaterEqual(len(generated.inline_shapes), 10)
+            # 8 张技术图 + 封面 1 个 logo；逐张都从 charts/ 取到才会被内嵌。
+            self.assertEqual(len(generated.inline_shapes), 9)
 
 
 if __name__ == "__main__":

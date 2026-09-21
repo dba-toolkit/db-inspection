@@ -3,7 +3,7 @@
 
 Reads one or more mysql_inspection_v1 tar.gz packages, validates package
 integrity, calculates deterministic static/time-series metrics, runs an
-quality-aware rule pack (config-driven, see inspection_rules.json), renders
+quality-aware rule pack (config-driven, see plugins/mysql/inspection_rules.json), renders
 PNG charts, and writes analysis.json, report_model.json and llm_input.json.
 
 Only Python standard library and matplotlib are required.
@@ -18,6 +18,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+
+# 本文件位于 plugins/mysql/：以 `python <本文件>` 方式被调用时 sys.path[0] 是所在目录，
+# plugins.* / inspection_core.* 会导入失败，故直接运行时把项目根补回 sys.path。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from inspection_core import Finding, PackageContext, RuleEvaluation
 from inspection_core.package_io import write_json
@@ -392,6 +397,9 @@ class AnalyzerV2(Analyzer):
         "mysql.innodb_status",
     }
 
+    # 趋势历史（sar，24h / 8 个维度）不可用时，采集质量不得再评为 A 级。
+    TREND_HISTORY_UNUSABLE_SCORE_CAP = 90.0
+
     def __init__(self, output: Path, keep_extracted: bool = False, rules_config: Path | None = None) -> None:
         super().__init__(output, keep_extracted)
         self.rule_evaluations: dict[str, list[RuleEvaluation]] = {}
@@ -414,6 +422,11 @@ class AnalyzerV2(Analyzer):
         normalized_items: list[dict[str, Any]] = []
         earned = 0.0
         total = 0.0
+        # 趋势历史（sar）的实际可用性。采集端可能把"导出成功但覆盖为零"记为 ok，
+        # 这里按分析侧实测结果重算，避免零覆盖的历史数据仍拿满分。
+        sar = self.sar_quality(ctx)
+        sar_usable = bool(sar.get("usable_for_trend_rules"))
+        sar_coverage = float(sar.get("coverage_hours") or 0.0)
         for raw in ctx.status.get("items", []):
             item = dict(raw)
             item_id = str(item.get("item_id", ""))
@@ -427,6 +440,9 @@ class AnalyzerV2(Analyzer):
             if item_id in {"system.filesystems", "system.inodes"} and status == "error" and ctx.tables.get(table_name):
                 status = "partial"
                 normalization = "主体数据已取得，仅个别挂载点读取失败"
+            if item_id == "system.sar_history" and not sar_usable:
+                status = "partial" if sar_coverage > 0 else "error"
+                normalization = "历史数据按分析侧实际可用性计分：" + "；".join(sar.get("reasons") or [])
             importance = 0.5 if item_id in self.OPTIONAL_COLLECTION_ITEMS else 1.0
             counts[status] = counts.get(status, 0) + 1
             total += importance
@@ -440,7 +456,6 @@ class AnalyzerV2(Analyzer):
                     "normalization": normalization,
                     "duration_ms": item.get("duration_ms"),
                 })
-        sar = self.sar_quality(ctx)
         limitations = list(sar["reasons"])
         for item in normalized_items:
             if item["status"] in {"permission_denied", "timeout", "error"}:
@@ -452,6 +467,12 @@ class AnalyzerV2(Analyzer):
         score = round((earned / total * 100) if total else 0.0, 1)
         if ctx.integrity.get("status") != "ok":
             score = min(score, 40.0)
+        if not sar_usable:
+            score = min(score, self.TREND_HISTORY_UNUSABLE_SCORE_CAP)
+            limitations.append(
+                f"趋势历史不可用（覆盖 {sar_coverage:.2f}/{float(sar.get('requested_hours') or 0):.0f} 小时），"
+                f"采集质量分上限 {self.TREND_HISTORY_UNUSABLE_SCORE_CAP:.0f}"
+            )
         return {
             "score": score,
             "grade": "A" if score >= 95 else "B" if score >= 85 else "C" if score >= 70 else "D",
@@ -460,7 +481,7 @@ class AnalyzerV2(Analyzer):
             "sar_history": sar,
             "limitations": limitations,
             "non_ok_items": normalized_items,
-            "scoring_note": "空结果不扣分；可选能力轻权重；部分成功、权限、超时和错误按影响扣分。",
+            "scoring_note": "空结果不扣分；可选能力轻权重；部分成功、权限、超时和错误按影响扣分；趋势历史不可用时采集质量分封顶。",
         }
 
     def derive_metrics(self, ctx: PackageContext) -> dict[str, Any]:

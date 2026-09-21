@@ -10,11 +10,20 @@ from typing import Any
 
 from .metrics import safe_float
 from .package_adapter import parse_instance_tag
+from inspection_core.system_checks import CANONICAL_RULE_IDS
 
 
 VERSION = "2.0.0"
 CONTRACT = "oracle_inspection_report_model"
 ANALYSIS_SCHEMA_VERSION = "2.0"
+
+# OS check ids live in the shared layer; the report item id, the analysis
+# lookup and the rule engine must all spell them the same way.
+_RULE_TIME_SYNC = CANONICAL_RULE_IDS["time_sync"]
+_RULE_CPU_PRESSURE = CANONICAL_RULE_IDS["cpu_pressure"]
+_RULE_IOWAIT_PRESSURE = CANONICAL_RULE_IDS["iowait_pressure"]
+_RULE_MEMORY_PRESSURE = CANONICAL_RULE_IDS["memory_pressure"]
+_RULE_FILESYSTEM_USAGE = CANONICAL_RULE_IDS["filesystem_usage"]
 
 
 def now_iso() -> str:
@@ -237,8 +246,8 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
             _val_row("CDB/PDB", "是" if is_cdb else "否"),
             _val_row("ASM", "是" if has_asm else "否"),
         ]),
-        _item("时间同步检查", "ORA.SYSTEM.TIME_SYNC",
-               analysis=_analysis("ORA.SYSTEM.TIME_SYNC")),
+        _item("时间同步检查", _RULE_TIME_SYNC,
+               analysis=_analysis(_RULE_TIME_SYNC)),
         _item("采集完整性", "ORA.COLLECTION.INTEGRITY",
                analysis=_analysis("ORA.COLLECTION.INTEGRITY")),
         _item("采集数据质量", "ORA.COLLECTION.QUALITY",
@@ -310,12 +319,12 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         _item("系统资源概要", "system.resources", resource_rows),
     ]
     if local:
-        sp_items.append(_item("CPU 压力评估", "ORA.SYSTEM.CPU_PRESSURE",
-                               analysis=_analysis("ORA.SYSTEM.CPU_PRESSURE")))
-        sp_items.append(_item("IO Wait 评估", "ORA.SYSTEM.IOWAIT_PRESSURE",
-                               analysis=_analysis("ORA.SYSTEM.IOWAIT_PRESSURE")))
-        sp_items.append(_item("内存压力评估", "ORA.SYSTEM.MEMORY_PRESSURE",
-                               analysis=_analysis("ORA.SYSTEM.MEMORY_PRESSURE")))
+        sp_items.append(_item("CPU 压力评估", _RULE_CPU_PRESSURE,
+                               analysis=_analysis(_RULE_CPU_PRESSURE)))
+        sp_items.append(_item("IO Wait 评估", _RULE_IOWAIT_PRESSURE,
+                               analysis=_analysis(_RULE_IOWAIT_PRESSURE)))
+        sp_items.append(_item("内存压力评估", _RULE_MEMORY_PRESSURE,
+                               analysis=_analysis(_RULE_MEMORY_PRESSURE)))
 
     # ── Filesystem data layer ──
     fs_rows = ctx.tables.get("filesystems", [])
@@ -330,8 +339,8 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
             })
     if display_fs:
         sp_items.append(_item("文件系统使用情况", "oracle.filesystems", rows=display_fs))
-    sp_items.append(_item("文件系统分析", "ORA.CAPACITY.FILESYSTEM_USAGE",
-                           analysis=_analysis("ORA.CAPACITY.FILESYSTEM_USAGE")))
+    sp_items.append(_item("文件系统分析", _RULE_FILESYSTEM_USAGE,
+                           analysis=_analysis(_RULE_FILESYSTEM_USAGE)))
 
     sections.append({"section_id": "system_performance", "title": "系统性能检查", "items": sp_items})
 
@@ -919,18 +928,20 @@ def build_report_model(analysis: dict[str, Any], inspection_sections_list: list[
     charts_raw = primary.get("charts", [])
     charts_normalized: list[dict[str, Any]] = []
     for c in charts_raw:
-        path_str = str(c.get("path", ""))
-        # Convert absolute path to relative (for report portability)
-        rel_path = path_str
-        if path_str:
+        source = str(c.get("path") or "")
+        # 报告模型记相对路径（chart 目录随模型一起拷贝才可移植）；
+        # 下游 Word 引擎以模型所在目录为根解析，绝对路径同样能命中。
+        portable = source
+        if source:
             try:
-                rel_path = str(Path(path_str).relative_to(output))
+                portable = Path(source).relative_to(output).as_posix()
             except ValueError:
-                rel_path = Path(path_str).name
+                portable = Path(source).name
         charts_normalized.append({
             "chart_id": c.get("chart_id", ""),
-            "status": "generated",
-            "file": c.get("path", ""),
+            "status": c.get("status") or ("generated" if source else "skipped"),
+            "file": portable,
+            "source_scope": c.get("source_scope", ""),
             "source_points": c.get("source_points", 0),
         })
 

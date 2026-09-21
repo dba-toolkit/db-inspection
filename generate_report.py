@@ -24,8 +24,11 @@ GENERATORS = {
 }
 
 
+ROOT = Path(__file__).resolve().parent
+
+
 def _load_config() -> dict:
-    path = Path(__file__).resolve().parent / "report_config.json"
+    path = ROOT / "config" / "report_config.json"
     if not path.exists():
         return {}
     try:
@@ -58,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--author", default=REPORT_CONFIG.get("author", "自动生成"))
     parser.add_argument("--reviewer", default=REPORT_CONFIG.get("reviewer", "待填写"))
     parser.add_argument("--report-version", default="")
-    parser.add_argument("--logo", default=REPORT_CONFIG.get("logo", "logo.png"))
+    parser.add_argument("--logo", default=REPORT_CONFIG.get("logo", "assets/logo.png"))
     parser.add_argument("--layout", choices=("professional", "legacy"), default="professional")
     return parser.parse_args()
 
@@ -88,8 +91,11 @@ def main() -> int:
     output = Path(args.output).expanduser().resolve() if args.output else default_output_path(
         model_path, model, profile, args.target
     )
-    logo = Path(args.logo).expanduser().resolve() if args.logo else None
-    if logo is not None and not logo.exists():
+    # 相对路径统一按项目根解析（不再依赖调用者的 cwd）；绝对路径保持原样。
+    logo = Path(args.logo)
+    logo = (ROOT / logo) if not logo.is_absolute() else logo
+    logo = logo.expanduser().resolve()
+    if not logo.exists():
         logo = None
 
     generated = generator_cls(

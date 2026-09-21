@@ -9,6 +9,10 @@ import shutil
 import sys
 from pathlib import Path
 
+# 直接以脚本方式运行本文件时把项目根补回 sys.path，保证 plugins.* / inspection_core.* 可导入。
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from inspection_core.package_io import read_json, write_json
 from plugins.postgresql.analyzer import ANALYZER_VERSION, Analyzer
 from plugins.postgresql.report_adapter import adapt_report_model

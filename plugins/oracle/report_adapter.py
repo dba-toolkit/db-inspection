@@ -20,16 +20,31 @@ FACT_CONCLUSION = "已采集并展示本项巡检事实，不单独形成风险�
 NO_RECORD_CONCLUSION = "未采集到结构化记录，本项不作通过结论。"
 
 _CHART_CAPTIONS = {
-    "system_cpu_sar": "CPU 使用率趋势",
-    "system_memory_sar": "内存使用率趋势",
-    "system_disk_util": "磁盘利用率趋势",
-    "sar_iowait_trend": "IO Wait 趋势",
-    "system_network": "网络吞吐趋势",
+    # 系统四张来自公共 OS 层（inspection_core.charts.specs.OS_CHART_IDS 同一集合）
+    "SYSTEM_CPU": "CPU 使用率趋势",
+    "SYSTEM_MEMORY": "内存使用率趋势",
+    "SYSTEM_DISK": "磁盘 I/O 趋势",
+    "SYSTEM_NETWORK_REALTIME": "网络吞吐趋势",
     "oracle_physical_io": "物理 I/O 趋势",
     "oracle_logical_vs_physical": "逻辑读与物理读",
     "oracle_redo_rate": "Redo 速率",
     "oracle_parse_ratio": "解析率",
 }
+
+# 公共渲染器用 sar_history / realtime_snapshot 表达来源，报告模型的历史词汇是
+# historical；两者在这里对齐一次，避免下游再按图名猜。
+_HISTORICAL_SCOPES = {"historical", "sar_history"}
+REPORT_SCOPES = ("historical", "realtime_snapshot")
+
+
+def _source_scope(chart: dict[str, Any], chart_id: str) -> str:
+    scope = str(chart.get("source_scope") or "").strip()
+    if scope in _HISTORICAL_SCOPES:
+        return "historical"
+    if scope in REPORT_SCOPES:
+        return "realtime_snapshot"
+    # 旧报告模型没有 scope 字段：按图名兜底（SYSTEM_* / sar_* 来自 SAR 历史）。
+    return "historical" if chart_id.startswith(("SYSTEM_", "system_", "sar_")) else "realtime_snapshot"
 
 
 def _extract_item_id(source: Any, section_id: str, index: int) -> str:
@@ -90,11 +105,7 @@ def _normalize_charts(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "caption": _CHART_CAPTIONS.get(chart_id, chart_id),
             "status": chart.get("status") or "generated",
             "file": f"charts/{Path(file).name}",
-            "source_scope": (
-                "historical"
-                if chart_id.startswith("system_") or chart_id.startswith("sar_")
-                else "realtime_snapshot"
-            ),
+            "source_scope": _source_scope(chart, chart_id),
             "source_points": chart.get("source_points"),
         })
     return charts

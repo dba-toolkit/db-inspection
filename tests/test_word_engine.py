@@ -15,7 +15,7 @@ from plugins.mysql.word_report import MYSQL_WORD_PROFILE, MySQLWordReportGenerat
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORT_MODEL = PROJECT_ROOT / "tests" / "baselines" / "mysql" / "current" / "report_model.json"
-LOGO = PROJECT_ROOT / "logo.png"
+LOGO = PROJECT_ROOT / "assets" / "logo.png"
 PRE_SPLIT_NORMALIZED_DOCUMENT_XML = "F7B0D2457FB0F1BDB8BAF4E36263EEC17AC87884BF145871A7AAFF650543C915"
 
 

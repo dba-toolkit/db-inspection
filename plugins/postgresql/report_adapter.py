@@ -62,8 +62,16 @@ def _build_plan(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]
     return plan
 
 
-def _chart_section(chart_id: str) -> str:
-    if chart_id in {"system_cpu", "system_memory", "system_disk"}:
+# Chart id → report section.  This is the single source of truth: the analyzer
+# tags the raw charts with it so the audit trail records where each picture was
+# meant to land, and the adapter re-derives it when adapting older models.
+HISTORY_CHART_IDS = ("SYSTEM_CPU", "SYSTEM_MEMORY", "SYSTEM_DISK")
+REALTIME_CHART_IDS = ("SYSTEM_NETWORK_REALTIME",)
+
+
+def chart_section(chart_id: str) -> str:
+    """Return the report section a chart belongs to, or '' when unknown."""
+    if chart_id in HISTORY_CHART_IDS or chart_id in REALTIME_CHART_IDS:
         return "system_info"
     if chart_id == "pg_sessions":
         return "connections"
@@ -132,8 +140,11 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
         chart = deepcopy(item)
         chart["status"] = "generated"
         chart["source_section_id"] = chart.get("section_id")
-        chart["section_id"] = _chart_section(str(chart.get("chart_id")))
-        chart.setdefault("source_scope", "historical" if str(chart.get("chart_id", "")).startswith("system_") else "realtime_snapshot")
+        chart["section_id"] = chart_section(str(chart.get("chart_id")))
+        chart.setdefault(
+            "source_scope",
+            "historical" if chart.get("chart_id") in HISTORY_CHART_IDS else "realtime_snapshot",
+        )
         charts.append(chart)
 
     sar_coverage = window.get("sar_coverage_hours")

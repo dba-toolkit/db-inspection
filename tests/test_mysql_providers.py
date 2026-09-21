@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import rules
 from plugins.mysql import (
     MySQLChartProvider,
     MySQLMetricProvider,
@@ -18,9 +17,6 @@ CURRENT_PACKAGE = PROJECT_ROOT / "mysql_inspection_v1_db01_192.168.100.80_3306_2
 
 
 class MySQLProviderTests(unittest.TestCase):
-    def test_root_rules_module_is_a_compatibility_entry(self) -> None:
-        self.assertEqual(rules.RuleEngine.__module__, "plugins.mysql.rules")
-
     def test_rule_provider_returns_one_evaluation_per_registered_rule(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             context = MySQLPackageAdapter(Path(temporary) / "work").load(CURRENT_PACKAGE, 1)

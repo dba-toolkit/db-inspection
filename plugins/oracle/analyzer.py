@@ -7,9 +7,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Sequence
 
+from inspection_core.charts import duration_ms
 from inspection_core.package_io import write_json
 
-from .charts import OracleChartProvider, _duration_ms
+from .charts import OracleChartProvider
 from .metrics import OracleMetricProvider
 from .package_adapter import OraclePackageAdapter, parse_instance_tag
 from .presentation import (
@@ -51,7 +52,7 @@ class OracleAnalyzer:
                 "status": status,
                 "started_at": started,
                 "finished_at": now_iso(),
-                "duration_ms": _duration_ms(start_ns),
+                "duration_ms": duration_ms(start_ns),
                 "reason": reason,
             })
 

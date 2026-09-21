@@ -1,5 +1,5 @@
 {
-  "_comment": "Oracle 巡检规则 — 阈值在此热更新，无需改代码",
+  "_comment": "Oracle 巡检规则 — 阈值在此热更新，无需改代码。OS 压力类阈值（CPU/iowait/内存/文件系统）不在此配置，统一由 inspection_core/system_checks.py 的 DEFAULT_THRESHOLDS 提供。",
   "version": "2.0",
 
   "globals": {
@@ -7,14 +7,8 @@
     "tablespace_critical_pct": 95,
     "asm_warning_pct": 80,
     "fra_warning_pct": 80,
-    "failed_login_warning": 10,
-    "archive_switch_warning_per_hour": 30,
     "buffer_cache_hit_warning": 90,
     "sort_disk_warning_pct": 5,
-    "cpu_peak_warning": 90,
-    "iowait_peak_warning": 20,
-    "memory_usage_warning": 90,
-    "filesystem_usage_critical": 90,
     "quality_score_min": 80
   },
 
@@ -38,7 +32,7 @@
       "recommendation": "检查失败采集项并在补足权限后重采。",
       "evidence_refs": ["collection_status"]
     },
-    "ORA.SYSTEM.TIME_SYNC": {
+    "COMMON.SYSTEM.TIME_SYNC": {
       "category": "system",
       "severity": "medium",
       "confidence": 0.95,
@@ -47,38 +41,34 @@
       "recommendation": "启用并验证 NTP/Chrony 服务，统一各节点时区。",
       "evidence_refs": ["snapshot.json#time_evidence"]
     },
-    "ORA.SYSTEM.CPU_PRESSURE": {
+    "COMMON.SYSTEM.CPU_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "cpu_peak_warning": 90 },
       "title": "CPU 使用率出现高峰",
       "summary": "持续 CPU 高负载可能造成数据库响应时间抖动。",
       "recommendation": "结合业务高峰历史与运行队列确认持续性，再定位高 CPU SQL 或系统进程。",
       "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
     },
-    "ORA.SYSTEM.IOWAIT_PRESSURE": {
+    "COMMON.SYSTEM.IOWAIT_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "iowait_peak_warning": 20 },
       "title": "CPU IO wait 出现高峰",
       "summary": "较高 IO wait 可能表明存储响应不足或集中写入。",
       "recommendation": "关联磁盘 util、数据库物理读写和存储层监控。",
       "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
     },
-    "ORA.SYSTEM.MEMORY_PRESSURE": {
+    "COMMON.SYSTEM.MEMORY_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "memory_usage_warning": 90 },
       "title": "主机内存使用率偏高",
       "summary": "持续内存压力可能触发回收或交换，影响数据库稳定性。",
       "recommendation": "结合 available、swap、OOM 记录和 Oracle SGA/PGA 预算综合判断。",
       "evidence_refs": ["history/sar_memory.csv", "timeseries/system_memory.csv"]
     },
-    "ORA.CAPACITY.FILESYSTEM_USAGE": {
+    "COMMON.CAPACITY.FILESYSTEM_USAGE": {
       "category": "capacity",
       "severity": "high",
       "confidence": 0.95,
-      "threshold": { "filesystem_usage_critical": 90 },
       "title": "文件系统使用率过高",
       "summary": "高使用率会增加数据库写入失败和服务中断风险。",
       "recommendation": "确认数据/归档/备份目录对应挂载点，清理或扩容并设置容量告警。",
@@ -223,24 +213,6 @@
       "summary": "排序操作中磁盘排序比例超过建议阈值。",
       "recommendation": "增大 PGA aggregate target 或优化排序 SQL 执行计划。",
       "evidence_refs": ["timeseries/oracle_sysstat.csv"]
-    },
-    "ORA.SYSTEM.SAR_CPU_PEAK": {
-      "category": "system",
-      "severity": "low",
-      "confidence": 0.9,
-      "title": "24h 历史 CPU 高峰",
-      "summary": "SAR 历史记录中 CPU 使用率出现高峰。",
-      "recommendation": "结合业务周期确认峰值为常态还是偶发。",
-      "evidence_refs": ["history/sar_cpu.csv"]
-    },
-    "ORA.SYSTEM.SAR_IOWAIT_PEAK": {
-      "category": "system",
-      "severity": "low",
-      "confidence": 0.9,
-      "title": "24h 历史 IOWait 高峰",
-      "summary": "SAR 历史记录中 IOWait 出现高峰。",
-      "recommendation": "检查存储性能基线，确认是否需优化存储或 SQL。",
-      "evidence_refs": ["history/sar_cpu.csv"]
     },
     "ORA.SECURITY.PASSWORD_EXPIRY": {
       "category": "security",

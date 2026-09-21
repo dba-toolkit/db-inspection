@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from .metrics import safe_float, safe_int
 from .package_adapter import OraclePackageContext as PackageContext
 from .presentation import Finding
+from inspection_core.system_checks import (
+    CANONICAL_RULE_IDS,
+    DEFAULT_THRESHOLDS,
+    os_pressure_report,
+)
 
 RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules_oracle.json"
 
@@ -83,10 +88,6 @@ class OracleRuleEngine:
     ) -> tuple[list[Finding], list[RuleEvaluation]]:
         self._findings = []
         self._evaluations = []
-
-        # Determine scope from metrics (addded by analyzer's derive_metrics)
-        is_local = metrics.get("scope", {}).get("database_target_is_local", False)
-        has_history = metrics.get("sampling_context", {}).get("history", {}).get("usable_for_trend_rules", False)
 
         self._check_collection_integrity(ctx)
         self._check_collection_quality(quality)
@@ -156,6 +157,8 @@ class OracleRuleEngine:
         triggered: bool,
         reason: str,
         facts: list[str],
+        confidence_override: float | None = None,
+        severity_override: str | None = None,
     ) -> None:
         """Core evaluation dispatcher — mirrors MySQL _evaluate."""
         cfg = self._cfg(rule_id)
@@ -166,6 +169,15 @@ class OracleRuleEngine:
         recommendation: str = cfg.get("recommendation", "")
         evidence: list[str] = cfg.get("evidence_refs", [])
         confidence: float = float(cfg.get("confidence", 1.0))
+        if confidence_override is not None:
+            # Data-source driven (SAR history vs. a short live sample).
+            confidence = confidence_override
+        if severity_override is not None:
+            # Two-tier rule: the pack declares the base level, the caller
+            # promotes it when the harder threshold is crossed.  This is the
+            # only way a per-rule second threshold can reach the finding — the
+            # status itself stays a single triggered/passed bit.
+            severity = severity_override
 
         if not applicable:
             status = "not_applicable"
@@ -215,7 +227,7 @@ class OracleRuleEngine:
         )
 
     def _check_time_sync(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
-        rule = "ORA.SYSTEM.TIME_SYNC"
+        rule = CANONICAL_RULE_IDS["time_sync"]
         local = metrics.get("scope", {}).get("database_target_is_local", False)
         te = ctx.snapshot.get("time_evidence", {})
         ntp = str(te.get("ntp_synchronized", "")).lower()
@@ -227,57 +239,33 @@ class OracleRuleEngine:
         )
 
     def _check_system_resources(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
+        """CPU / IO wait / memory pressure, judged by the shared OS layer.
+
+        Same three checks MySQL ships; the window, peak criterion, thresholds
+        and verdict semantics all come from ``inspection_core.system_checks``.
+        """
         local = metrics.get("scope", {}).get("database_target_is_local", False)
-        history_usable = metrics.get("sampling_context", {}).get("history", {}).get("usable_for_trend_rules", False)
-        source = metrics["system_history"] if history_usable else metrics.get("system_realtime", {})
-        conf = 0.9 if history_usable else 0.65
-        reason_note = "使用有效 SAR 历史" if history_usable else "仅使用现场短时样本，结论置信度较低"
-
-        # CPU
-        cpu_max = source.get("cpu_busy_pct", {}).get("max")
-        threshold = self._threshold("ORA.SYSTEM.CPU_PRESSURE", "cpu_peak_warning", 90)
-        self._evaluate(
-            "ORA.SYSTEM.CPU_PRESSURE", local, cpu_max is not None,
-            cpu_max is not None and cpu_max >= threshold,
-            reason_note,
-            [f"CPU 峰值：{cpu_max:.1f}%"] if cpu_max is not None else [],
+        source, verdicts = os_pressure_report(
+            metrics, include=("cpu_pressure", "iowait_pressure", "memory_pressure"),
         )
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
-
-        # IO wait
-        iowait_max = source.get("cpu_iowait_pct", {}).get("max")
-        threshold = self._threshold("ORA.SYSTEM.IOWAIT_PRESSURE", "iowait_peak_warning", 20)
-        self._evaluate(
-            "ORA.SYSTEM.IOWAIT_PRESSURE", local, iowait_max is not None,
-            iowait_max is not None and iowait_max >= threshold,
-            reason_note,
-            [f"IO wait 峰值：{iowait_max:.1f}%"] if iowait_max is not None else [],
-        )
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
-
-        # Memory
-        mem_avg = source.get("memory_used_pct", {}).get("average")
-        threshold = self._threshold("ORA.SYSTEM.MEMORY_PRESSURE", "memory_usage_warning", 90)
-        self._evaluate(
-            "ORA.SYSTEM.MEMORY_PRESSURE", local, mem_avg is not None,
-            mem_avg is not None and mem_avg >= threshold,
-            reason_note,
-            [f"内存平均使用率：{mem_avg:.1f}%"] if mem_avg is not None else [],
-        )
-        if self._evaluations:
-            self._evaluations[-1].confidence = conf
+        reason_note = source["reason"]
+        for verdict in verdicts:
+            self._evaluate(
+                verdict["rule_id"], local, verdict["available"], verdict["triggered"],
+                reason_note,
+                [verdict["fact"]] if verdict["fact"] else [],
+                confidence_override=source["confidence"],
+            )
 
     def _check_filesystem_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
-        rule = "ORA.CAPACITY.FILESYSTEM_USAGE"
+        rule = CANONICAL_RULE_IDS["filesystem_usage"]
         local = metrics.get("scope", {}).get("database_target_is_local", False)
         fs_rows = ctx.tables.get("filesystems", [])
         max_pct = 0.0
         for row in fs_rows:
             pct = safe_float(row.get("USE%")) or safe_float(row.get("used_pct")) or 0
             max_pct = max(max_pct, pct)
-        t = self._threshold(rule, "filesystem_usage_critical", 90)
+        t = DEFAULT_THRESHOLDS["filesystem_usage_critical"]
         self._evaluate(
             rule, local, bool(fs_rows),
             max_pct >= t,
@@ -296,12 +284,13 @@ class OracleRuleEngine:
         t_warn = self._threshold(rule, "tablespace_warning_pct", 80)
         t_crit = self._threshold(rule, "tablespace_critical_pct", 95)
         triggered = pct is not None and pct >= t_warn
-        severity_override = "critical" if (pct is not None and pct >= t_crit) else None
+        promote = "critical" if (pct is not None and pct >= t_crit) else None
         self._evaluate(
             rule, True, pct is not None,
             triggered,
-            f"{source_label} {pct:.1f}%，超过{'严重' if severity_override else '告警'}阈值" if triggered else f"{source_label} {pct:.1f}%，正常" if pct is not None else "无数据",
+            f"{source_label} {pct:.1f}%，超过{'严重' if promote else '告警'}阈值" if triggered else f"{source_label} {pct:.1f}%，正常" if pct is not None else "无数据",
             [f"max_{'capacity' if source_label=='容量使用率' else 'used'}_pct={pct}"] if pct is not None else [],
+            severity_override=promote,
         )
 
     def _check_asm_usage(self, metrics: dict[str, Any]) -> None:
@@ -484,19 +473,20 @@ class OracleRuleEngine:
         if not rows:
             self._evaluate(rule, True, False, False, "无 redo log 多路复用数据", [])
             return
-        single_members = 0
+        min_members = self._threshold(rule, "redo_member_min", 2)
+        below_min = 0
         for row in rows:
             raw = str(row.get("MEMBER_COUNT", "") or row.get("MEMBERS", "1")).strip()
             try:
-                if int(raw) < 2:
-                    single_members += 1
+                if int(raw) < min_members:
+                    below_min += 1
             except ValueError:
                 pass
-        triggered = single_members > 0
+        triggered = below_min > 0
         self._evaluate(
             rule, True, True, triggered,
-            f"{single_members} 个日志组为单成员" if triggered else "所有日志组已多路复用",
-            [f"single_member_groups={single_members}"],
+            f"{below_min} 个日志组成员数少于 {min_members}" if triggered else f"所有日志组成员数均不少于 {min_members}",
+            [f"groups_below_min_members={below_min}"],
         )
 
     def _check_redo_size(self, ctx: PackageContext) -> None:
@@ -541,11 +531,14 @@ class OracleRuleEngine:
             self._evaluate(rule, True, False, False, "无法定位 SQL AREA 命中率", [])
             return
         t = self._threshold(rule, "library_cache_hit_warning", 95)
+        t_crit = self._threshold(rule, "library_cache_hit_critical", 90)
         triggered = sql_hit < t
+        promote = "critical" if sql_hit < t_crit else None
         self._evaluate(
             rule, True, True, triggered,
-            f"SQL AREA GETHIT_PCT={sql_hit:.1f}%",
+            f"SQL AREA GETHIT_PCT={sql_hit:.1f}%，低于{'严重' if promote else '告警'}阈值" if triggered else f"SQL AREA GETHIT_PCT={sql_hit:.1f}%",
             [f"sql_area_gethit_pct={sql_hit:.1f}"],
+            severity_override=promote,
         )
 
     def _check_wait_events(self, ctx: PackageContext) -> None:

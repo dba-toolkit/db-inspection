@@ -1,15 +1,9 @@
 {
-  "_comment": "MySQL巡检规则配置文件 — 修改此文件可调整阈值和规则行为，无需改动代码。",
+  "_comment": "MySQL巡检规则配置文件 — 修改此文件可调整阈值和规则行为，无需改动代码。OS 压力类阈值（CPU/iowait/内存/文件系统）不在此配置，统一由 inspection_core/system_checks.py 的 DEFAULT_THRESHOLDS 提供。",
   "version": "2.0",
 
   "globals": {
-    "long_transaction_threshold_seconds": 300,
-    "replication_lag_threshold_seconds": 60,
-    "connection_usage_warning": 0.85,
-    "filesystem_usage_critical": 90,
-    "cpu_peak_warning": 90,
-    "iowait_peak_warning": 20,
-    "memory_usage_warning": 90
+    "connection_usage_warning": 0.85
   },
 
   "rules": {
@@ -44,7 +38,6 @@
     "COMMON.SYSTEM.CPU_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "cpu_peak_warning": 90 },
       "title": "CPU 使用率出现高峰",
       "summary": "持续 CPU 高负载可能造成数据库响应时间抖动。",
       "recommendation": "结合业务高峰历史与运行队列确认持续性，再定位 SQL 或系统进程。",
@@ -53,7 +46,6 @@
     "COMMON.SYSTEM.IOWAIT_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "iowait_peak_warning": 20 },
       "title": "CPU IO wait 出现高峰",
       "summary": "较高 IO wait 可能表明存储响应不足或集中写入。",
       "recommendation": "关联磁盘 util、await、数据库物理读写和存储层监控。",
@@ -62,7 +54,6 @@
     "COMMON.SYSTEM.MEMORY_PRESSURE": {
       "category": "system",
       "severity": "medium",
-      "threshold": { "memory_usage_warning": 90 },
       "title": "主机内存使用率偏高",
       "summary": "持续内存压力可能触发回收或交换，影响数据库稳定性。",
       "recommendation": "结合 available、swap、OOM 记录和 MySQL 内存预算综合判断。",
@@ -135,7 +126,6 @@
       "category": "capacity",
       "severity": "high",
       "confidence": 0.95,
-      "threshold": { "filesystem_usage_critical": 90 },
       "title": "文件系统使用率过高",
       "summary": "高使用率会增加数据库写入失败和服务中断风险。",
       "recommendation": "确认数据目录对应挂载点，清理或扩容并设置容量告警。",
@@ -234,14 +224,14 @@
       "recommendation": "按错误代码和时间窗口与业务告警关联，必要时经授权采集脱敏日志片段。",
       "evidence_refs": ["tables/error_log_summary.tsv"]
     },
-    "MYSQL.BACKUP.RECENT_SUCCESS": {
+    "MYSQL.BACKUP.TASK_VISIBILITY": {
       "category": "backup",
-      "severity": "high",
-      "confidence": 0.5,
-      "title": "无法验证最近备份是否成功",
-      "summary": "仅凭数据库现场信息不能证明备份可恢复。",
-      "recommendation": "接入备份平台的任务结果与恢复演练证据后再评价。",
-      "evidence_refs": ["tables/backup_evidence.tsv"]
+      "severity": "low",
+      "confidence": 0.6,
+      "title": "未发现备份任务配置",
+      "summary": "主机上未见 cron / systemd timer / 备份进程，无法确认备份是否已经配置。",
+      "recommendation": "确认备份机制（本地脚本 / 备份平台 / 存储侧快照）归属，并补充可验证的备份结果与恢复演练证据。",
+      "evidence_refs": ["evidence/backup_cron.txt", "evidence/backup_timers.txt", "evidence/backup_processes.txt"]
     }
   }
 }

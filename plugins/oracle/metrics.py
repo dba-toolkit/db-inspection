@@ -86,6 +86,7 @@ class OracleMetricProvider:
         ora_rows = ctx.timeseries.get("oracle_sysstat", [])
         ora_rates = counter_rates(ora_rows, [
             "user_commits", "user_rollbacks", "execute_count", "parse_count_total",
+            "parse_count_hard",
             "physical_reads", "physical_writes", "redo_size", "sorts_memory", "sorts_disk",
             "consistent_gets", "db_block_gets", "session_logical_reads",
         ])

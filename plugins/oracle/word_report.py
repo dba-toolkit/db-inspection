@@ -35,11 +35,13 @@ ORACLE_WORD_PROFILE = WordReportProfile(
         "system_performance": SectionChartProfile(
             model_field="oracle_analysis",
             charts=(
-                ChartDefinition("system_cpu_sar", "CPU 使用率趋势"),
-                ChartDefinition("system_memory_sar", "内存使用率趋势"),
-                ChartDefinition("system_disk_util", "磁盘利用率趋势"),
-                ChartDefinition("sar_iowait_trend", "IO Wait 趋势"),
-                ChartDefinition("system_network", "网络吞吐趋势"),
+                # 系统四张由公共 OS 层产出（id 见 plugins/oracle/charts.py::OS_CHART_IDS）。
+                # 原先的 system_cpu_sar / system_memory_sar / system_disk_util /
+                # sar_iowait_trend / system_network 五张已随第③步并入这四张。
+                ChartDefinition("SYSTEM_CPU", "CPU 使用率趋势"),
+                ChartDefinition("SYSTEM_MEMORY", "内存使用率趋势"),
+                ChartDefinition("SYSTEM_DISK", "磁盘 I/O 趋势"),
+                ChartDefinition("SYSTEM_NETWORK_REALTIME", "网络吞吐趋势"),
             ),
         ),
         "oracle_performance": SectionChartProfile(

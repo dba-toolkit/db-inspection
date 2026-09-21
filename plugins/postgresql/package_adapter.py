@@ -12,7 +12,7 @@ from typing import Any
 
 from inspection_core.models import PackageContext
 from inspection_core.package_io import read_json, safe_extract_tar, sha256_file
-from inspection_core.tabular import parse_csv, parse_delimited
+from inspection_core.tabular import parse_csv, parse_delimited, parse_sadf
 
 
 class PostgreSQLPackageError(RuntimeError):
@@ -65,10 +65,13 @@ class PostgreSQLPackageAdapter:
         for path in sorted(timeseries_dir.glob("*.csv")):
             timeseries[path.stem] = parse_csv(path)
 
+        # SAR history is sadf semicolon output with a commented header, not plain
+        # CSV.  Reading it with ``parse_csv`` yields one unnamed column and zero
+        # usable rows, which silently emptied every history-based chart.
         history: dict[str, list[dict[str, str]]] = {}
         history_dir = root / "history"
-        for path in sorted(history_dir.glob("*.csv")):
-            history[path.stem] = parse_csv(path)
+        for path in sorted(history_dir.glob("sar_*.csv")):
+            history[path.stem] = parse_sadf(path)
 
         return PackageContext(
             source=source,

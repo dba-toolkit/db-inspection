@@ -26,24 +26,29 @@ def detect_db_type(source: Path) -> str | None:
 
 
 def build_command(db_type: str, source: Path, output: Path, rules_config: Path | None) -> list[str]:
+    """把统一入口的参数翻译成各库分析器的子进程命令行。
+
+    各库分析器已收进 plugins/<db>/：mysql 是 plugins/mysql/analyzer.py（编排器本体），
+    postgresql / oracle / sqlserver 是 plugins/<db>/cli.py（薄命令行适配层）。
+    """
     if db_type == "mysql":
-        cmd = [sys.executable, str(ROOT / "analyze_inspection_v2.py"), str(source), "--output", str(output)]
+        cmd = [sys.executable, str(ROOT / "plugins" / "mysql" / "analyzer.py"), str(source), "--output", str(output)]
         if rules_config:
             cmd += ["--rules-config", str(rules_config)]
         return cmd
     if db_type == "postgresql":
-        cmd = [sys.executable, str(ROOT / "analyze_postgresql.py"), str(source), "-o", str(output)]
+        cmd = [sys.executable, str(ROOT / "plugins" / "postgresql" / "cli.py"), str(source), "-o", str(output)]
         if rules_config:
             cmd += ["--rules", str(rules_config)]
         return cmd
     if db_type == "oracle":
         default_rules = ROOT / "plugins" / "oracle" / "inspection_rules_oracle.json"
-        cmd = [sys.executable, str(ROOT / "analyze_oracle.py"), str(source), "--output", str(output)]
+        cmd = [sys.executable, str(ROOT / "plugins" / "oracle" / "cli.py"), str(source), "--output", str(output)]
         cmd += ["--rules-config", str(rules_config or default_rules)]
         return cmd
     if db_type == "sqlserver":
         default_rules = ROOT / "plugins" / "sqlserver" / "inspection_rules.json"
-        cmd = [sys.executable, str(ROOT / "analyze_sqlserver.py"), str(source), "--output", str(output)]
+        cmd = [sys.executable, str(ROOT / "plugins" / "sqlserver" / "cli.py"), str(source), "--output", str(output)]
         cmd += ["--rules-config", str(rules_config or default_rules)]
         return cmd
     raise ValueError(f"unknown db_type: {db_type}")
