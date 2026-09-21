@@ -610,8 +610,14 @@ collect_sar_history() {
         local coverage_status coverage_hours
         coverage_status=$(awk -F'\t' '$1=="status"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         coverage_hours=$(awk -F'\t' '$1=="coverage_hours"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
-        [ "$coverage_status" = "partial" ] && status="partial" || status="ok"
-        reason="raw sadf data exported; approximate CPU history coverage=${coverage_hours:-unknown} hours"
+        # 直接映射 coverage.tsv 的判定结果：导出成功不等于有覆盖，
+        # empty（读不到历史区间）必须如实记为 empty，不能默认 ok。
+        case "${coverage_status:-}" in
+            ok)       status="ok" ;;
+            empty|"") status="empty" ;;
+            *)        status="partial" ;;
+        esac
+        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours"
     fi
     end_iso=$(iso_now); end_ms=$(epoch_ms)
     record_status "system.sar_history" "system.history" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "${count:-0}" 0 "history/" "$reason"

@@ -2,6 +2,12 @@
 # MySQL Inspection Collector v1.1.0-standard
 # 客户侧只负责：环境检查、能力探测、只读采集、时序采样、脱敏、状态记录和打包。
 # 风险判断、拓扑合并、图表和 Word 报告均由后续 Python 完成。
+#
+# 退出码（F-05，自动化按码判断，不要只看回传包在不在）：
+#   0 成功（包已生成，或 --no-package）      10 参数/环境/认证材料准备失败
+#   20 MySQL 连接失败                        30 敏感扫描拦截，已阻止打包
+#   31 打包失败（任务目录可用）              130 被 INT/TERM/HUP 中断
+# 详见 --help。
 
 # 用户误用 `sh` 时自动切换到 Bash（CentOS sh=bash POSIX 模式、Debian sh=dash 都需要处理）
 if [ -z "${BASH_VERSION:-}" ] || [ -n "${POSIXLY_CORRECT:-}" ] || { set -o 2>/dev/null | grep -qi '^posix.*on'; }; then
@@ -24,6 +30,10 @@ SAR_HISTORY_HOURS=24
 SAMPLE_INTERVAL=5
 SAMPLE_COUNT=6
 MYSQL_TIMEOUT_SECONDS=30
+# 逐项超时（F-24）：给已知耗时远高于普通项的查询单独放宽，目前用于
+# mysql.unused_indexes 与 mysql.table_io_top（5.7 大表基数下 30 秒必超）。
+# 注意不要用它替换 MYSQL_TIMEOUT_SECONDS——全局调大会让全部采集项一起变慢。
+SLOW_QUERY_TIMEOUT_SECONDS=300
 MIN_FREE_MB=200
 TOP_N=100
 OUTPUT_PARENT="/var/tmp"
@@ -64,6 +74,10 @@ MySQL 巡检采集器 v1.1.0（标准版）
   --sample-count N        默认 6 次，总时长约 30 秒
   --sar-history-hours N   默认请求最近 24 小时历史 sar
   --mysql-timeout SEC     单条 MySQL 命令超时，默认 30 秒
+  --slow-query-timeout SEC
+                          个别重查询项的独立超时，默认 300 秒
+                          （作用于 mysql.unused_indexes / mysql.table_io_top；
+                           5.7 大表基数下这两项在 30 秒内跑不完）
   --include-log-text      包含有限错误日志样本（默认关闭）
 
 深度采样示例（约 120 秒）：
@@ -73,6 +87,14 @@ MySQL 巡检采集器 v1.1.0（标准版）
   1. 同一份脚本可在主库、从库、MGR/PXC 节点执行。
   2. 一个 MySQL 实例生成一个采集包；主从拓扑由后续 Python 使用多个包合并判断。
   3. 客户侧不做风险评级，不生成图表，不生成 Word。
+
+退出码（自动化请按此判断，不要再只看"有没有 tar.gz"）：
+   0   全部成功，回传包已生成（或使用了 --no-package）
+  10   参数错误 / 认证材料准备失败 / 环境不满足（Bash 版本、缺少 mysql 客户端）
+  20   MySQL 连接失败
+  30   敏感信息扫描拦截，已阻止打包（见 logs/security_scan_findings.txt）
+  31   打包失败，但任务目录可用，可直接回传任务目录
+ 130   收到 INT/TERM/HUP 信号中断（任务目录留有 COLLECTION_INCOMPLETE）
 EOF
 }
 
@@ -196,6 +218,20 @@ log_info() { log INFO "$@"; }
 log_warn() { log WARN "$@"; }
 log_error() { log ERROR "$@"; }
 
+# ---------------------------------------------------------------------------
+# classify_failure <rc> <stderr_file> —— 把失败归入十个 status 之一
+#
+# 关键区分（F-21，**别把这两条合并**）：
+#   unsupported     —— "表 / 变量 / 功能确实不存在" = **环境真不支持**，无需处理
+#   schema_mismatch —— "表存在但列不存在" = **脚本 SQL 与本版本列集不匹配**，
+#                       这是采集器自身缺陷（如 5.7 上查 8.0 专有列），必须浮出来
+# 两者以前都归 unsupported，于是脚本写错 SQL 时下游判定"该环境采不到此项"，
+# 既不告警也不提示，缺陷永远不会被发现。
+#
+# 状态全集（与 INTERFACE.md §5.3 对齐）：
+#   ok / empty / unsupported / not_enabled / not_applicable / permission_denied /
+#   timeout / error / skipped / partial / schema_mismatch
+# ---------------------------------------------------------------------------
 classify_failure() {
     local rc="$1" err_file="$2"
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then printf 'timeout'; return; fi
@@ -203,31 +239,80 @@ classify_failure() {
         printf 'not_enabled'
     elif grep -Eqi 'access denied|command denied|permission denied|requires.*privilege|you need.*privilege' "$err_file" 2>/dev/null; then
         printf 'permission_denied'
-    elif grep -Eqi "doesn.t exist|unknown table|unknown system variable|unknown column|not supported|unsupported" "$err_file" 2>/dev/null; then
+    elif grep -Eqi 'unknown column|unknown field|unknown identifier' "$err_file" 2>/dev/null; then
+        # 必须在 unsupported 之前判断：1054 的文本是 "Unknown column 'X' in 'field list'"
+        printf 'schema_mismatch'
+    elif grep -Eqi "doesn.t exist|unknown table|unknown system variable|not supported|unsupported" "$err_file" 2>/dev/null; then
         printf 'unsupported'
     else
         printf 'error'
     fi
 }
 
+# ---------------------------------------------------------------------------
+# known_tsv_header <file> —— 空结果时写入的占位表头
+#
+# 为什么需要：mysql 客户端**在空结果时不输出列名**。若不补占位表头，Python 会拿到
+#             0 字节文件、连列名都没有。
+# 代价     : 这份表头是**静态硬编码**。一旦某条 SQL 的 SELECT 列表改了而这里没改，
+#             **只有空结果时才暴露**（F-03），正常跑完全看不出来。
+# 注意     : 列名必须写 **MySQL 原生列名**（如 Master_Host、SQL_TEXT），
+#             因为 sanitize_tsv_columns 保留的是原始列名。
+# 分支     : 表头**无法用一份静态文本表达**，必须按运行条件分支：
+#             ① F-20 —— group_replication_members 的 MEMBER_ROLE / MEMBER_VERSION、
+#                replication_workers 的 LAST_APPLIED_TRANSACTION / APPLYING_TRANSACTION
+#                是 8.0 专有列，5.7 上不存在，SQL 已按列集裁剪，表头必须跟着裁
+#             ② F-20 —— replication_workers 的 LAST_SEEN_TRANSACTION 反过来只在 5.7 有
+#             （F-06 之后，复制错误消息列名恒为 LAST_ERROR_MESSAGE，不再随参数分支）
+# 维护     : 改任何 SQL 的 SELECT 列表 → 同步改这里（INTERFACE.md §7 规则 3）
+# ---------------------------------------------------------------------------
 known_tsv_header() {
     local name
     name=$(basename "$1")
+    # F-06 / F-18：错误消息一律保留明文，列名**恒为 LAST_ERROR_MESSAGE**，不再随
+    #      --include-log-text 变化（原先默认分支把列名换成 LAST_ERROR_MESSAGE_SHA256，
+    #      哈希一个错误消息的诊断价值为零：不可逆、无法比对）。
+    #      服务器自己生成的诊断文本不含用户 SQL 字面量；真正可能带 SQL 原文的是
+    #      error_log_samples.message，那个才由 --include-log-text 管，两者不是一个门槛。
+    # F-20：复制相关两张表的列集**随版本不同**（MEMBER_ROLE / MEMBER_VERSION /
+    #      LAST_APPLIED_TRANSACTION / APPLYING_TRANSACTION 都是 8.0 专有列，
+    #      LAST_SEEN_TRANSACTION 只在 5.7 有）。SQL 侧已按列集探测裁剪，
+    #      表头必须跟着裁——否则空结果时 Python 拿到的列名与实际数据行不符。
     case "$name" in
       engines.tsv) printf 'Engine\tSupport\tComment\tTransactions\tXA\tSavepoints' ;;
-      replica_status.tsv) printf 'Channel_Name\tSource_Host\tSource_Port\tSource_UUID\tReplica_IO_Running\tReplica_SQL_Running\tSeconds_Behind_Source\tLast_IO_Errno\tLast_SQL_Errno\tAuto_Position' ;;
+      # F-06：占位表头必须与 sanitize_tsv_columns 白名单里的错误列一致，
+      #   否则空结果时 Python 拿到的 schema 里看不到 Last_IO_Error 这一列。
+      replica_status.tsv) printf 'Channel_Name\tSource_Host\tSource_Port\tSource_UUID\tReplica_IO_Running\tReplica_SQL_Running\tSeconds_Behind_Source\tLast_Errno\tLast_Error\tLast_IO_Errno\tLast_IO_Error\tLast_SQL_Errno\tLast_SQL_Error\tAuto_Position' ;;
       binary_log_status.tsv) printf 'File\tPosition\tBinlog_Do_DB\tBinlog_Ignore_DB\tExecuted_Gtid_Set' ;;
       binary_logs.tsv) printf 'Log_name\tFile_size\tEncrypted' ;;
       metadata_locks_pending.tsv) printf 'OBJECT_TYPE\tOBJECT_SCHEMA\tOBJECT_NAME\tLOCK_TYPE\tLOCK_DURATION\tLOCK_STATUS\tOWNER_THREAD_ID' ;;
       data_lock_waits.tsv) printf 'ENGINE\tREQUESTING_ENGINE_TRANSACTION_ID\tBLOCKING_ENGINE_TRANSACTION_ID\tREQUESTING_THREAD_ID\tBLOCKING_THREAD_ID' ;;
-      long_transactions.tsv) printf 'trx_id\ttrx_state\tduration_seconds\ttrx_rows_locked\ttrx_rows_modified\ttrx_tables_locked\ttrx_mysql_thread_id\tquery_sha256' ;;
-      processlist.tsv) printf 'ID\tUSER\tHOST\tDB\tCOMMAND\tTIME\tSTATE\tSQL_SHA256' ;;
-      sql_digests_top.tsv) printf 'schema_name\tDIGEST\tCOUNT_STAR\ttotal_seconds\tavg_seconds\tSUM_ROWS_EXAMINED\tSUM_ROWS_SENT\tSUM_NO_INDEX_USED\tSUM_NO_GOOD_INDEX_USED' ;;
+      long_transactions.tsv) printf 'trx_id\ttrx_state\tduration_seconds\ttrx_rows_locked\ttrx_rows_modified\ttrx_tables_locked\ttrx_mysql_thread_id\tquery_sample' ;;
+      processlist.tsv) printf 'ID\tUSER\tHOST\tDB\tCOMMAND\tTIME\tSTATE\tSQL_TEXT' ;;
+      sql_digests_top.tsv) printf 'schema_name\tDIGEST\tCOUNT_STAR\ttotal_seconds\tavg_seconds\tSUM_ROWS_EXAMINED\tSUM_ROWS_SENT\tSUM_NO_INDEX_USED\tSUM_NO_GOOD_INDEX_USED\tdigest_text' ;;
       redundant_indexes.tsv) printf 'table_schema\ttable_name\tredundant_index_name\tredundant_index_columns\tdominant_index_name\tdominant_index_columns\tsql_drop_index' ;;
       unused_indexes.tsv) printf 'object_schema\tobject_name\tindex_name' ;;
-      replication_channels.tsv) printf 'CHANNEL_NAME\tGROUP_NAME\tSOURCE_UUID\tTHREAD_ID\tSERVICE_STATE\tCOUNT_RECEIVED_HEARTBEATS\tLAST_HEARTBEAT_TIMESTAMP\tRECEIVED_TRANSACTION_SET\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE_SHA256\tLAST_ERROR_TIMESTAMP' ;;
-      replication_workers.tsv) printf 'CHANNEL_NAME\tWORKER_ID\tTHREAD_ID\tSERVICE_STATE\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE_SHA256\tLAST_ERROR_TIMESTAMP\tLAST_APPLIED_TRANSACTION\tAPPLYING_TRANSACTION' ;;
-      group_replication_members.tsv) printf 'CHANNEL_NAME\tMEMBER_ID\tMEMBER_HOST\tMEMBER_PORT\tMEMBER_STATE\tMEMBER_ROLE\tMEMBER_VERSION' ;;
+      replication_channels.tsv) printf 'CHANNEL_NAME\tGROUP_NAME\tSOURCE_UUID\tTHREAD_ID\tSERVICE_STATE\tCOUNT_RECEIVED_HEARTBEATS\tLAST_HEARTBEAT_TIMESTAMP\tRECEIVED_TRANSACTION_SET\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE\tLAST_ERROR_TIMESTAMP' ;;
+      replication_workers.tsv)
+        if [ "${REPL_WORKER_LAST_SEEN_AVAILABLE:-0}" -eq 1 ] && [ "${REPL_WORKER_APPLY_COLS_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tWORKER_ID\tTHREAD_ID\tSERVICE_STATE\tLAST_SEEN_TRANSACTION\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE\tLAST_ERROR_TIMESTAMP\tLAST_APPLIED_TRANSACTION\tAPPLYING_TRANSACTION'
+        elif [ "${REPL_WORKER_APPLY_COLS_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tWORKER_ID\tTHREAD_ID\tSERVICE_STATE\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE\tLAST_ERROR_TIMESTAMP\tLAST_APPLIED_TRANSACTION\tAPPLYING_TRANSACTION'
+        elif [ "${REPL_WORKER_LAST_SEEN_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tWORKER_ID\tTHREAD_ID\tSERVICE_STATE\tLAST_SEEN_TRANSACTION\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE\tLAST_ERROR_TIMESTAMP'
+        else
+            printf 'CHANNEL_NAME\tWORKER_ID\tTHREAD_ID\tSERVICE_STATE\tLAST_ERROR_NUMBER\tLAST_ERROR_MESSAGE\tLAST_ERROR_TIMESTAMP'
+        fi ;;
+      group_replication_members.tsv)
+        if [ "${GR_MEMBER_ROLE_AVAILABLE:-0}" -eq 1 ] && [ "${GR_MEMBER_VERSION_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tMEMBER_ID\tMEMBER_HOST\tMEMBER_PORT\tMEMBER_STATE\tMEMBER_ROLE\tMEMBER_VERSION'
+        elif [ "${GR_MEMBER_ROLE_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tMEMBER_ID\tMEMBER_HOST\tMEMBER_PORT\tMEMBER_STATE\tMEMBER_ROLE'
+        elif [ "${GR_MEMBER_VERSION_AVAILABLE:-0}" -eq 1 ]; then
+            printf 'CHANNEL_NAME\tMEMBER_ID\tMEMBER_HOST\tMEMBER_PORT\tMEMBER_STATE\tMEMBER_VERSION'
+        else
+            printf 'CHANNEL_NAME\tMEMBER_ID\tMEMBER_HOST\tMEMBER_PORT\tMEMBER_STATE'
+        fi ;;
       group_replication_stats.tsv) printf 'CHANNEL_NAME\tVIEW_ID\tMEMBER_ID\tCOUNT_TRANSACTIONS_IN_QUEUE\tCOUNT_TRANSACTIONS_CHECKED\tCOUNT_CONFLICTS_DETECTED\tCOUNT_TRANSACTIONS_ROWS_VALIDATING\tTRANSACTIONS_COMMITTED_ALL_MEMBERS\tLAST_CONFLICT_FREE_TRANSACTION' ;;
       error_log_summary.tsv) printf 'PRIO\tERROR_CODE\toccurrence_count\tfirst_seen\tlast_seen' ;;
       error_log_samples.tsv) printf 'LOGGED\tTHREAD_ID\tPRIO\tERROR_CODE\tmessage' ;;
@@ -276,7 +361,45 @@ capture_command() {
     return "$rc"
 }
 
+# ---------------------------------------------------------------------------
+# mysql_exec —— 所有 TSV 类查询的统一执行入口（**改一处影响全部采集项**）
+#
+# 参数   : 透传给 mysql 客户端的参数（`-e` / `-N` / `-s` / `--column-names` …）
+# stdout : mysql 的批量输出，字段转义**由客户端负责**
+# 返回码 : mysql 客户端退出码；124 / 137 表示被 timeout 包装器判定为超时
+#
+# 注意   : 这里**不能加 `--raw`**（F-01，有意为之、勿改回）。
+#          MySQL 手册原文：`--batch` "results in nontabular output format and
+#          escaping of special characters"；`--raw` "disables this character
+#          escaping"。`\n` `\t` `\0` `\\` 必须由客户端转成字面量，否则含换行的值
+#          （Executed_Gtid_Set、trx_query、error log message）会撑破 TSV 行结构，
+#          row_count 随之失真，而且状态文件仍然写着 ok。
+#          需要保留原始换行的整段文本，请用 mysql_exec_raw。
+# ---------------------------------------------------------------------------
 mysql_exec() {
+    mysql_exec_with_timeout "$MYSQL_TIMEOUT_SECONDS" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# mysql_exec_with_timeout <seconds> [mysql args...] —— 指定单次超时的执行入口
+#
+# 用途   : 给耗时明显高于普通项的查询单独放宽超时（F-24）。
+#          **不要**为此调大全局 MYSQL_TIMEOUT_SECONDS——那会让所有采集项一起变慢。
+# ---------------------------------------------------------------------------
+mysql_exec_with_timeout() {
+    local seconds="$1"; shift
+    run_with_timeout "$seconds" "$MYSQL_BIN" "${MYSQL_CONN_ARGS[@]}" --batch "$@"
+}
+
+# ---------------------------------------------------------------------------
+# mysql_exec_raw —— 唯一允许关掉客户端转义的入口，**仅供整段文本型证据使用**
+#
+# 与 mysql_exec 的唯一差别是多一个 `--raw`，输出保留原始换行与制表符。
+# 目前只给 `SHOW ENGINE INNODB STATUS` 用（它本身就是一段多行文本、不是表），
+# 落盘为 evidence/innodb_status.txt，不参与 TSV 解析。
+# ⚠️ 禁止用它采集任何 TSV 表格数据。
+# ---------------------------------------------------------------------------
+mysql_exec_raw() {
     run_with_timeout "$MYSQL_TIMEOUT_SECONDS" "$MYSQL_BIN" "${MYSQL_CONN_ARGS[@]}" --batch --raw "$@"
 }
 
@@ -284,12 +407,30 @@ mysql_scalar() {
     mysql_exec -N -s -e "$1" 2>/dev/null | head -n 1 | tr -d '\r'
 }
 
+# ---------------------------------------------------------------------------
+# mysql_query_tsv <item_id> <category> <outfile> <query> [item_timeout_seconds]
+#
+# 作用   : 执行一条只读 SQL，把结果落成 TSV，并逐项登记 collection_status
+# stdout : 无（结果写 $outfile）
+# 返回码 : mysql 客户端退出码，由 classify_failure 归类后写入状态文件
+# 副作用 : ① 写 $outfile（空结果或失败时用 known_tsv_header 补占位表头）
+#          ② 写 $STATUS_PARTS_DIR/<item_id>.tsv
+#          ③ 追加 stderr 到 logs/modules/<category>.log
+#
+# 注意   : 第 5 参用于**逐项放宽超时**（F-24）。大表基数下 sys.schema_unused_indexes
+#          这类查询在 5.7 上必然超过全局 30 秒；给它单独设 300 秒，
+#          而不是把全局 MYSQL_TIMEOUT_SECONDS 调大（那会让所有项一起变慢）。
+#
+# 状态语义：ok / empty（无数据，属正常）/ timeout / permission_denied /
+#          unsupported（表或功能确实不存在）/ schema_mismatch（表存在但列不存在，
+#          说明脚本 SQL 与本版本列集不匹配）/ error / not_enabled / not_applicable / partial
+# ---------------------------------------------------------------------------
 mysql_query_tsv() {
-    local item_id="$1" category="$2" outfile="$3" query="$4"
+    local item_id="$1" category="$2" outfile="$3" query="$4" item_timeout="${5:-}"
     local start_iso end_iso start_ms end_ms rc status rows reason err
     start_iso=$(iso_now); start_ms=$(epoch_ms); err="$TMP_DIR/$(sanitize_id "$item_id").stderr"
     mkdir -p "$(dirname "$outfile")"
-    mysql_exec --column-names -e "$query" > "$outfile" 2> "$err"; rc=$?
+    mysql_exec_with_timeout "${item_timeout:-$MYSQL_TIMEOUT_SECONDS}" --column-names -e "$query" > "$outfile" 2> "$err"; rc=$?
     end_iso=$(iso_now); end_ms=$(epoch_ms)
     status="ok"; reason=""
     if [ "$rc" -ne 0 ]; then
@@ -326,9 +467,31 @@ mysql_query_fallback() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# mysql_table_exists <schema> <table> —— 表级能力探测
+#
+# 局限（F-20）：**表存在不代表需要的列存在**。5.7 与 8.0 的 performance_schema
+# 复制表列集不同，表在、列不在时这条探测会通过，随后 SQL 报 1054，
+# 整项 0 行却被记成 unsupported。需要确认列时请配 mysql_column_exists。
+# ---------------------------------------------------------------------------
 mysql_table_exists() {
     local schema="$1" table="$2" n
     n=$(mysql_scalar "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${schema}' AND table_name='${table}'")
+    [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# mysql_column_exists <schema> <table> <column> —— 列级能力探测（F-20 新增）
+#
+# 用途   : 跨版本列集不同时，用来决定 SQL 的 SELECT 列表里要不要包含某个列。
+#          典型：MEMBER_ROLE / MEMBER_VERSION（8.0 才有）、
+#                LAST_APPLIED_TRANSACTION / APPLYING_TRANSACTION（8.0 才有）、
+#                LAST_SEEN_TRANSACTION（5.7 才有）
+# 返回码 : 0 = 列存在，非 0 = 不存在（不要用它判断失败）
+# ---------------------------------------------------------------------------
+mysql_column_exists() {
+    local schema="$1" table="$2" column="$3" n
+    n=$(mysql_scalar "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='${schema}' AND table_name='${table}' AND column_name='${column}'")
     [ "${n:-0}" -gt 0 ] 2>/dev/null
 }
 
@@ -452,8 +615,105 @@ collect_system_static() {
     collect_mycnf_allowlist
 }
 
+# ---------------------------------------------------------------------------
+# my.cnf include 展开（F-02）
+#
+# MySQL 对 `!include` / `!includedir` 是**就地展开**：读到指令的位置立刻插入被包含
+# 文件的全部内容，所以同一个键出现在多个文件时「后者胜」。这里按同样顺序展开
+# （深度优先、原地），白名单里的值才与实例实际生效值一致。
+#
+# 现实背景：RHEL / Anolis 家族装完 MySQL 后，/etc/my.cnf 往往**只有一行**
+# `!includedir /etc/my.cnf.d`，真实参数全在被包含文件里。不展开 include 的话
+# 白名单基本为空——而旧版还会把状态写成 ok（**假 OK**，正是 F-02）。
+# ---------------------------------------------------------------------------
+
+# 解析单个文件里的 include 指令，输出 "<file|dir>\t<路径>"
+_cnf_parse_includes() {
+    local file="$1" raw kind arg
+    [ -r "$file" ] || return 0
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        raw=$(printf '%s' "$raw" | tr -d '\r')
+        [ -z "${raw//[[:space:]]/}" ] && continue      # 空行
+        case "$raw" in '#'*|';'*) continue ;; esac     # 注释行（# 与 ; 都算）
+        raw=$(printf '%s' "$raw" | sed -E 's/^[[:space:]]+//')
+        case "$raw" in
+          '!includedir'*) kind="dir";  arg="${raw#!includedir}" ;;
+          '!include'*)    kind="file"; arg="${raw#!include}" ;;
+          *) continue ;;
+        esac
+        arg="${arg%%#*}"                               # 去掉行尾注释
+        arg=$(printf '%s' "$arg" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+        [ -n "$arg" ] && printf '%s\t%s\n' "$kind" "$arg"
+    done < "$file"
+}
+
+# 递归展开 include 链，按 MySQL 的读取顺序把文件追加进 CNF_EXPANDED，
+# 同时把展开过程写进 $CNF_INCLUDE_LOG（缩进表示层级，便于 Python 排查）
+_cnf_expand_chain() {
+    local file="$1" depth="${2:-0}" kind arg f pad
+    [ -f "$file" ] || return 0
+    [ "$depth" -ge 8 ] && return 0
+    for f in "${CNF_EXPANDED[@]}"; do                  # 防环 / 防重复计入
+        [ "$f" = "$file" ] && return 0
+    done
+    CNF_EXPANDED+=("$file")
+    pad=$(printf '%*s' "$depth" '')
+    printf '%s%s\n' "$pad" "$file" >> "$CNF_INCLUDE_LOG"
+    while IFS=$'\t' read -r kind arg; do
+        [ -n "$arg" ] || continue
+        case "$arg" in
+          /*) ;;
+          *)
+            # 相对路径由 MySQL 按进程 CWD 解析，这里不猜，只记下来让 Python 能看到
+            printf '%s  %s  [relative path not expanded]\n' "$pad" "$arg" >> "$CNF_INCLUDE_LOG"
+            continue ;;
+        esac
+        if [ "$kind" = "dir" ]; then
+            if [ -d "$arg" ]; then
+                # MySQL 只读该目录下的 *.cnf，且按文件名字典序
+                while IFS= read -r f; do
+                    _cnf_expand_chain "$f" "$((depth+1))"
+                done < <(find "$arg" -maxdepth 1 -type f -name '*.cnf' 2>/dev/null | LC_ALL=C sort)
+            else
+                printf '%s  %s  [directory not found]\n' "$pad" "$arg" >> "$CNF_INCLUDE_LOG"
+            fi
+        else
+            if [ -f "$arg" ]; then
+                _cnf_expand_chain "$arg" "$((depth+1))"
+            else
+                printf '%s  %s  [file not found]\n' "$pad" "$arg" >> "$CNF_INCLUDE_LOG"
+            fi
+        fi
+    done < <(_cnf_parse_includes "$file")
+}
+
+# 白名单正则（匹配前已把 key 的 `-` 归一成 `_` 并转小写）。
+# 含现场实际在用、旧版漏掉的：max_allowed_packet / max_connect_errors /
+# default_authentication_plugin / log_bin / relay_log / pid_file /
+# character_set_client_handshake / replica_skip_errors / mysqlx_socket
+CNF_ALLOWLIST_RE='^(port|socket|basedir|datadir|tmpdir|pid_file|server_id|bind_address|report_host|report_port|max_connections|max_connect_errors|max_allowed_packet|back_log|open_files_limit|table_open_cache|table_definition_cache|thread_cache_size|wait_timeout|interactive_timeout|skip_name_resolve|character_set_server|character_set_client_handshake|collation_server|lower_case_table_names|sql_mode|transaction_isolation|default_storage_engine|default_authentication_plugin|performance_schema|slow_query_log|slow_query_log_file|long_query_time|log_output|log_error|general_log|log_bin|log_slave_updates|log_replica_updates|binlog_format|sync_binlog|binlog_expire_logs_seconds|expire_logs_days|max_binlog_size|gtid_mode|enforce_gtid_consistency|read_only|super_read_only|relay_log|relay_log_purge|relay_log_recovery|relay_log_info_repository|replica_skip_errors|slave_skip_errors|mysqlx_socket|mysqlx_port|net_read_timeout|net_write_timeout|innodb_buffer_pool_size|innodb_buffer_pool_instances|innodb_redo_log_capacity|innodb_log_file_size|innodb_log_files_in_group|innodb_log_buffer_size|innodb_flush_log_at_trx_commit|innodb_flush_method|innodb_flush_neighbors|innodb_io_capacity|innodb_io_capacity_max|innodb_read_io_threads|innodb_write_io_threads|innodb_page_cleaners|innodb_purge_threads|innodb_file_per_table|innodb_doublewrite|innodb_autoinc_lock_mode|innodb_lock_wait_timeout|innodb_stats_persistent|innodb_lru_scan_depth|innodb_thread_concurrency|innodb_change_buffering|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size|bulk_insert_buffer_size)$'
+
+# ---------------------------------------------------------------------------
+# collect_mycnf_allowlist —— 采集「被显式配置」的参数白名单
+#
+# item_id  : system.mycnf_allowlist          category: system.static
+# 产出     : tables/mycnf_allowlist.tsv      4 列 source_file / section / parameter / configured_value
+#            evidence/mycnf_path.txt         入口配置文件
+#            evidence/mycnf_includes.txt     include 展开过程（含未展开的相对路径与缺失项）
+#
+# 关键点   : ① 递归展开 `!include` / `!includedir`（F-02）——RHEL 上 /etc/my.cnf
+#               往往只有一行 !includedir，不展开就等于没采
+#            ② **只取 [mysqld] / [mysqld_safe]**。[client] 与 [mysqld] 有同名键
+#               （socket / port），不区分 section 会输出两行、让下游取值有歧义
+#            ③ key 的 `-` 归一成 `_`（现场 my.cnf 里 `transaction-isolation`、
+#               `log-bin`、`pid-file` 与下划线写法混用）
+#            ④ 无值型开关（如 `skip-name-resolve`）取值记为 1
+#            ⑤ **空结果写 empty，不写 ok**——旧版硬编码 ok，在 RHEL 家族上就是假 OK
+# 不做     : 不把未在白名单内的参数收进来（全量 my.cnf 不进包，判据见 FIX-PLAN §0.5）
+# Python   : 表结构从 2 列变 4 列，**按列名取值、不要按下标**（INTERFACE.md §7 规则 4）
+# ---------------------------------------------------------------------------
 collect_mycnf_allowlist() {
-    local defaults_file datadir basedir cnf_path="" p
+    local defaults_file datadir basedir cnf_path="" p src rows status reason
     defaults_file=$(ps -eo args 2>/dev/null | grep '[m]ysqld' | grep -o -- '--defaults-file=[^ ]*' | cut -d= -f2 | head -1)
     datadir=$(mysql_scalar 'SELECT @@datadir')
     basedir=$(mysql_scalar 'SELECT @@basedir')
@@ -463,26 +723,56 @@ collect_mycnf_allowlist() {
     [ -n "$basedir" ] && paths+=("${basedir%/}/etc/my.cnf" "${basedir%/}/my.cnf")
     paths+=(/etc/my.cnf /etc/mysql/my.cnf /usr/local/mysql/etc/my.cnf /usr/local/etc/my.cnf)
     for p in "${paths[@]}"; do [ -f "$p" ] && [ -r "$p" ] && { cnf_path="$p"; break; }; done
+
+    CNF_INCLUDE_LOG="$EVIDENCE_DIR/mycnf_includes.txt"
+    : > "$CNF_INCLUDE_LOG"
+    CNF_EXPANDED=()
+
     if [ -z "$cnf_path" ]; then
         : > "$TABLES_DIR/mycnf_allowlist.tsv"
+        printf '# no readable config file found\n' >> "$CNF_INCLUDE_LOG"
         record_status "system.mycnf_allowlist" "system.static" "empty" "$(iso_now)" "$(iso_now)" 0 0 0 "tables/mycnf_allowlist.tsv" "no readable config file found"
         return 0
     fi
-    {
-      printf 'parameter\tconfigured_value\n'
-      awk '
-        BEGIN{IGNORECASE=1; OFS="\t"}
-        /^[[:space:]]*[#;]/ || /^[[:space:]]*$/ {next}
-        /^[[:space:]]*\[/ {next}
-        {
-          line=$0; key=line; sub(/[[:space:]]*=.*/,"",key); gsub(/[[:space:]]/,"",key)
-          if (key ~ /^(port|socket|basedir|datadir|tmpdir|server_id|bind_address|max_connections|back_log|open_files_limit|table_open_cache|table_definition_cache|thread_cache_size|wait_timeout|interactive_timeout|skip_name_resolve|character_set_server|collation_server|lower_case_table_names|sql_mode|transaction_isolation|default_storage_engine|performance_schema|slow_query_log|long_query_time|log_output|log_error|general_log|binlog_format|sync_binlog|binlog_expire_logs_seconds|expire_logs_days|gtid_mode|enforce_gtid_consistency|read_only|super_read_only|relay_log_recovery|innodb_buffer_pool_size|innodb_buffer_pool_instances|innodb_redo_log_capacity|innodb_log_file_size|innodb_log_files_in_group|innodb_log_buffer_size|innodb_flush_log_at_trx_commit|innodb_flush_method|innodb_io_capacity|innodb_io_capacity_max|innodb_read_io_threads|innodb_write_io_threads|innodb_page_cleaners|innodb_purge_threads|innodb_file_per_table|innodb_doublewrite|innodb_autoinc_lock_mode|tmp_table_size|max_heap_table_size|sort_buffer_size|join_buffer_size|read_buffer_size|read_rnd_buffer_size)$/) {
-            val=line; sub(/^[^=]*=/,"",val); gsub(/^[[:space:]]+|[[:space:]]+$/,"",val); print key,val
-          }
-        }' "$cnf_path"
-    } > "$TABLES_DIR/mycnf_allowlist.tsv"
     printf '%s\n' "$cnf_path" > "$EVIDENCE_DIR/mycnf_path.txt"
-    record_status "system.mycnf_allowlist" "system.static" "ok" "$(iso_now)" "$(iso_now)" 0 "$(awk 'END{print NR-1}' "$TABLES_DIR/mycnf_allowlist.tsv")" 0 "tables/mycnf_allowlist.tsv" ""
+    _cnf_expand_chain "$cnf_path" 0
+
+    {
+      printf 'source_file\tsection\tparameter\tconfigured_value\n'
+      for src in "${CNF_EXPANDED[@]}"; do
+        [ -r "$src" ] || continue
+        awk -v src="$src" -v allow="$CNF_ALLOWLIST_RE" '
+          BEGIN{OFS="\t"}
+          {
+            line=$0; sub(/\r$/,"",line); sub(/^[[:space:]]+/,"",line)
+            if (line=="" || line ~ /^[#;]/) next
+            if (line ~ /^!/) next
+            if (line ~ /^\[/) {
+              s=line; sub(/^\[/,"",s); sub(/\].*/,"",s)
+              gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); gsub(/-/,"_",s)
+              sec=tolower(s); next
+            }
+            if (sec!="mysqld" && sec!="mysqld_safe") next
+            key=line; sub(/[[:space:]]*=.*/,"",key)
+            gsub(/[[:space:]]/,"",key); gsub(/-/,"_",key)
+            k=tolower(key)
+            if (k !~ allow) next
+            if (line ~ /=/) { val=line; sub(/^[^=]*=/,"",val) } else { val="1" }
+            sub(/[[:space:]]+[#;].*$/,"",val)
+            gsub(/^[[:space:]]+|[[:space:]]+$/,"",val)
+            print src, sec, k, val
+          }' "$src"
+      done
+    } > "$TABLES_DIR/mycnf_allowlist.tsv"
+
+    rows=$(awk 'END{print (NR>0?NR-1:0)}' "$TABLES_DIR/mycnf_allowlist.tsv" 2>/dev/null); rows=${rows:-0}
+    status="ok"; reason=""
+    if [ "$rows" -eq 0 ]; then
+        # 关键：空结果必须写 empty。写成 ok 就是假 OK —— 下游看不出"一个参数都没采到"
+        status="empty"
+        reason="no whitelisted [mysqld] parameter found in ${#CNF_EXPANDED[@]} file(s); see evidence/mycnf_includes.txt"
+    fi
+    record_status "system.mycnf_allowlist" "system.static" "$status" "$(iso_now)" "$(iso_now)" 0 "$rows" 0 "tables/mycnf_allowlist.tsv" "$reason"
 }
 
 probe_capabilities() {
@@ -508,12 +798,28 @@ probe_capabilities() {
     DATA_LOCK_WAITS_AVAILABLE=0; mysql_table_exists performance_schema data_lock_waits && DATA_LOCK_WAITS_AVAILABLE=1
     METADATA_LOCKS_AVAILABLE=0; mysql_table_exists performance_schema metadata_locks && METADATA_LOCKS_AVAILABLE=1
     GR_MEMBERS_AVAILABLE=0; mysql_table_exists performance_schema replication_group_members && GR_MEMBERS_AVAILABLE=1
+    # F-20：表存在 ≠ 列存在。下面三项列级探测决定采集 SQL 的 SELECT 列表，
+    #       避免 5.7 上因查询 8.0 专有列而让整项 0 行（还会被误记成 unsupported）。
+    GR_MEMBER_ROLE_AVAILABLE=0; GR_MEMBER_VERSION_AVAILABLE=0
+    if [ "$GR_MEMBERS_AVAILABLE" -eq 1 ]; then
+        mysql_column_exists performance_schema replication_group_members MEMBER_ROLE && GR_MEMBER_ROLE_AVAILABLE=1
+        mysql_column_exists performance_schema replication_group_members MEMBER_VERSION && GR_MEMBER_VERSION_AVAILABLE=1
+    fi
+    REPL_WORKER_APPLY_COLS_AVAILABLE=0; REPL_WORKER_LAST_SEEN_AVAILABLE=0
+    if mysql_table_exists performance_schema replication_applier_status_by_worker; then
+        mysql_column_exists performance_schema replication_applier_status_by_worker LAST_APPLIED_TRANSACTION && REPL_WORKER_APPLY_COLS_AVAILABLE=1
+        mysql_column_exists performance_schema replication_applier_status_by_worker LAST_SEEN_TRANSACTION && REPL_WORKER_LAST_SEEN_AVAILABLE=1
+    fi
     REPL_CONN_STATUS_AVAILABLE=0; mysql_table_exists performance_schema replication_connection_status && REPL_CONN_STATUS_AVAILABLE=1
     ERROR_LOG_TABLE_AVAILABLE=0; mysql_table_exists performance_schema error_log && ERROR_LOG_TABLE_AVAILABLE=1
     WSREP_ON=$(mysql_scalar "SHOW GLOBAL VARIABLES LIKE 'wsrep_on'" | awk '{print $2}')
     [ -z "$WSREP_ON" ] && WSREP_ON="OFF"
 
     {
+      # 取值口径（F-16，有意为之）：本文件里布尔能力统一写 **0/1**；
+      # snapshot.json 的 capabilities 段则写 **true/false**。
+      # Python 侧请**只读 snapshot.json**，不要从本文件取能力值，
+      # 否则同一事实两处类型不同会踩坑。见 INTERFACE.md §5.1 / §5.1.1。
       printf 'capability\tvalue\n'
       printf 'mysql_version\t%s\n' "$MYSQL_VERSION"
       printf 'version_comment\t%s\n' "$MYSQL_VERSION_COMMENT"
@@ -526,7 +832,11 @@ probe_capabilities() {
       printf 'data_lock_waits\t%s\n' "$DATA_LOCK_WAITS_AVAILABLE"
       printf 'metadata_locks\t%s\n' "$METADATA_LOCKS_AVAILABLE"
       printf 'group_replication_members\t%s\n' "$GR_MEMBERS_AVAILABLE"
+      printf 'group_replication_member_role\t%s\n' "$GR_MEMBER_ROLE_AVAILABLE"
+      printf 'group_replication_member_version\t%s\n' "$GR_MEMBER_VERSION_AVAILABLE"
       printf 'replication_connection_status\t%s\n' "$REPL_CONN_STATUS_AVAILABLE"
+      printf 'replication_applier_apply_cols\t%s\n' "$REPL_WORKER_APPLY_COLS_AVAILABLE"
+      printf 'replication_applier_last_seen\t%s\n' "$REPL_WORKER_LAST_SEEN_AVAILABLE"
       printf 'performance_schema_error_log\t%s\n' "$ERROR_LOG_TABLE_AVAILABLE"
       printf 'wsrep_on\t%s\n' "$WSREP_ON"
       printf 'sar_command\t%s\n' "$HAS_SAR"
@@ -719,8 +1029,14 @@ collect_sar_history() {
         local coverage_status coverage_hours
         coverage_status=$(awk -F'\t' '$1=="status"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         coverage_hours=$(awk -F'\t' '$1=="coverage_hours"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
-        [ "$coverage_status" = "partial" ] && status="partial" || status="ok"
-        reason="raw sadf data exported; approximate CPU history coverage=${coverage_hours:-unknown} hours; Python will perform final filtering and coverage calculation"
+        # 直接映射 coverage.tsv 的判定结果：导出成功不等于有覆盖，
+        # empty（读不到历史区间）必须如实记为 empty，不能默认 ok。
+        case "${coverage_status:-}" in
+            ok)       status="ok" ;;
+            empty|"") status="empty" ;;
+            *)        status="partial" ;;
+        esac
+        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours; Python will perform final filtering and coverage calculation"
     fi
     end_iso=$(iso_now); end_ms=$(epoch_ms)
     record_status "system.sar_history" "system.history" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "${count:-0}" 0 "history/" "$reason"
@@ -738,6 +1054,56 @@ record_skipped() {
 }
 
 
+# ---------------------------------------------------------------------------
+# collect_innodb_status —— 采集 SHOW ENGINE INNODB STATUS 的**原始文本**
+#
+# item_id   : mysql.innodb_status            category: mysql.basic
+# 输出      : evidence/innodb_status.txt     （注意是 .txt，不是 .tsv）
+#
+# 为什么单独一个函数（F-01）：
+#   InnoDB status 是**一段多行文本**，不是表。它必须走 mysql_exec_raw 保留原始换行，
+#   否则客户端会把换行转义成字面量 `\n`，虽然行结构安全了，但人读不了、
+#   也没必要再让 Python 反转义。落成 .txt 让 Python 直接按文本解析，
+#   不再依赖 awk/sed 去抠字段（那种做法版本一变就失效）。
+#
+# ⚠️ 本项是全脚本**唯一**使用 --raw 的采集项，不要照抄到 TSV 类采集。
+# Python   : 文件由 evidence/innodb_status.tsv 改名为 .txt（INTERFACE.md §7 规则 4）
+# ---------------------------------------------------------------------------
+collect_innodb_status() {
+    local out="$EVIDENCE_DIR/innodb_status.txt" raw="$TMP_DIR/innodb_status.raw"
+    local err="$TMP_DIR/mysql.innodb_status.stderr"
+    local start_iso start_ms end_ms rc status reason rows
+    start_iso=$(iso_now); start_ms=$(epoch_ms)
+    mysql_exec_raw -N -s -e 'SHOW ENGINE INNODB STATUS' > "$raw" 2> "$err"; rc=$?
+    end_ms=$(epoch_ms)
+    status="ok"; reason=""
+    if [ "$rc" -ne 0 ]; then
+        status=$(classify_failure "$rc" "$err")
+        reason=$(tail -n 5 "$err" 2>/dev/null | tr '\n' ' ')
+        : > "$out"
+    else
+        # mysql -N -s 的输出是 "InnoDB\t\t<多行状态文本>"，去掉前两列前缀即可
+        sed -e '1s/^[^\t]*\t[^\t]*\t//' "$raw" > "$out" 2>/dev/null || cp "$raw" "$out"
+        [ -s "$out" ] || status="empty"
+    fi
+    cat "$err" >> "$MODULE_LOG_DIR/mysql.basic.log" 2>/dev/null
+    rm -f "$err" "$raw"
+    rows=$(wc -l < "$out" 2>/dev/null | tr -d ' '); rows=${rows:-0}
+    record_status "mysql.innodb_status" "mysql.basic" "$status" "$start_iso" "$(iso_now)" "$((end_ms-start_ms))" "$rows" "$rc" "evidence/innodb_status.txt" "$reason"
+}
+
+# ---------------------------------------------------------------------------
+# sanitize_tsv_columns <file> <保留列名，空格分隔> —— 按列白名单裁剪 TSV
+#
+# 作用   : 保留每个 TSV 里真正要回传的列，去掉冗余列。全脚本**只对
+#          replica_status.tsv 调用一次**（列太多且跨版本差异大）。
+# 注意   : ① 保留的是**原始列名**（回写 $keep[x]），所以 known_tsv_header 里
+#             必须写 MySQL 原生列名，不能写臆造名
+#          ② 依赖"一行 = 一条记录"。F-01 去掉 --raw 后客户端负责转义，
+#             含换行的值不会再撑破行结构，续行问题随之消失（F-07）
+#          ③ 目标列一个都没匹配上时 `exit 2`，此时**保留原文件不动**
+# 维护   : 这里改列白名单 → 同步改 known_tsv_header 的 replica_status.tsv 行
+# ---------------------------------------------------------------------------
 sanitize_tsv_columns() {
     local file="$1" wanted="$2" tmp="$file.safe"
     [ -s "$file" ] || return 0
@@ -746,7 +1112,9 @@ sanitize_tsv_columns() {
       NR==1{
         for(i=1;i<=NF;i++){
           h=tolower($i)
-          for(j=1;j<=n;j++) if(h==tolower(w[j])) keep[++k]=i
+          # break 不能省：wanted 里 Source_UUID/Master_UUID 各出现两次，
+          # 少了 break 会把同一个表头列匹配两次、is 追加两次，输出直接多出一列。
+          for(j=1;j<=n;j++) if(h==tolower(w[j])){ keep[++k]=i; break }
         }
         if(k==0) exit 2
         for(x=1;x<=k;x++) printf "%s%s",(x>1?OFS:""),$keep[x]
@@ -759,10 +1127,64 @@ sanitize_tsv_columns() {
     if [ $? -eq 0 ] && [ -s "$tmp" ]; then mv "$tmp" "$file"; else rm -f "$tmp"; fi
 }
 
+# ---------------------------------------------------------------------------
+# filter_sensitive_variables —— 落到 global_variables.tsv 之后的统一脱敏闸门
+# ---------------------------------------------------------------------------
+# 背景（F-04）：主查询用 WHERE 过滤了 rsa_public_key 与 wsrep_sst_auth，但**回退路径**
+#       的裸 `SHOW GLOBAL VARIABLES`（MariaDB 10.x / PXC 上没有
+#       performance_schema.global_variables 时走这条）一行都没过滤，
+#       `wsrep_sst_auth = 用户:明文口令` 会整行落盘；而 security_scan 的
+#       `password=` / `--password` 规则匹配不到 `user:pass` 形态，门禁照样放行。
+#       故改成"取回之后无条件过一遍"，两条路径全覆盖，不再依赖 SQL 侧 WHERE。
+#
+# 原则（勿简化）：删的是"真秘密"，不是"名字里带 password 的键"。
+#       MySQL 里带裸 password 的变量基本都是**策略**（有效期、复用次数、复杂度检查），
+#       它们本身就是巡检结论，删掉等于把结论一起删了。
+#
+# 参数：$1 = 待过滤 TSV（两列 VARIABLE_NAME / VARIABLE_VALUE），就地改写。
+# 留痕：被删的键写 $EVIDENCE_DIR/redacted_findings.txt（变量名 + 值长度 + 是否含冒号，
+#       **不写值**），供 Python 侧验证门禁确实生效过。
+# ---------------------------------------------------------------------------
+filter_sensitive_variables() {
+    local f="$1" tmp="${1}.filtered" removed="${1}.removed"
+    local redacted="$EVIDENCE_DIR/redacted_findings.txt"
+    [ -s "$f" ] || return 0
+    : > "$removed"
+    awk -F'\t' -v OFS='\t' -v removed="$removed" '
+      NR==1 {print; next}
+      {
+        k=tolower($1)
+
+        # ① 策略类变量一律保留：名字带 password，值是策略不是秘密。
+        #    default_password_lifetime=0（密码永不过期）正是巡检要出的结论。
+        if (k ~ /^(default_password_lifetime|password_history|password_reuse_interval|password_require_current|disconnect_on_expired_password|validate_password)/) { print; next }
+
+        # ② 密钥 / 证书路径
+        if (k ~ /(^|_)(rsa_public_key|private_key|public_key_path|server_public_key_path)(_|$)/) { printf("%s\t%d\t%s\n",$1,length($2),(index($2,":")>0?"yes":"no")) >> removed; next }
+        if (k ~ /(^|_)ssl_(key|ca|capath|cert|crl|crlpath)(_|$)/) { printf("%s\t%d\t%s\n",$1,length($2),(index($2,":")>0?"yes":"no")) >> removed; next }
+
+        # ③ 明文凭据。只认 passwd/pwd/secret/token 等，**不认裸 password**。
+        #    注意：wsrep_sst_receive_address 是 SST 监听地址(host:port)，不是凭证，
+        #    必须保留；只有 wsrep_sst_auth 是 user:pass，才删。
+        if (k == "wsrep_sst_auth") { printf("%s\t%d\t%s\n",$1,length($2),(index($2,":")>0?"yes":"no")) >> removed; next }
+        if (k ~ /(^|_)(passwd|pwd|secret|token|api_key|auth_token|access_key|secret_key)(_|$)/) { printf("%s\t%d\t%s\n",$1,length($2),(index($2,":")>0?"yes":"no")) >> removed; next }
+
+        print
+      }' "$f" > "$tmp" && mv "$tmp" "$f"
+    rm -f "$tmp"
+    if [ -s "$removed" ]; then
+        [ -f "$redacted" ] || printf 'variable_name\tvalue_length\tcontains_colon\n' > "$redacted"
+        cat "$removed" >> "$redacted"
+    fi
+    rm -f "$removed"
+}
+
 collect_mysql_basic() {
     mysql_query_fallback "mysql.global_variables" "mysql.basic" "$TABLES_DIR/global_variables.tsv" \
       "SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME NOT LIKE '%rsa_public_key%' AND VARIABLE_NAME NOT IN ('wsrep_sst_auth') ORDER BY VARIABLE_NAME" \
       "SHOW GLOBAL VARIABLES" || true
+    # F-04：主查询与回退路径取回后**统一**过闸，不再分工。宁可多扫一遍，也不留一条裸路径。
+    filter_sensitive_variables "$TABLES_DIR/global_variables.tsv"
     mysql_query_fallback "mysql.global_status" "mysql.basic" "$TABLES_DIR/global_status.tsv" \
       "SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status ORDER BY VARIABLE_NAME" \
       "SHOW GLOBAL STATUS" || true
@@ -770,7 +1192,7 @@ collect_mysql_basic() {
     mysql_query_tsv "mysql.plugins" "mysql.basic" "$TABLES_DIR/plugins.tsv" "SHOW PLUGINS" || true
     mysql_query_tsv "mysql.schemas" "mysql.basic" "$TABLES_DIR/schemas.tsv" \
       "SELECT schema_name,default_character_set_name,default_collation_name FROM information_schema.schemata ORDER BY schema_name" || true
-    mysql_query_tsv "mysql.innodb_status" "mysql.basic" "$EVIDENCE_DIR/innodb_status.tsv" "SHOW ENGINE INNODB STATUS" || true
+    collect_innodb_status
     mysql_query_tsv "mysql.open_tables" "mysql.basic" "$TABLES_DIR/open_tables.tsv" \
       "SELECT OBJECT_SCHEMA,COUNT(*) AS open_handle_count,COUNT(DISTINCT OWNER_THREAD_ID) AS owner_threads FROM performance_schema.table_handles GROUP BY OBJECT_SCHEMA ORDER BY open_handle_count DESC" || true
 }
@@ -828,12 +1250,17 @@ collect_mysql_performance() {
     else record_skipped "mysql.redundant_indexes" "mysql.performance" "unsupported" "sys.schema_redundant_indexes unavailable" "$TABLES_DIR/redundant_indexes.tsv"; fi
 
     if [ "$SYS_SCHEMA_AVAILABLE" -eq 1 ] && mysql_table_exists sys schema_unused_indexes; then
+        # F-24：sys.schema_unused_indexes 内部是 information_schema.statistics
+        #       LEFT JOIN pfs 索引使用统计。5.7 的 I_S 要扫 .frm，大表基数下**必然**
+        #       超过全局 30 秒 → 该项 timeout、报告中"未使用索引"一节为空。
+        #       这里单独放宽到 SLOW_QUERY_TIMEOUT_SECONDS（默认 300），不要改全局值。
         mysql_query_tsv "mysql.unused_indexes" "mysql.performance" "$TABLES_DIR/unused_indexes.tsv" \
-          "SELECT object_schema,object_name,index_name FROM sys.schema_unused_indexes ORDER BY object_schema,object_name LIMIT 500" || true
+          "SELECT object_schema,object_name,index_name FROM sys.schema_unused_indexes ORDER BY object_schema,object_name LIMIT 500" "$SLOW_QUERY_TIMEOUT_SECONDS" || true
     else record_skipped "mysql.unused_indexes" "mysql.performance" "unsupported" "sys.schema_unused_indexes unavailable" "$TABLES_DIR/unused_indexes.tsv"; fi
 
+    # F-24：同 unused_indexes，5.7 大表基数下必然超全局 30 秒
     mysql_query_tsv "mysql.table_io_top" "mysql.performance" "$TABLES_DIR/table_io_top.tsv" \
-      "SELECT OBJECT_SCHEMA,OBJECT_NAME,COUNT_READ,COUNT_WRITE,ROUND(SUM_TIMER_WAIT/1000000000000,3) AS total_wait_seconds FROM performance_schema.table_io_waits_summary_by_table WHERE OBJECT_SCHEMA NOT IN ('mysql','sys','information_schema','performance_schema') ORDER BY SUM_TIMER_WAIT DESC LIMIT ${TOP_N}" || true
+      "SELECT OBJECT_SCHEMA,OBJECT_NAME,COUNT_READ,COUNT_WRITE,ROUND(SUM_TIMER_WAIT/1000000000000,3) AS total_wait_seconds FROM performance_schema.table_io_waits_summary_by_table WHERE OBJECT_SCHEMA NOT IN ('mysql','sys','information_schema','performance_schema') ORDER BY SUM_TIMER_WAIT DESC LIMIT ${TOP_N}" "$SLOW_QUERY_TIMEOUT_SECONDS" || true
     mysql_query_tsv "mysql.file_io_top" "mysql.performance" "$TABLES_DIR/file_io_top.tsv" \
       "SELECT FILE_NAME,EVENT_NAME,COUNT_READ,COUNT_WRITE,SUM_NUMBER_OF_BYTES_READ,SUM_NUMBER_OF_BYTES_WRITE,ROUND(SUM_TIMER_WAIT/1000000000000,3) AS total_wait_seconds FROM performance_schema.file_summary_by_instance ORDER BY SUM_TIMER_WAIT DESC LIMIT ${TOP_N}" || true
     mysql_query_tsv "mysql.wait_events_top" "mysql.performance" "$TABLES_DIR/wait_events_top.tsv" \
@@ -846,17 +1273,20 @@ collect_mysql_replication() {
     else
         mysql_query_tsv "mysql.replica_status" "mysql.replication" "$TABLES_DIR/replica_status.tsv" "SHOW SLAVE STATUS" || true
     fi
-    sanitize_tsv_columns "$TABLES_DIR/replica_status.tsv" "Channel_Name Source_Host Master_Host Source_Port Master_Port Source_UUID Master_UUID Connect_Retry Source_Log_File Master_Log_File Read_Source_Log_Pos Read_Master_Log_Pos Relay_Log_File Relay_Log_Pos Relay_Source_Log_File Relay_Master_Log_File Replica_IO_Running Slave_IO_Running Replica_SQL_Running Slave_SQL_Running Replicate_Do_DB Replicate_Ignore_DB Replicate_Do_Table Replicate_Ignore_Table Replicate_Wild_Do_Table Replicate_Wild_Ignore_Table Last_Errno Last_IO_Errno Last_SQL_Errno Skip_Counter Exec_Source_Log_Pos Exec_Master_Log_Pos Relay_Log_Space Until_Condition Until_Log_File Until_Log_Pos Source_SSL_Allowed Master_SSL_Allowed Seconds_Behind_Source Seconds_Behind_Master Source_Server_Id Master_Server_Id Source_UUID Master_UUID SQL_Delay SQL_Remaining_Delay Retrieved_Gtid_Set Executed_Gtid_Set Auto_Position Replicate_Rewrite_DB"
+    # F-06：白名单必须带上 Last_Error / Last_IO_Error / Last_SQL_Error。
+    #   只有 Errno 是写不出任何结论的——13114 本身不代表可行动信息，真正指向根因
+    #   （两台从库 server_id 相同）的是那段 1236 的原文。
+    sanitize_tsv_columns "$TABLES_DIR/replica_status.tsv" "Channel_Name Source_Host Master_Host Source_Port Master_Port Source_UUID Master_UUID Connect_Retry Source_Log_File Master_Log_File Read_Source_Log_Pos Read_Master_Log_Pos Relay_Log_File Relay_Log_Pos Relay_Source_Log_File Relay_Master_Log_File Replica_IO_Running Slave_IO_Running Replica_SQL_Running Slave_SQL_Running Replicate_Do_DB Replicate_Ignore_DB Replicate_Do_Table Replicate_Ignore_Table Replicate_Wild_Do_Table Replicate_Wild_Ignore_Table Last_Errno Last_Error Last_IO_Errno Last_IO_Error Last_SQL_Errno Last_SQL_Error Skip_Counter Exec_Source_Log_Pos Exec_Master_Log_Pos Relay_Log_Space Until_Condition Until_Log_File Until_Log_Pos Source_SSL_Allowed Master_SSL_Allowed Seconds_Behind_Source Seconds_Behind_Master Source_Server_Id Master_Server_Id SQL_Delay SQL_Remaining_Delay Retrieved_Gtid_Set Executed_Gtid_Set Auto_Position Replicate_Rewrite_DB"
     if [ "$LOG_BIN" = "1" ] || [ "$LOG_BIN" = "ON" ]; then
         if [ "$MYSQL_FAMILY" = "mysql" ] && { [ "${MYSQL_MAJOR:-0}" -gt 8 ] || { [ "${MYSQL_MAJOR:-0}" -eq 8 ] && [ "${MYSQL_MINOR:-0}" -ge 4 ]; }; }; then
             mysql_query_tsv "mysql.binary_log_status" "mysql.replication" "$TABLES_DIR/binary_log_status.tsv" "SHOW BINARY LOG STATUS" || true
         else
             mysql_query_tsv "mysql.binary_log_status" "mysql.replication" "$TABLES_DIR/binary_log_status.tsv" "SHOW MASTER STATUS" || true
         fi
-        # GTID set may contain embedded newlines; join continuation lines
-        if [ -s "$TABLES_DIR/binary_log_status.tsv" ]; then
-            sed -i ':a;N;$!ba;s/,\n/, /g' "$TABLES_DIR/binary_log_status.tsv" 2>/dev/null || true
-        fi
+        # F-01 之前这里有一段 `sed -i ':a;N;$!ba;s/,\n/, /g'`，用来把 GTID 集合的
+        # 续行拼回一行。去掉 mysql_exec 的 --raw 之后，客户端会把换行转义成字面量
+        # `\n`，行结构天然完整，**该补丁已变成空转，故删除**。
+        # 现在 Executed_Gtid_Set 是一个字段内带 \n 的合法值，Python 侧 unescape 即可。
         mysql_query_tsv "mysql.binary_logs" "mysql.replication" "$TABLES_DIR/binary_logs.tsv" "SHOW BINARY LOGS" || true
     else
         record_skipped "mysql.binary_log_status" "mysql.replication" "not_applicable" "binary logging is disabled" "$TABLES_DIR/binary_log_status.tsv"
@@ -864,28 +1294,37 @@ collect_mysql_replication() {
     fi
 
     if [ "$REPL_CONN_STATUS_AVAILABLE" -eq 1 ]; then
-        if [ "$INCLUDE_LOG_TEXT" -eq 1 ]; then
-            mysql_query_tsv "mysql.replication_channels" "mysql.replication" "$TABLES_DIR/replication_channels.tsv" \
-              "SELECT CHANNEL_NAME,GROUP_NAME,SOURCE_UUID,THREAD_ID,SERVICE_STATE,COUNT_RECEIVED_HEARTBEATS,LAST_HEARTBEAT_TIMESTAMP,RECEIVED_TRANSACTION_SET,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE,LAST_ERROR_TIMESTAMP FROM performance_schema.replication_connection_status ORDER BY CHANNEL_NAME" || true
-        else
-            mysql_query_tsv "mysql.replication_channels" "mysql.replication" "$TABLES_DIR/replication_channels.tsv" \
-              "SELECT CHANNEL_NAME,GROUP_NAME,SOURCE_UUID,THREAD_ID,SERVICE_STATE,COUNT_RECEIVED_HEARTBEATS,LAST_HEARTBEAT_TIMESTAMP,RECEIVED_TRANSACTION_SET,LAST_ERROR_NUMBER,CASE WHEN LAST_ERROR_MESSAGE='' THEN '' ELSE SHA2(LAST_ERROR_MESSAGE,256) END AS LAST_ERROR_MESSAGE_SHA256,LAST_ERROR_TIMESTAMP FROM performance_schema.replication_connection_status ORDER BY CHANNEL_NAME" || true
-        fi
+        # F-06：不再按 --include-log-text 分叉、也不再 SHA2。LAST_ERROR_MESSAGE 是
+        #   服务器自己生成的诊断文本，不含用户 SQL 字面量；截断到 500 字符保留根因
+        #   （例如 1236 里"两台从库 server_id 相同"那段），去掉尾部冗长堆栈。
+        #   依赖 F-01：客户端转义后换行变字面量 \n，不会撑破 TSV 行结构。
+        mysql_query_tsv "mysql.replication_channels" "mysql.replication" "$TABLES_DIR/replication_channels.tsv" \
+          "SELECT CHANNEL_NAME,GROUP_NAME,SOURCE_UUID,THREAD_ID,SERVICE_STATE,COUNT_RECEIVED_HEARTBEATS,LAST_HEARTBEAT_TIMESTAMP,RECEIVED_TRANSACTION_SET,LAST_ERROR_NUMBER,CASE WHEN LAST_ERROR_MESSAGE='' THEN '' ELSE LEFT(LAST_ERROR_MESSAGE,500) END AS LAST_ERROR_MESSAGE,LAST_ERROR_TIMESTAMP FROM performance_schema.replication_connection_status ORDER BY CHANNEL_NAME" || true
     else record_skipped "mysql.replication_channels" "mysql.replication" "unsupported" "replication_connection_status unavailable" "$TABLES_DIR/replication_channels.tsv"; fi
 
     if mysql_table_exists performance_schema replication_applier_status_by_worker; then
-        if [ "$INCLUDE_LOG_TEXT" -eq 1 ]; then
-            mysql_query_tsv "mysql.replication_workers" "mysql.replication" "$TABLES_DIR/replication_workers.tsv" \
-              "SELECT CHANNEL_NAME,WORKER_ID,THREAD_ID,SERVICE_STATE,LAST_ERROR_NUMBER,LAST_ERROR_MESSAGE,LAST_ERROR_TIMESTAMP,LAST_APPLIED_TRANSACTION,APPLYING_TRANSACTION FROM performance_schema.replication_applier_status_by_worker ORDER BY CHANNEL_NAME,WORKER_ID" || true
-        else
-            mysql_query_tsv "mysql.replication_workers" "mysql.replication" "$TABLES_DIR/replication_workers.tsv" \
-              "SELECT CHANNEL_NAME,WORKER_ID,THREAD_ID,SERVICE_STATE,LAST_ERROR_NUMBER,CASE WHEN LAST_ERROR_MESSAGE='' THEN '' ELSE SHA2(LAST_ERROR_MESSAGE,256) END AS LAST_ERROR_MESSAGE_SHA256,LAST_ERROR_TIMESTAMP,LAST_APPLIED_TRANSACTION,APPLYING_TRANSACTION FROM performance_schema.replication_applier_status_by_worker ORDER BY CHANNEL_NAME,WORKER_ID" || true
-        fi
+        # F-20：这两个列集**互斥**——LAST_SEEN_TRANSACTION 只在 5.7 有，
+        #       LAST_APPLIED_TRANSACTION / APPLYING_TRANSACTION 只在 8.0 有。
+        #       写死任意一套，都会在另一版本上报 1054 Unknown column 并让整项 0 行，
+        #       而且因为探测只做到表级，还会被误记成 unsupported（缺陷不会浮出来）。
+        local w_mid w_post w_err
+        w_mid="";  [ "$REPL_WORKER_LAST_SEEN_AVAILABLE" -eq 1 ] && w_mid=",LAST_SEEN_TRANSACTION"
+        w_post=""; [ "$REPL_WORKER_APPLY_COLS_AVAILABLE" -eq 1 ] && w_post=",LAST_APPLIED_TRANSACTION,APPLYING_TRANSACTION"
+        # F-06：worker 错误消息同样保留明文（原默认分支是 SHA2，等于只有错误号可看）。
+        w_err=",CASE WHEN LAST_ERROR_MESSAGE='' THEN '' ELSE LEFT(LAST_ERROR_MESSAGE,500) END AS LAST_ERROR_MESSAGE"
+        mysql_query_tsv "mysql.replication_workers" "mysql.replication" "$TABLES_DIR/replication_workers.tsv" \
+          "SELECT CHANNEL_NAME,WORKER_ID,THREAD_ID,SERVICE_STATE${w_mid},LAST_ERROR_NUMBER${w_err},LAST_ERROR_TIMESTAMP${w_post} FROM performance_schema.replication_applier_status_by_worker ORDER BY CHANNEL_NAME,WORKER_ID" || true
     else record_skipped "mysql.replication_workers" "mysql.replication" "unsupported" "replication_applier_status_by_worker unavailable" "$TABLES_DIR/replication_workers.tsv"; fi
 
     if [ "$GR_MEMBERS_AVAILABLE" -eq 1 ]; then
+        # F-20：MEMBER_ROLE / MEMBER_VERSION 是 8.0 专有列。5.7 上表在、列不在，
+        #       写死会在 5.7 报 1054 并让整项 0 行（还会被误记为 unsupported）。
+        local gr_cols
+        gr_cols=""
+        [ "$GR_MEMBER_ROLE_AVAILABLE" -eq 1 ] && gr_cols="${gr_cols},MEMBER_ROLE"
+        [ "$GR_MEMBER_VERSION_AVAILABLE" -eq 1 ] && gr_cols="${gr_cols},MEMBER_VERSION"
         mysql_query_tsv "mysql.group_replication_members" "mysql.replication" "$TABLES_DIR/group_replication_members.tsv" \
-          "SELECT CHANNEL_NAME,MEMBER_ID,MEMBER_HOST,MEMBER_PORT,MEMBER_STATE,MEMBER_ROLE,MEMBER_VERSION FROM performance_schema.replication_group_members ORDER BY MEMBER_HOST,MEMBER_PORT" || true
+          "SELECT CHANNEL_NAME,MEMBER_ID,MEMBER_HOST,MEMBER_PORT,MEMBER_STATE${gr_cols} FROM performance_schema.replication_group_members ORDER BY MEMBER_HOST,MEMBER_PORT" || true
         if mysql_table_exists performance_schema replication_group_member_stats; then
             mysql_query_tsv "mysql.group_replication_stats" "mysql.replication" "$TABLES_DIR/group_replication_stats.tsv" \
               "SELECT CHANNEL_NAME,VIEW_ID,MEMBER_ID,COUNT_TRANSACTIONS_IN_QUEUE,COUNT_TRANSACTIONS_CHECKED,COUNT_CONFLICTS_DETECTED,COUNT_TRANSACTIONS_ROWS_VALIDATING,TRANSACTIONS_COMMITTED_ALL_MEMBERS,LAST_CONFLICT_FREE_TRANSACTION FROM performance_schema.replication_group_member_stats" || true
@@ -942,7 +1381,7 @@ collect_mysql_logs_backup() {
         if [ "$INCLUDE_LOG_TEXT" -eq 1 ]; then
             mysql_query_tsv "mysql.error_log_samples" "mysql.logs" "$TABLES_DIR/error_log_samples.tsv" \
               "SELECT LOGGED,THREAD_ID,PRIO,ERROR_CODE,LEFT(DATA,1000) AS message FROM performance_schema.error_log WHERE LOGGED >= NOW() - INTERVAL 24 HOUR ORDER BY LOGGED DESC LIMIT 500" || true
-        else record_skipped "mysql.error_log_samples" "mysql.logs" "skipped" "log text disabled by default" "$TABLES_DIR/error_log_samples.tsv"; fi
+        else record_skipped "mysql.error_log_samples" "mysql.logs" "skipped" "log text not collected: pass --include-log-text (default off, keeps SQL literals inside the customer site)" "$TABLES_DIR/error_log_samples.tsv"; fi
     else
         record_skipped "mysql.error_log_summary" "mysql.logs" "unsupported" "performance_schema.error_log unavailable" "$TABLES_DIR/error_log_summary.tsv"
         if [ "$INCLUDE_LOG_TEXT" -eq 1 ] && [ -n "$log_error_path" ] && [ -r "$log_error_path" ]; then
@@ -1015,14 +1454,24 @@ derive_role_evidence() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# generate_collection_status_json —— 汇总 $STATUS_PARTS_DIR 下的逐项状态
+#
+# 输出   : collection_status.json（Python 第二入口）
+# 结构   : { schema_version, items[], summary{} }
+# 注意   : ① Python 必须按 **status 取值**分支，不要按 reason 文本匹配（见 INTERFACE.md §5.3）
+#          ② summary 的计数只是导航，判定请以 items[].status 为准
+#          ③ F-10：文件列表用数组传递。旧版 `files=$(find ... | tr '\n' ' ')`
+#             再以 `awk ... $files` 展开，路径含空格时会被拆成多个参数 → JSON 损坏
+# ---------------------------------------------------------------------------
 generate_collection_status_json() {
-    local files
-    files=$(find "$STATUS_PARTS_DIR" -type f -name '*.tsv' | sort | tr '\n' ' ')
-    if [ -z "$files" ]; then
+    local -a files=()
+    local f
+    while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(find "$STATUS_PARTS_DIR" -type f -name '*.tsv' | sort)
+    if [ ${#files[@]} -eq 0 ]; then
         printf '{"schema_version":"1.0","items":[],"summary":{}}\n' > "$COLLECTION_STATUS_FILE"
         return 0
     fi
-    # 状态文件由采集器自身生成，文件名均已净化，不含空格。
     awk -F'\t' '
       function esc(s,   t){
         t=s; gsub(/\\/,"\\\\",t); gsub(/"/,"\\\"",t); gsub(/\r/,"\\r",t); gsub(/\n/,"\\n",t); gsub(/\t/,"\\t",t); return t
@@ -1035,9 +1484,9 @@ generate_collection_status_json() {
       }
       END{
         print ""; print "  ],";
-        printf "  \"summary\": {\"ok\":%d,\"empty\":%d,\"unsupported\":%d,\"not_enabled\":%d,\"not_applicable\":%d,\"permission_denied\":%d,\"timeout\":%d,\"error\":%d,\"skipped\":%d,\"partial\":%d}\n",c["ok"]+0,c["empty"]+0,c["unsupported"]+0,c["not_enabled"]+0,c["not_applicable"]+0,c["permission_denied"]+0,c["timeout"]+0,c["error"]+0,c["skipped"]+0,c["partial"]+0
+        printf "  \"summary\": {\"ok\":%d,\"empty\":%d,\"unsupported\":%d,\"not_enabled\":%d,\"not_applicable\":%d,\"permission_denied\":%d,\"timeout\":%d,\"error\":%d,\"skipped\":%d,\"partial\":%d,\"schema_mismatch\":%d}\n",c["ok"]+0,c["empty"]+0,c["unsupported"]+0,c["not_enabled"]+0,c["not_applicable"]+0,c["permission_denied"]+0,c["timeout"]+0,c["error"]+0,c["skipped"]+0,c["partial"]+0,c["schema_mismatch"]+0
         print "}"
-      }' $files > "$COLLECTION_STATUS_FILE"
+      }' "${files[@]}" > "$COLLECTION_STATUS_FILE"
 }
 
 generate_snapshot_json() {
@@ -1057,9 +1506,16 @@ generate_snapshot_json() {
     collected_end=$(iso_now)
     derive_role_evidence
 
+    # 计数口径（F-21）：
+    #   ok_count      = 采到数据 / 无数据(正常) / 不适用 / 主动跳过
+    #   warning_count = 环境不支持 + 未启用 + 部分成功 + **schema_mismatch**
+    #   error_count   = 错误 + 超时 + 权限不足
+    # schema_mismatch（表在、列不在 = 采集器缺陷）**不**计入 error_count，
+    # 以免把自动化流水线直接卡死；但它连同 unsupported 都不是"可以忽略"的状态，
+    # Python 请读 items[].status 逐项处理，不要只看这三个计数。
     ok_count=$(awk -F'\t' '$3=="ok"||$3=="empty"||$3=="not_applicable"||$3=="skipped"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     error_count=$(awk -F'\t' '$3=="error"||$3=="timeout"||$3=="permission_denied"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
-    warning_count=$(awk -F'\t' '$3=="unsupported"||$3=="not_enabled"||$3=="partial"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
+    warning_count=$(awk -F'\t' '$3=="unsupported"||$3=="not_enabled"||$3=="partial"||$3=="schema_mismatch"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
 
     actual_mysql_points=$(awk 'END{print (NR>0?NR-1:0)}' "$MYSQL_CSV" 2>/dev/null); actual_mysql_points=${actual_mysql_points:-0}
     actual_cpu_points=$(awk 'END{print (NR>0?NR-1:0)}' "$CPU_CSV" 2>/dev/null); actual_cpu_points=${actual_cpu_points:-0}
@@ -1108,7 +1564,7 @@ generate_snapshot_json() {
 }
 
 generate_summary() {
-    local total_ms ok empty unsupported not_enabled permission timeout error skipped partial
+    local total_ms ok empty unsupported not_enabled permission timeout error skipped partial schema_mismatch
     local actual_mysql_points actual_elapsed_ms sampling_status sar_coverage_status sar_coverage_hours sar_first sar_last
     total_ms=$(( $(epoch_ms) - COLLECTION_STARTED_MS ))
     ok=$(awk -F'\t' '$3=="ok"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
@@ -1120,6 +1576,9 @@ generate_summary() {
     error=$(awk -F'\t' '$3=="error"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     partial=$(awk -F'\t' '$3=="partial"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     skipped=$(awk -F'\t' '$3=="skipped"||$3=="not_applicable"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
+    # F-21：schema_mismatch = 表在、列不在，说明采集 SQL 与本版本列集不匹配。
+    # 它是**采集器缺陷**，不是"环境不支持"，必须单独计数并让人看见。
+    schema_mismatch=$(awk -F'\t' '$3=="schema_mismatch"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     actual_mysql_points=$(awk 'END{print (NR>0?NR-1:0)}' "$MYSQL_CSV" 2>/dev/null); actual_mysql_points=${actual_mysql_points:-0}
     actual_elapsed_ms=$(awk -F, 'NR>1{v=$2}END{print v+0}' "$MYSQL_CSV" 2>/dev/null); actual_elapsed_ms=${actual_elapsed_ms:-0}
     sampling_status=$(awk -F'\t' '$1=="timeseries.realtime_sampling"{print $3}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null | tail -1); sampling_status=${sampling_status:-error}
@@ -1145,8 +1604,15 @@ generate_summary() {
       [ -n "$sar_first" ] && printf '历史 sar 初步范围: %s ～ %s（最终精确覆盖率由 Python 计算）\n' "$sar_first" "$sar_last"
       printf '实时同步采样请求: %s 秒一次，共 %s 次，约 %s 秒\n' "$SAMPLE_INTERVAL" "$SAMPLE_COUNT" "$((SAMPLE_INTERVAL*SAMPLE_COUNT))"
       printf '实时同步采样实际: 状态 %s，MySQL 数据点 %s，实际跨度 %.2f 秒\n' "$sampling_status" "$actual_mysql_points" "$(awk -v ms="$actual_elapsed_ms" 'BEGIN{print ms/1000}')"
+      # F-19：默认不看错误日志原文时，必须显式说一句——否则下游分不清"本机真没有错误"
+      #       和"压根没采原文"（collection_status.json 里 error_log_samples 是 skipped，
+      #       而 skipped 在另外二十多个采集项里也表示"按设计跳过"，语义被淹没）。
+      if [ "$INCLUDE_LOG_TEXT" -ne 1 ]; then
+          printf '\n注意：错误日志原文未采集（--include-log-text 未开启），本次仅有按 PRIO/ERROR_CODE 的聚合计数。\n'
+      fi
       printf '\n状态统计\n'
       printf '  成功: %s\n  成功但无数据: %s\n  部分成功: %s\n  不支持: %s\n  未启用: %s\n  不适用/跳过: %s\n  权限不足: %s\n  超时: %s\n  错误: %s\n' "$ok" "$empty" "$partial" "$unsupported" "$not_enabled" "$skipped" "$permission" "$timeout" "$error"
+      printf '  与版本不匹配(schema_mismatch): %s  ← 非 0 表示采集脚本与目标版本列集不符，属采集器缺陷，需修脚本而不是忽略\n' "$schema_mismatch"
       printf '\n耗时最长的采集项（前 10）\n'
       cat "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null | awk -F'\t' -v total="$total_ms" '$4!="" && $6 ~ /^[0-9]+$/ && $6>=0 && $6<=total*2' | sort -t$'\t' -k6,6nr | head -10 | awk -F'\t' '{printf "  %-45s %8.3f 秒  %s\n",$1,$6/1000,$3}'
       printf '\n非成功项\n'
@@ -1212,7 +1678,11 @@ create_package() {
 
 cleanup_auth() {
     [ -n "${MYSQL_CNF:-}" ] && rm -f "$MYSQL_CNF"
+    # F-11：临时认证目录建在任务目录**之外**，任务目录可整包回传。SIGKILL / OOM killer
+    #       不走 trap，若 cnf 留在任务目录里，就可能被打包带走；故这里必须一并清掉。
+    [ -n "${AUTH_TMP_DIR:-}" ] && [ -d "$AUTH_TMP_DIR" ] && rm -rf "$AUTH_TMP_DIR"
     MYSQL_CNF=""
+    AUTH_TMP_DIR=""
 }
 
 handle_signal() {
@@ -1223,6 +1693,8 @@ handle_signal() {
 }
 
 trap handle_signal INT TERM HUP
+# F-11：正常路径已显式 cleanup_auth，这里再挂一道 EXIT 兜底，覆盖任何未预料的退出分支。
+trap cleanup_auth EXIT
 
 # -------------------- 参数与入口 --------------------
 POSITIONAL=()
@@ -1239,6 +1711,7 @@ while [ $# -gt 0 ]; do
       --sample-count) SAMPLE_COUNT="${2-}"; shift 2 ;;
       --sar-history-hours) SAR_HISTORY_HOURS="${2-}"; shift 2 ;;
       --mysql-timeout) MYSQL_TIMEOUT_SECONDS="${2-}"; shift 2 ;;
+      --slow-query-timeout) SLOW_QUERY_TIMEOUT_SECONDS="${2-}"; shift 2 ;;
       --include-log-text) INCLUDE_LOG_TEXT=1; shift ;;
       --no-package) CREATE_PACKAGE=0; shift ;;
       --) shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
@@ -1253,7 +1726,7 @@ done
 [ ${#POSITIONAL[@]} -ge 4 ] && LEGACY_PASSWORD="${POSITIONAL[3]}"
 
 dbHost="${dbHost:-127.0.0.1}"; dbPort="${dbPort:-3306}"; dbUser="${dbUser:-root}"
-for n in "$dbPort" "$SAMPLE_INTERVAL" "$SAMPLE_COUNT" "$SAR_HISTORY_HOURS" "$MYSQL_TIMEOUT_SECONDS"; do is_uint "$n" || { printf '端口和时间参数必须是正整数\n' >&2; exit 10; }; done
+for n in "$dbPort" "$SAMPLE_INTERVAL" "$SAMPLE_COUNT" "$SAR_HISTORY_HOURS" "$MYSQL_TIMEOUT_SECONDS" "$SLOW_QUERY_TIMEOUT_SECONDS"; do is_uint "$n" || { printf '端口和时间参数必须是正整数\n' >&2; exit 10; }; done
 [ "$SAMPLE_INTERVAL" -ge 1 ] && [ "$SAMPLE_COUNT" -ge 1 ] || exit 10
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { printf '需要 Bash 4.0 或更高版本\n' >&2; exit 10; }
 has_cmd mysql || { printf '未找到 mysql 客户端\n' >&2; exit 10; }
@@ -1278,7 +1751,7 @@ LOG_FILE="$LOG_DIR/collection.log"; SNAPSHOT_FILE="$TASK_DIR/snapshot.json"; COL
 SUMMARY_FILE="$TASK_DIR/summary.txt"; MANIFEST_FILE="$TASK_DIR/manifest.json"
 CPU_CSV="$TIMESERIES_DIR/system_cpu.csv"; MEM_CSV="$TIMESERIES_DIR/system_memory.csv"; NET_CSV="$TIMESERIES_DIR/system_network.csv"; DISK_CSV="$TIMESERIES_DIR/system_disk.csv"; MYSQL_CSV="$TIMESERIES_DIR/mysql_status.csv"
 : > "$LOG_FILE"
-BG_PIDS=(); BG_NAMES=(); BG_START_ISO=(); BG_START_MS=(); FINALIZED=0; MYSQL_CNF=""; MYSQL_CONN_ARGS=()
+BG_PIDS=(); BG_NAMES=(); BG_START_ISO=(); BG_START_MS=(); FINALIZED=0; MYSQL_CNF=""; AUTH_TMP_DIR=""; MYSQL_CONN_ARGS=()
 HAS_SAR=0; has_cmd sar && HAS_SAR=1
 HAS_SADF=0; has_cmd sadf && HAS_SADF=1
 
@@ -1304,7 +1777,11 @@ else
         if [ -t 0 ]; then stty -echo 2>/dev/null; IFS= read -r PASS; stty echo 2>/dev/null; printf '\n'; else IFS= read -r PASS; fi
     fi
     escaped=$(cnf_escape "$PASS") || { printf '密码包含换行，无法安全处理\n' >&2; exit 10; }
-    MYSQL_CNF=$(mktemp "$TMP_DIR/.mysql_defaults.XXXXXX.cnf") || exit 10
+    # F-11：认证文件放到任务目录**之外**（任务目录是可整包回传的）。SIGKILL / OOM 不走
+    #       trap，留在任务目录里就有可能被打包带走。
+    AUTH_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mysql_insp_auth.XXXXXX") || { printf '无法创建临时认证目录\n' >&2; exit 10; }
+    chmod 700 "$AUTH_TMP_DIR"
+    MYSQL_CNF=$(mktemp "$AUTH_TMP_DIR/.mysql_defaults.XXXXXX.cnf") || { printf '无法创建临时认证文件\n' >&2; exit 10; }
     chmod 600 "$MYSQL_CNF"
     {
       printf '[client]\n'; printf 'host=%s\n' "$dbHost"; printf 'port=%s\n' "$dbPort"; printf 'user=%s\n' "$dbUser"; printf 'password="%s"\n' "$escaped"; printf 'protocol=tcp\n'
@@ -1343,23 +1820,33 @@ wait_background_modules
 derive_role_evidence
 cleanup_auth
 
-# 生成结构化状态和快照；敏感扫描通过后才允许打包。
+# ---------------------------------------------------------------------------
+# 收尾：敏感扫描 → 生成状态/快照/摘要 → 打包
+# ---------------------------------------------------------------------------
+# F-12：scan 必须**先**跑。它会先往 $STATUS_PARTS_DIR 写一条 package.security_scan
+#       状态，随后 generate_collection_status_json 遍历时自然带上，全量统计只跑一遍；
+#       旧版是先算一遍、if/else 两个分支里又各算一遍，每轮多跑两次全量 awk。
+# F-05：失败分支不再落到 exit 0。退出码：0 成功 / 10 参数或环境 / 20 连接失败 /
+#       30 敏感扫描拦截（未打包）/ 31 打包失败（任务目录仍可用）。
+security_scan; SCAN_RC=$?
+
 generate_collection_status_json
 generate_snapshot_json
 generate_summary
-if security_scan; then
-    generate_collection_status_json
-    generate_snapshot_json
-    generate_summary
+
+if [ "$SCAN_RC" -eq 0 ]; then
     generate_manifest
     rm -rf "$TMP_DIR" "$STATUS_PARTS_DIR"
-    create_package || log_warn "回传包生成失败，可直接回传任务目录"
+    if ! create_package; then
+        log_warn "回传包生成失败，可直接回传任务目录"
+        FINALIZED=1
+        exit 31
+    fi
 else
-    generate_collection_status_json
-    generate_snapshot_json
-    generate_summary
-    log_error "敏感信息扫描未通过，已阻止打包；请查看 logs/security_scan_findings.txt"
     rm -rf "$TMP_DIR" "$STATUS_PARTS_DIR"
+    log_error "敏感信息扫描未通过，已阻止打包；请查看 logs/security_scan_findings.txt"
+    FINALIZED=1
+    exit 30
 fi
 
 FINALIZED=1
