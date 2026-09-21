@@ -599,6 +599,8 @@ class AnalyzerV2(Analyzer):
                 status: sum(1 for evaluation in evaluations if evaluation.status == status)
                 for status in ("triggered", "passed", "not_evaluated", "not_applicable")
             }
+        # 拓扑建好后，把源端实例的复制状态从"本机上游行"改写为"下游从库"。
+        self.presentation_builder.attach_topology_replication(analysis)
         all_findings = [finding for instance in analysis.get("instances", []) for finding in instance.get("findings", [])]
         scores = [instance.get("health_summary", {}).get("score", 0) for instance in analysis.get("instances", [])]
         analysis["overall_health_summary"].update({

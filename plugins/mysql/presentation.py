@@ -1240,6 +1240,122 @@ class MySQLPresentationBuilder:
         ]
         return sections, conclusions
 
+    def attach_topology_replication(self, analysis: dict[str, Any]) -> None:
+        """把源端实例的复制状态从「本机上游行」改写为「下游从库」。
+
+        11.5 原先只渲染本实例的 ``SHOW REPLICA STATUS``。当本实例是复制源端时，
+        本机没有真实的上游复制行（那条 ``Source_Host`` 指向自己的是残留通道），
+        真正要评价的「下游从库是否在运行、延迟多少」记录在其它节点的
+        ``facts.role_evidence`` 里。这里按拓扑把下游节点补进复制状态表，
+        否则报告只显示一条无意义的残留通道，读不到真实的主从健康。
+        """
+        topology = analysis.get("topology") or {}
+        nodes = topology.get("nodes") or []
+        edges = topology.get("edges") or []
+        instances = analysis.get("instances") or []
+        if not (nodes and edges and instances):
+            return
+        primary = instances[0]
+        primary_id = primary.get("instance_id")
+        by_id = {node.get("node_id"): node for node in nodes}
+        primary_node = by_id.get(primary_id) if primary_id else None
+        if not primary_node:
+            return
+        # 只在源端改写：从库/级联中间节点保留本机观测到的上游行。
+        if str(primary_node.get("role_effective") or "").strip().lower() != "source":
+            return
+        targets = [
+            by_id[edge.get("target_node_id")]
+            for edge in edges
+            if edge.get("source_node_id") == primary_id
+            and edge.get("target_node_id") in by_id
+        ]
+        if not targets:
+            return
+        instances_by_id = {item.get("instance_id"): item for item in instances}
+        rows: list[dict[str, Any]] = []
+        stopped = 0
+        lags: list[float] = []
+        for node in targets:
+            role = (
+                (instances_by_id.get(node.get("node_id")) or {}).get("facts") or {}
+            ).get("role_evidence") or {}
+            io_state = role.get("replica_io_running")
+            sql_state = role.get("replica_sql_running")
+            lag = role.get("replica_lag_seconds")
+            lag_value = float(lag) if isinstance(lag, (int, float)) and not isinstance(lag, bool) else None
+            lag_display: Any = "未采集"
+            if lag_value is not None:
+                lag_display = int(lag_value) if lag_value.is_integer() else lag_value
+            if str(io_state).strip().upper() != "YES" or str(sql_state).strip().upper() != "YES":
+                stopped += 1
+            if lag_value is not None:
+                lags.append(lag_value)
+            address = ":".join(
+                str(value) for value in (node.get("ip"), node.get("port")) if value not in (None, "")
+            )
+            rows.append({
+                "从库主机": node.get("hostname") or node.get("instance_tag") or "未采集",
+                "地址": address or "未采集",
+                "IO 线程": str(io_state) if io_state not in (None, "") else "未采集",
+                "SQL 线程": str(sql_state) if sql_state not in (None, "") else "未采集",
+                # 缺失值保持"未采集"，不得显示成 0（见 analysis contracts.missing_value_policy）。
+                "延迟秒": lag_display,
+            })
+        residual = [
+            edge for edge in topology.get("self_reference_edges") or []
+            if edge.get("target_node_id") == primary_id
+        ]
+        residual_note = (
+            f"本机 SHOW REPLICA STATUS 中另有 {len(residual)} 条指向自身的残留通道，不构成真实主从关系。"
+            if residual else ""
+        )
+        lag_txt = f"，最大延迟 {max(lags):.0f} 秒" if lags else ""
+        if stopped:
+            status = "risk"
+            conclusion = (
+                f"本实例为复制源端，下游 {len(rows)} 个从库中有 {stopped} 个 IO/SQL 线程未运行；"
+                "复制中断会直接削弱高可用与数据保护能力。" + residual_note
+            )
+            recommendation = "检查复制错误、网络和源端状态，制定可回滚的恢复步骤。"
+        elif residual:
+            status = "attention"
+            conclusion = (
+                f"本实例为复制源端，下游 {len(rows)} 个从库 IO/SQL 线程均在运行{lag_txt}；"
+                + residual_note
+                + "残留通道应确认后清理或补全上游信息。"
+            )
+            recommendation = "持续监控复制延迟和错误日志；确认残留通道为历史遗留后清理（RESET REPLICA ALL）。"
+        else:
+            status = "normal"
+            conclusion = f"本实例为复制源端，下游 {len(rows)} 个从库 IO/SQL 线程均在运行{lag_txt}。"
+            recommendation = "持续监控复制延迟和错误日志；变更前确认切换机制与演练记录。"
+        evidence = [f"下游从库 {len(rows)} 个"]
+        if residual:
+            evidence.append(f"本机残留复制通道 {len(residual)} 条")
+        note = "本实例按复制源端处理；表中为声明以本实例为上游的从库。"
+        for section in primary.get("inspection_sections") or []:
+            for item in section.get("items") or []:
+                if item.get("item_id") != "mysql.replication.status":
+                    continue
+                item["display"]["rows"] = rows
+                item["display"]["shown_rows"] = len(rows)
+                item["display"]["total_rows"] = len(rows)
+                item["display"]["note"] = note
+                # 表里是拓扑推导出的下游从库，不是本机表行；来源与计数同步改写，
+                # 否则图注会出现"数据来源：本机 replica_status；原始记录：1 条"却列 2 行。
+                item["source"] = "topology.edges; 各节点 tables/replica_status.tsv"
+                item["collection"]["row_count"] = len(rows)
+                item["analysis"]["status"] = status
+                item["analysis"]["conclusion"] = conclusion
+                item["analysis"]["recommendation"] = recommendation
+                item["analysis"]["evidence"] = evidence
+        for entry in primary.get("comprehensive_conclusions") or []:
+            if entry.get("topic") == "复制与高可用":
+                entry["status"] = status
+                entry["conclusion"] = conclusion
+                entry["evidence"] = ["tables/replica_status.tsv", "topology.edges"]
+
     @staticmethod
     def _metric_commentary(instance: dict[str, Any]) -> dict[str, str]:
         """Generate data-driven commentary based on actual metric values.
