@@ -30,6 +30,8 @@ OS threshold or invent a fifth rule-id spelling.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime
+import re
 from typing import Any
 
 from .models import PackageContext
@@ -57,12 +59,16 @@ __all__ = [
     "lsblk_entries",
     "memory_total_kb",
     "normalize_os_metrics",
+    "ntp_clock_offset_seconds",
+    "ntp_verdict",
     "os_disk_rows",
+    "os_memory_available_min_bytes",
     "os_network_rows",
     "os_pressure_report",
     "os_pressure_verdicts",
     "os_resource_rows",
     "os_source",
+    "parse_timedatectl",
 ]
 
 # ---------------------------------------------------------------------------
@@ -571,6 +577,20 @@ def _summary_value(block: dict[str, Any], key: str, field: str) -> Any:
     return summary.get(field)
 
 
+def os_memory_available_min_bytes(metrics: dict[str, Any]) -> float | None:
+    """窗口内**最低可用内存**（``MemAvailable``，字节）；未采集时返回 None。
+
+    ``%memused``（SAR 与 /proc/meminfo 都给）把页缓存算作"已用"，单看它会把
+    "缓存占满、可用内存充足"的正常主机判成内存压力——这是内存规则长期误报的根因。
+    ``MemAvailable`` 是内核给出的可用于新分配的估计值，但**只有实时采样块里有**
+    （SAR 历史不采集该字段）。因此这个取值必然来自实时窗口；它只用于给历史窗口的
+    ``%memused`` 判定做复核，不参与挑选判定窗口。
+
+    取值收口在这里，插件不得自己去翻 ``system_realtime``。
+    """
+    return safe_float(_summary_value(_realtime_block(metrics), "memory_available_bytes", "min"))
+
+
 def os_resource_rows(metrics: dict[str, Any], *, source_label: str | None = None) -> list[dict[str, Any]]:
     """Build the shared 系统资源概要 table from the chosen OS window.
 
@@ -608,7 +628,7 @@ def os_resource_rows(metrics: dict[str, Any], *, source_label: str | None = None
 
     realtime = _realtime_block(metrics)
     available = _summary_value(realtime, "memory_available_bytes", "average")
-    available_min = _summary_value(realtime, "memory_available_bytes", "min")
+    available_min = os_memory_available_min_bytes(metrics)
     if available is not None:
         rows.append({
             "指标": "可用内存",
@@ -665,3 +685,133 @@ def _rate(block: dict[str, Any], key: str, field: str) -> str | None:
         return None
     rendered = format_bytes(value)
     return None if rendered is None else f"{rendered}/s"
+
+
+# ---------------------------------------------------------------------------
+# 时间同步（NTP）证据
+# ---------------------------------------------------------------------------
+# `timedatectl` 是判断"主机时间能不能信"的唯一实锤，而采集侧的
+# `snapshot.time_evidence.ntp_synchronized` 在部分采集版本里是空串（解析缺失），
+# `evidence/timedatectl.txt` 却一直有原文。判定口径收口在这里，插件不得各自
+# 从原文再解析一遍，也不得把"未启用持续同步源但已经对齐"与"真的没同步"
+# 混成同一条风险 —— 前者只需确认，后者才影响日志关联与复制诊断。
+
+_TIMEDATECTL_FIELDS = {
+    "Local time": "local_time",
+    "Universal time": "universal_time",
+    "RTC time": "rtc_time",
+    "Time zone": "time_zone",
+    "NTP enabled": "ntp_enabled",
+    "NTP synchronized": "ntp_synchronized",
+    "RTC in local TZ": "rtc_in_local_tz",
+    "DST active": "dst_active",
+}
+
+# `timedatectl` 的时钟写法：Mon 2026-09-21 10:34:22
+# `Local time` / `Universal time` 行尾还带时区缩写（CST / UTC），因此只截取
+# 时钟本体，不把后缀当输入 —— 否则 `strptime` 会因多余 token 整体失败。
+_TIMEDATECTL_CLOCK = "%a %Y-%m-%d %H:%M:%S"
+_TIMEDATECTL_CLOCK_RE = re.compile(r"(\w{3}\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+
+_TRUTHY = {"yes", "true", "1", "active", "on"}
+_FALSY = {"no", "false", "0", "inactive", "off"}
+
+
+def parse_timedatectl(text: Any) -> dict[str, Any]:
+    """把 ``timedatectl`` 原文解析成白名单键值对，其余行忽略。
+
+    只认已知字段：未知行不进结果，避免把发行版差异（新增/改名的行）当成判据输入。
+    """
+    evidence: dict[str, Any] = {}
+    for raw_line in str(text or "").splitlines():
+        if ":" not in raw_line:
+            continue
+        label, _, value = raw_line.partition(":")
+        key = _TIMEDATECTL_FIELDS.get(label.strip())
+        value = value.strip()
+        if key is None or not value:
+            continue
+        evidence[key] = value
+    return evidence
+
+
+def _timedatectl_clock(value: Any) -> datetime | None:
+    match = _TIMEDATECTL_CLOCK_RE.search(str(value or ""))
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), _TIMEDATECTL_CLOCK)
+    except ValueError:
+        return None
+
+
+def ntp_clock_offset_seconds(evidence: dict[str, Any]) -> float | None:
+    """RTC 与参考时钟的偏移（秒）；取不到返回 None。
+
+    ``RTC in local TZ: yes`` 时 RTC 存的是本地时间，必须与 ``Local time`` 比；
+    否则与 ``Universal time`` 比。只解析到分钟精度，因此结果精度也是分钟。
+    """
+    rtc = _timedatectl_clock(evidence.get("rtc_time"))
+    if rtc is None:
+        return None
+    reference_key = "local_time" if str(
+        evidence.get("rtc_in_local_tz", "")
+    ).strip().lower() in _TRUTHY else "universal_time"
+    reference = _timedatectl_clock(evidence.get(reference_key))
+    if reference is None:
+        return None
+    return abs((rtc - reference).total_seconds())
+
+
+def ntp_verdict(
+    evidence: dict[str, Any], *, offset_warning_seconds: float = 10.0
+) -> dict[str, Any]:
+    """按单个节点给时间同步结论，四档：``ok`` / ``attention`` / ``risk`` / ``unknown``。
+
+    - ``synchronized=no`` 且 RTC 偏移超过阈值 → ``risk``（有实锤）
+    - ``synchronized=no`` 但拿不到偏移 → ``attention``（未同步，但无法量化后果）
+    - ``enabled=no`` 且 ``synchronized=yes`` → ``attention``（未配持续同步源，需确认）
+    - ``synchronized=yes`` 且已启用同步源 → ``ok``
+    - 两个字段都拿不到 → ``unknown``（不判定，也不折叠成"通过"）
+
+    返回值里的 ``triggered`` 只把 ``risk`` 记为真：``attention`` 需要人工确认，
+    不具备"必须整改"的定性证据，规则引擎里落 ``passed``、呈现层落"提示"。
+    """
+    synchronized = str(evidence.get("ntp_synchronized", "")).strip().lower()
+    enabled = str(evidence.get("ntp_enabled", "")).strip().lower()
+    offset = ntp_clock_offset_seconds(evidence)
+    offset_rendered = None if offset is None else f"{offset:.0f} 秒"
+    facts: list[str] = [f"NTP synchronized={synchronized or 'unknown'}"]
+    if enabled:
+        facts.append(f"NTP enabled={enabled}")
+    if offset is not None:
+        facts.append(f"RTC 与参考时钟偏移 {offset_rendered}")
+
+    if synchronized in _FALSY:
+        if offset is not None and offset > offset_warning_seconds:
+            return {
+                "tier": "risk", "triggered": True,
+                "reason": f"主机时间未与 NTP 同步，RTC 偏移 {offset_rendered}",
+                "facts": facts,
+            }
+        return {
+            "tier": "attention", "triggered": False,
+            "reason": "主机时间未与 NTP 同步（无法量化偏移）",
+            "facts": facts,
+        }
+    if synchronized in _TRUTHY:
+        if enabled in _FALSY:
+            return {
+                "tier": "attention", "triggered": False,
+                "reason": "已对齐但未启用持续同步源，需确认同步方式",
+                "facts": facts,
+            }
+        return {
+            "tier": "ok", "triggered": False,
+            "reason": "主机时间同步状态正常", "facts": facts,
+        }
+    return {
+        "tier": "unknown", "triggered": False,
+        "reason": "本次未采集到可判读的时间同步证据",
+        "facts": facts if evidence else [],
+    }
