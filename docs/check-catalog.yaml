@@ -152,6 +152,7 @@ report_sections:
       - {id: mysql.capacity.objects, source: tables/object_counts.tsv}
       - {id: mysql.capacity.risks, source: "tables/no_primary_key_summary.tsv; tables/non_innodb_tables.tsv; tables/auto_increment_usage.tsv; tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; tables/unused_indexes.tsv"}
       - {id: mysql.capacity.risk_details, source: "tables/no_primary_key_top.tsv; tables/non_innodb_tables.tsv; tables/fragmentation_top.tsv; tables/redundant_indexes.tsv; tables/unused_indexes.tsv; tables/auto_increment_usage.tsv"}
+      - {id: mysql.capacity.programmable_objects, source: "tables/routines.tsv; tables/events.tsv"}
   - id: sql_io
     title: "SQL、等待与文件 I/O 检查"
     items:
@@ -203,7 +204,7 @@ known_mapping_gaps:
   - "采集项、规则和报告项尚无统一 check manifest；本文件目前是人工冻结目录。"
   - "plugins/mysql/inspection_rules.json 只配置元数据和阈值，新增规则仍需修改 plugins/mysql/rules.py。"
   - "部分采集项只用于能力判断或派生指标，不直接出现在 Word。"
-  - "events、routines、triggers、schema_privileges、table_io_top、open_tables 等已采集，但当前没有独立报告 item。"
+  - "events、routines 已落报告 item mysql.capacity.programmable_objects；triggers、schema_privileges、table_io_top、open_tables 等已采集，但当前仍没有独立报告 item。"
   - "备份检查只能看到主机侧线索，不能证明备份成功或可恢复。"
   - "所有 TSV 缺少逐检查项 schema_version，字段变化当前依赖 MySQL package adapter/metrics 兼容。"
   - "当前两个报告 item 使用 analysis.status=ok，其余正常项使用 normal；统一报告契约时需要版本化迁移。"

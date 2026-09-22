@@ -804,3 +804,622 @@ TYPE 恒紧随其后，于是 TYPE 之后第一个 token 是 SIZE、之后首个
 
 **作用域**：`attach_topology_replication()` 只作用于**源端实例**；多实例报告正文仍只取 `instances[0]`
 （§22.17 末段），从库实例不单独成节 —— 本次未动契约，基线无需因本项刷新（单实例基线无 `edges`，函数直接返回）。
+
+---
+
+### 22.20 采集层三缺陷的外部复核回吐（F-28 / F-29 / F-30）
+
+**触发**：把三套 MySQL 8.0.30 生产采集包（一主两从）绕过分析层、直读原始字节做独立复核，得到 3 条与采集层 / 契约
+相关的结论，回吐到 `docs/mysql-collector-fix-plan.md` 批 4。**其中 2 条初版判断经复核被推翻，1 条影响面被高估**。
+
+**① F-28 `long_transactions.query_sample` 保留裸 CR【已改脚本】**
+
+根因：MySQL 客户端 batch 模式的转义集合是 LF / TAB / NUL / 反斜杠，**不含 CR**。`collect_mysql_performance`
+里 processlist 项（L1243）做了 `REPLACE`，long_transactions 项（L1230）漏了 → 同包两个同类采集项口径不一致。
+
+初版误判："270 行中 244 行是碎片行"。按字节复核：文件实为 28 个 LF 行 = 表头 + 26 行数据，**每行 7 个 TAB、结构完好**；
+LF / TAB 早已被客户端转义（F-01 生效）。"270 行"是通用换行读取（Python 文本模式把裸 CR 认作换行）产生的假象。
+
+修法：`query_sample` 补成**三层 REPLACE**（CR / LF / TAB 各清一次）。列名未变 → `known_tsv_header` 不动。
+
+**② F-29 快照 `global_status.tsv` 不含 `Com_*`【不改采集，写死口径】**
+
+根因：主查询走 `performance_schema.global_status`，而 P_S 状态表**按设计排除 `Com_xxx`**（手册 10.14；Bug #87645
+官方判 by design，引 WL#6629）。**不是白名单问题** —— 脚本对该文件没有任何列裁剪，三包均为 317 行、`Com_` 只有
+`Com_stmt_reprepare`。
+
+初版把影响写成"分析层派生 TPS = `nan`"，**复核后确认是误判**：`plugins/mysql/metrics.py` 本就取
+`timeseries/mysql_status.csv` 的 `Com_commit` / `Com_rollback` 逐点差分（`MYSQL_COUNTERS`），实测
+`mysql_realtime.tps.average` = **51.87 / 17.66 / 5.07**（`.34` / `.125` / `.33`）完全正常；`ctx.global_status`
+全仓**只有赋值处、无读取处**，是个死字段。后果因此从"下游算不出"降级为"契约没写清、下游可能误用"。
+
+修法（选 B，不改采集）：`docs/mysql-collector-interface.md` 新增 **§8.4** 写死口径「派生 TPS / 读写比一律用
+`timeseries/mysql_status.csv` 差分，勿用 `global_status.tsv`」；`inspection_core/models.py` 与
+`plugins/mysql/package_adapter.py` 的字段旁各加注释。
+
+**③ F-30 `accounts.tsv` 的 `host` 可为空串【不改采集】**
+
+根因：源端 `mysql.user.Host` 本身就是空串（旁证：同包 `schema_privileges.tsv` 的 GRANTEE 渲染为 `'user'@''`）。
+按 MySQL 8.0 手册 8.2.6，**空串等价于 `%`（any host，排序在 `%` 之后）**。28 行中 10 行为空，含核心业务账号 `emr`。
+
+初版误判："采集丢字段、来源未知、须现场补齐" —— **方向相反**，实际是"任意主机可连"，暴露面被反向低估。
+
+修法：不改 SQL、不改 `known_tsv_header`；契约 §8.4 写明语义，分析层把 `host IN ('%','')` 合并计入"任意主机可连"
+并单列 `host=''`。
+
+**验证**：`bash -n inspection/mysql_inspection_standard.sh` rc=0；`query_sample` 行经字节比对确认为三层 REPLACE
+（文件 129,663 → 129,720 字节，+57）。回归 `pytest tests/test_mysql_{metrics,package_adapter,providers}.py
+tests/test_inspection_core.py` → **11 passed / 4 failed**，4 项失败全部是缺
+`mysql_inspection_v1_db01_192.168.100.80_3306_20260811_160102.tar.gz` 夹具的预存在失败（与本轮无关，零回归）。
+`docs/mysql-collector-interface.md` §8.4 与 `docs/mysql-collector-fix-plan.md` 批 4 已同步。
+
+**作用域**：F-28 只改采集脚本的 SQL 表达式（列集与 `item_id` 均不变）；F-29 / F-30 只改契约文档与 Python 注释，
+**不改任何分析逻辑 → 基线无需刷新**。方法论留档：复核采集包**先看字节**（以二进制打开读原值）；**看到"空"先在
+包内找旁证**，**看到"缺"先查源表语义** —— 这三条本轮全踩过。
+
+### 22.21 配置表跨节点对比与行级判定（最小验证）+ 一个吞判据的死分支
+
+**触发**：用户拿外部（LLM）独立报告对标自己的分析层，指出「参数表是 `参数/采集值/说明` 单实例三列，
+没有跨节点并排与行级判定」，而多实例巡检里配置漂移是最高价值产出。选定「最小验证」范围：
+只把 `mysql.config.durability` 一组做成对比表，看效果再铺开。
+
+**① 顺带发现的真缺陷：`_config_recommendation` 有一整段死代码**
+
+`plugins/mysql/presentation.py` 的分支写的是 `elif item_id == "mysql.config.persistence"`，而该组的真实
+`item_id` 是 `mysql.config.durability`（同文件 `variable_groups` 定义处）。全仓搜 `mysql.config.persistence`
+**只有这一处**、`docs/check-catalog.yaml` 里也没有这个 id —— 分支从未执行过。
+
+被吞掉的检查里恰好包括 **`replica_skip_errors` 非 OFF**、`binlog_format≠ROW`、`sync_binlog≠1`、
+`slow_query_log=OFF`、`binlog_expire_logs_seconds=0`。而 `plugins/mysql/rules.py` 里没有任何
+`replica_skip_errors` 规则 —— **所以「静默跳过复制错误」这条 P0 此前既没进规则、也没进建议。**
+
+实测证据（同输入同顺序 A/B：`_work/llm_review/baseline` vs 现产物）：
+
+- `instances[1]`（`.125`）建议新增 `replica_skip_errors=1032 → 跳过复制错误会导致主从数据静默不一致，强烈建议设为 OFF`；
+- `instances[2]`（`.33`）新增 `replica_skip_errors=1032,1062 → …`；
+- 两者的 `mysql.config.durability` 状态 `normal → attention`；
+- `comprehensive_conclusions[0]`（配置组）从「1 / 2 组存在可优化项」变为「2 / 3 组」。
+
+修法：`elif item_id in ("mysql.config.durability", "mysql.config.persistence")`（保留旧 id 兼容）。
+
+**② 跨节点对比 + 行级判定（本轮只作用于 durability 组）**
+
+新增 `MySQLPresentationBuilder.attach_config_comparison(analysis)`，在 `AnalyzerV2.analyze` 里紧跟
+`attach_topology_replication(analysis)` 之后调用 —— 拓扑就绪才能取到各节点 `role_effective`。
+
+- **取数**：`build_inspection_model(ctx, metrics)` 是逐实例调用的，顺带把 `ctx.variables` 记进
+  `self._variables_by_instance[instance_id]`（builder 在 `AnalyzerV2.__init__` 只建一次）；没有这层缓存时
+  （手工构造的 analysis、单测）回退 `facts.key_variables`，取不到的参数显示「未采集」而不是 0。
+- **列结构**：N≥2 且拓扑可解析 → `参数 / .33（源） / .34 / .125 / 判定`；N=1 或「N≥2 但拓扑未解析」→
+  退化为 `参数 / 采集值 / 判定` 并在 `display.note` 说明原因，**绝不生成空节点列**。
+- **判定三态**：`达标 / 不达标 / 不适用`，由 `_durability_verdict()` 按角色与形态给出并附一句依据。
+  角色守卫：`log_bin` / `gtid_mode` / `enforce_gtid_consistency` 在单实例落「不适用」；
+  `enforce_gtid_consistency` 在 `gtid_mode` 未开启时也不生效；`binlog_format` / `sync_binlog` /
+  `binlog_expire_logs_seconds` 只在开启了 binlog 的节点上判；`innodb_flush_log_at_trx_commit` 与形态无关，恒判。
+- **单一来源**：参数清单抽成模块级 `DURABILITY_VARIABLES`，表格行与判定行共用一份定义。
+
+**实测**（`_work/llm_review/pkgs` 下三包直跑 `analyze.py`）：
+
+```
+Binary Log（log_bin）                        | ON     | ON     | ON     | 达标
+Binlog 格式（binlog_format）                 | ROW    | ROW    | ROW    | 达标
+GTID 模式（gtid_mode）                       | ON     | ON     | ON     | 达标
+GTID 一致性（enforce_gtid_consistency）      | ON     | ON     | ON     | 达标
+Binlog 同步策略（sync_binlog）               | 1      | 1      | 1      | 达标
+事务日志刷盘策略（innodb_flush_log_at_trx_commit） | 1 | 1      | 1      | 达标
+Binlog 保留秒数（binlog_expire_logs_seconds）| 259200 | 432000 | 432000 |
+    不达标（节点间保留期不一致（3 天 / 5 天），按时间点恢复的窗口不同）
+```
+
+Word 渲染核对：生成 `.docx` 后第 29 张表表头即 `['参数', '.33（源）', '.34', '.125', '判定']` 五列 ——
+`inspection_core/word_engine.py` 的 `data_table` 按 rows 的列名动态建列，**加列零成本**。
+
+**验证**：
+
+- 逐字段精确 diff（排除时间戳 / 耗时 / `input_packages` 路径）：`llm_input.json` **0 处差异**；
+  `analysis.json` 与 `report_model.json` 的实质差异**只落在 durability 一项**（+ 上述死分支连锁）；
+  `collection.row_count` 保持 **644**（`global_variables` 的真实采集行数），**未被改成 7**。
+- 合成 analysis 覆盖 6 种形态：N=3 / N=2 一主一从 / N=1 单实例 / N≥2 但拓扑未解析 / 无缓存回退 /
+  反例（持久性、格式、GTID 全偏）—— 全部符合预期，单实例下 3 项正确落「不适用」而非「达标」。
+- 三包跑完 finding 数 **28 条逐一同 id**（与改动前一致）→ 规则层零影响。
+- `pytest tests/` → **184 passed / 5 failed**，5 项全是缺
+  `mysql_inspection_v1_db01_192.168.100.80_3306_20260811_160102.tar.gz` 夹具的预存在失败（零新增）。
+
+**作用域**：只改 `plugins/mysql/presentation.py`（新增方法 + 死分支修复）与 `plugins/mysql/analyzer.py`
+（一行接线）。采集脚本、`docs/check-catalog.yaml`、`word_engine.py`、`llm_input.json` 契约均未动。
+
+### 22.22 多实例报告的主体锚定与风险台账合并（阶段 19，用户审报告发现）
+
+**触发**：用户拿外部（LLM）独立报告对标后追问「为什么我的总结中少那么多东西」「也不说是哪个 IP 参数有问题」
+「我的主库是 33，应该以主库为主」。核实确认根因在**数据层而非表达层**。
+
+**① 风险台账只取 `instances[0]`（最严重）**
+
+`plugins/mysql/presentation.py::build_report_model` 取 `findings = primary.get("findings", [])`，
+`security` 与 `optimization_plan` 都由这一份派生。三节点实测：`overall_health_summary` 计到
+4 high / 15 medium / 9 low，而 `risk_register` 只有 **8 条**（与单实例基线逐条相同）—— 其余节点的风险不可见。
+PostgreSQL（`plugins/postgresql/analyzer.py` 的 `all_findings`）与 Oracle（`plugins/oracle/presentation.py`
+的 `findings_all`）都是全实例合并，**MySQL 是唯一例外**。
+
+**② 正文主体随传包顺序漂移**
+
+`build_report_model` 取 `instances[0]`；`instances` 由 `build_instance_results` 按 `zip(contexts, ...)`
+即命令行顺序排列；`_topology_sort_key` 只作用于 `topology.nodes`。同一份数据换个传参顺序，报告就换主角。
+连带：`attach_topology_replication` 以 `instances[0]` 判断"是否源端"，非源端顺序下**整段不生效**。
+
+**③ `requires_restart` 有数据、无渲染**
+
+`inspection_rules.json` 已声明该字段（`MYSQL.INNODB.BUFFER_POOL_RATIO`），`word_engine.py` 全文 **0 次**引用。
+
+**修法**
+
+| 文件 | 改动 |
+| --- | --- |
+| `plugins/mysql/analyzer.py` | 新增 `Analyzer.order_instances_by_topology()`；在 `build_topology` 之后重排 `instance_results`。节点不足两个、或存在对不上 `node_id` 的实例时保持原序（不猜、不丢实例） |
+| `plugins/mysql/presentation.py` | 新增 `_merged_findings()` 与 `_instance_node_label()`；`findings` 改为全实例合并，finding_id 全局连续重排（各实例原本都从 R001 起，直接拼接会撞号）；`node` 键**仅在 N≥2 时**注入 |
+| `inspection_core/word_engine.py` | `build_risk_register_professional`：findings 带 `node` 时增加「节点」列（6 列），`requires_restart` 为真时在处置建议后追加「（该变更需重启实例生效）」 |
+
+**为什么 `node` 只在 N≥2 时注入**：单实例正文本来就是它，加列没有信息量；更重要的是
+`tests/test_mysql_presentation.py::test_report_builder_matches_frozen_report_contract`
+以 `tests/baselines/mysql/current/{analysis,report_model}.json` 做冻结契约比对，
+无条件注入会让单实例输出漂移、打穿该测试（首轮实测确实打穿了：6 failed）。
+
+**实测**（`_work/llm_review/pkgs` 三包，故意按 `.34 / .125 / .33` 传参）：
+
+- `analysis.instances` 重排为 `.33 / .34 / .125`；`report_model.overview.ip = 192.168.1.33`（源端）
+- `risk_register` **8 → 28 条**（`.33` 10 / `.34` 8 / `.125` 10），编号 R001–R028 连续，
+  级别 4 / 15 / 9 与 `overall_health_summary` **首次自洽**
+- `optimization_plan` P1 / P2 / P3 = 4 / 15 / 9；`security` 3 条（三节点的远程 root 账户）
+- Word 风险表渲染为 6 列 `编号 / 节点 / 级别 / 风险事项 / 事实依据 / 处置建议`，28 行
+- 合成一条 `requires_restart=True` 的 finding → 处置建议渲染出「（该变更需重启实例生效）」
+
+**验证**：`pytest tests/` → **184 passed / 5 failed**，5 项全是缺 8/11 夹具的预存在失败（零新增）；
+冻结契约测试恢复 PASS。
+
+**遗留（需用户决策，未动代码）**：`health_assessment` 仍取主体实例的 `health_summary`
+（`.33` 29 分 / `.34` 51 分 / `.125` 37 分），首页显示 29/100 + 2 / 5 / 3，与 28 条台账的 4 / 15 / 9 矛盾。
+评分口径为 `base 100, high −15, medium −7, low −2`，三节点直接相加会把集群分压成 **0 分**，语义不对，
+故未擅自改成"汇总"。
+
+**作用域**：`plugins/mysql/presentation.py` / `plugins/mysql/analyzer.py` / `inspection_core/word_engine.py`
+三个文件。采集层、`docs/check-catalog.yaml`、`llm_input.json` 契约未动。`word_engine` 的改动
+**对其他插件零影响**（PG / Oracle 的 findings 不带 `node` 键，走原 5 列）。
+但**基线指纹会变**：单实例包同样会带上「判定」列与新的 `参数` 单元格格式，且死分支修复会改变 durability 组的
+建议与状态 —— 已在 `tests/baselines/mysql/current/README.md` 追加说明。
+
+**留档的方法论**：**判据写进代码 ≠ 会执行。** 改判定逻辑之前，先用「生产者的 id / 消费者的 id 是不是同一个
+字符串」核一遍分支可达性 —— 本次这条 P0 被吞了整整一轮巡检，报告上完全看不出来。
+
+**未做（加分题，另开一轮）**：`_config_recommendation` 的 `base` 句在参数**齐全**时仍输出
+「对缺失参数确认版本适用性」，读起来别扭；而 `has_specific` 判定依赖 `startswith("对缺失参数")` 这个前缀，
+改文案必须同时改启发式，属另一轮的事。
+
+### 22.23 反哺分析层：8 条判据进引擎 + 节点级归属呈现（阶段 20，用户对标外部报告）
+
+**触发**：用户把外部（LLM）三节点独立报告与《可沉淀清单_反哺分析层.md》一起丢过来，质问
+「你没从这 2 个文件中吸收沉淀到我的分析层吗」「也不说是哪个 IP 参数有问题」，并追加
+「总结要说明是哪个比如 33 34 或者 125，不然我不知道是哪台有问题」。诉求分两层：**判据要真进引擎**
+（不能只写在技能文档里），**结论/判定/事实必须落到具体节点**。
+
+**① 8 条判据从「文档里写着」变成「引擎里执行」**
+
+`inspection_rules.json` 25 → 33 条（version 仍 2.0），`globals` 增
+`memory_available_floor_percent` / `swap_usage_warning`：
+
+| rule_id | 数据来源 | 判据要点 |
+| --- | --- | --- |
+| `MYSQL.TRANSACTION.ISOLATION_LEVEL` | `transaction_isolation` 变量 | `READ-UNCOMMITTED` / `READ UNCOMMITTED` 触发 |
+| `MYSQL.INNODB.REDO_CAPACITY` | 状态变量 `Innodb_redo_log_capacity_resized` | 阈值 `redo_capacity_min_bytes`；缺则退旧参数推算、再退变量值，事实里写明用的哪层证据 |
+| `MYSQL.REPLICATION.SKIP_ERRORS` | `replica_skip_errors` + 真实复制通道数 | 非 OFF 且确有通道 → 错误会被静默跳过 |
+| `MYSQL.REPLICATION.REPLICA_WRITABLE` | `read_only` / `super_read_only` / `event_scheduler` 三点闭合 | 源端 `not_applicable`；副本可写即触发 |
+| `MYSQL.INNODB.DEADLOCK` | `evidence/innodb_status.txt` 的 `LATEST DETECTED DEADLOCK` | 报最近一次死锁时间与发起线程 |
+| `MYSQL.SYSTEM.TRANSPARENT_HUGEPAGE` | `tables/hugepages.tsv` | `always` 触发（MySQL 官方建议 never/madvise） |
+| `MYSQL.SYSTEM.IDENTITY_CONFLICT` | **跨实例**比对 hostname / machine-id | 见 ② |
+| `COMMON.SYSTEM.SWAP_PRESSURE` | `memory_snapshot` swap 使用率 | 阈值 `swap_usage_warning` |
+
+`rules.py` 新增 7 个 `_check_*` 并注册进 `run()`。规则总数实测 `rules=33`。
+
+**② 跨实例判据必须在后处理阶段做**
+
+规则引擎逐实例执行、看不到对端，所以 `MYSQL.SYSTEM.IDENTITY_CONFLICT` 只能放在
+`AnalyzerV2.analyze()` → 新增的 `attach_cluster_findings()`（仅 N≥2）里：调用
+`plugins/mysql/rules.py::evaluate_identity_conflicts()`，把 finding 挂到 **IP 最小**的节点上，
+`facts` 列全成员，再并入各实例的 `findings` / `rule_evaluations`，重算 `health_summary`
+与 `overall_health_summary`。实测两组冲突：`.33` 与 `.125` 主机名相同（machine-id 不同）；
+`.33` 与 `.34` machine_id 相同（克隆未 sysprep）。
+
+**③ R001 内存长期误报消除**
+
+SAR `%memused` 把页缓存计入"已用"，三节点 24h 峰值 99.7~99.8%，但 `MemAvailable` 尚有
+42 / 102 / 99 GiB。`RuleEngine._memory_verdict()` 在 `MEMORY_PRESSURE` 触发时叠加复核：
+窗口内**最低可用内存** ≥ 总量 × `memory_available_floor_percent`（10%）则改判 `passed`，
+并把依据写进事实。**取值收口在公共层**（`inspection_core.system_checks.os_memory_available_min_bytes`），
+插件不得自己翻 `system_realtime`（见 ⑤）。三节点实测全部 `passed`。
+
+**④ 配置对比从 1 组铺到 4 组，判定列点名节点**
+
+`presentation.py` 提 `CONFIG_GROUP_VARIABLES`（memory / connection / durability / charset 四组参数的
+**唯一来源**，表头与判定共用），`attach_config_comparison` 遍历四组调 `_config_verdict` 分发；
+新增 `_node_value_groups` 把各节点取值按同值聚合渲染（`.33（源）=3 天；.34、.125=5 天`），
+`_drift_verdict` / `_memory_config_verdict` / `_connection_config_verdict` / `_charset_config_verdict`
+逐组给专属理由。设计上**故意**让 `innodb_redo_log_capacity` 落「不适用」并注明「变量值不代表实际容量」，
+把读者引到风险台账的 `MYSQL.INNODB.REDO_CAPACITY`。四组实测列均为
+`['参数', '.33（源）', '.34', '.125', '判定']`，判定列点名节点（如「`.34` 取 fsync」、
+「`.125` 的 `collation_server`、`time_zone`」）。
+
+**⑤ 节点级归属呈现（本轮用户诉求的核心）**
+
+| 位置 | 改动 |
+| --- | --- |
+| 首页健康分 | `health_assessment` 增 `nodes` 明细（每节点 hostname / 角色 / score / 高 / 中 / 低）+ `scope_note`；`word_engine.build_summary_v31` 渲染 7 列分节点健康表 |
+| 综合结论 | `comprehensive_conclusions` 增「节点风险分布」+ 逐节点风险清单；每条带 `node`；`word_engine` 综合结论表与管理结论表加「节点」列（条件 `has_node`） |
+| 风险台账 | 沿用 22.22 的 6 列（含节点），本轮 40 条：`.33` 16 / `.34` 12 / `.125` 12 |
+
+**⑥ 本轮抓到的两个新增回归（已修）**
+
+改完跑全量发现 7 failed（基线应为 5），多出的两条都是被这两个守卫测试抓住的**真缺陷**：
+
+- `test_os_common_layer.py::test_plugin_sources_do_not_recompute_the_window` ——
+  `_memory_verdict` 里写了 `metrics.get("system_realtime")`，等于插件自己挑数据窗口，
+  正是该守卫要防的事。修法：在公共层加 `os_memory_available_min_bytes(metrics)`，
+  `rules.py` 改为调用它（`system_realtime` 字面量从插件消失）。
+- `test_rule_pack_config.py::test_every_requested_key_is_declared_somewhere` ——
+  `self._threshold(CANONICAL_RULE_IDS["memory_pressure"], ...)` 把**小写字面量** `memory_pressure`
+  塞进了 `_threshold(...)` 参数里，被「按调用内小写字面量抽键」的抽取器误当成配置键。
+  修法：按既有风格先 `rule = CANONICAL_RULE_IDS["memory_pressure"]` 再传变量。
+
+**实测**（`_work/llm_review/pkgs` 三包 → `out_b`）：
+
+- `analysis` 40 条风险：高 11 / 中 20 / 低 9；`health_assessment.nodes` = `.33` score 0（高4/中9/低3）、
+  `.34` score 0（高4/中5/低3）、`.125` score 7（高3/中6/低3）
+- 批 B 规则逐节点状态：`.33` 隔离/redo/skip_errors/deadlock/THP/标识冲突触发、`REPLICA_WRITABLE`
+  = `not_applicable`（源端）；`.34` 额外触发 `REPLICA_WRITABLE`；`.125` 额外触发 `SKIP_ERRORS` + `SWAP_PRESSURE`；
+  三节点 `MEMORY_PRESSURE` 全部 `passed`
+- Word：`table[4]` 分节点健康表(7 列) / `table[5]` 综合结论(4 列含节点) / `table[27–30]` 四组配置对比(5 列) /
+  `table[55]` 风险台账(6 列 41 行) / `table[59]` 管理结论(5 列含节点)
+
+**验证**：`pytest tests/` → **184 passed / 5 failed / 31 subtests**，5 项全是缺 8/11 夹具的预存在失败
+（零新增）。
+
+**作用域**：`plugins/mysql/{rules.py, presentation.py, analyzer.py}`、`plugins/mysql/inspection_rules.json`、
+`inspection_core/{word_engine.py, system_checks.py}`。采集层与 `docs/check-catalog.yaml` 未动。
+本轮的 `system_checks.py` 改动是**加函数**（新增导出 `os_memory_available_min_bytes`），
+对 PG / Oracle 零影响。**基线指纹会变**：finding 数 28(22.22 后) → 40，且新增节点列/健康分表 —— 已在
+`tests/baselines/mysql/current/README.md` 追加说明。
+
+**留档的方法论**：「判据写在文档/技能里」与「判据由引擎执行」是两件事，验收必须落到
+**引擎输出的 `rule_evaluations`**；节点归属必须在**数据层**（finding 带 `node`）解决，
+表达层只负责渲染，否则改一处漏一处。
+
+---
+
+### 22.24 批 C：把清单 A/B/C/D/E/F/J 六类漏检与口径缺陷真正落地
+
+**触发**：批 B 汇报后复核《可沉淀清单_反哺分析层.md》，发现清单里 **A/B/C/D/E/F/J 六大类仍未落地**。
+逐条核对采集包原文后确认其中两条清单结论本身有误（见"勘误"），是本轮返工的起点。
+
+**逐条根因 → 修法**
+
+1. **B4/C4 时间同步过度判定**：`rules._check_time_sync` 只读 `snapshot.time_evidence.ntp_synchronized`；
+   呈现层 `system.time` 三节点统一判 `risk`。实测 `.33`/`.34` 的 RTC 与 UTC 完全对齐、只有
+   `NTP enabled=no`，`.125` 才真偏移 131 秒。
+   → 公共层加 `parse_timedatectl()` / `ntp_clock_offset_seconds()` / `ntp_verdict()`（三档：
+   `synchronized=no` 且 RTC 偏移 >10s → risk；`enabled=no` 但 `synchronized=yes` → attention；否则 ok）；
+   `metrics.time_evidence()` 用 `evidence/timedatectl.txt` **只补空值不覆盖**采集值；规则与呈现共用。
+
+2. **B3 备份"未采集 ≠ 0"**：原 `_check_backup` 把"文件存在但 0 字节"判成"未发现任何备份任务"。
+   实测 `.34`/`.125` 三个 `evidence/backup_*.txt` 全是 **0 字节**，`.33` 的 `backup_cron.txt` 有 118 字节
+   但两行都是注释。
+   → 四态：文件不存在 → 未采集；存在但全 0 字节 → `not_evaluated`（无法判定）；有内容但全被注释 →
+   `triggered`（唯一可判"无"）；有未注释任务 → 通过。`metrics.backup_task_visibility()` 单一来源，
+   规则与 `mysql.backup` 结论同源。
+
+3. **B2/B10/B5/B9 计数与排序口径**：
+   - 自增容量原拿"采集明细条数"当风险对象数（100 条 = 100 个风险），实测最高使用率仅 **22.79%**；
+     → 改按 `used_pct` 阈值判定，明细行给"剩余量"绝对值（`{:,}` 千分位）。
+   - 碎片明细原按采集端碎片率倒序，TOP 被"分配 0.02 MB / 空闲 18 MB"的极小表占满；
+     → 呈现改按 `data_free_mb` 重排，规则按 `data_free_mb ≥ 100MB` 判（`.33` 5,748MB / `.125` 6,014MB）。
+   - Binlog 呈现受 `_select_rows(..., 20)` 截断，结论只写"已配置 20 个 Binlog 文件"，实际三包是
+     **74 / 129 / 131 个**；→ 补 `metrics.binlog_totals()`，结论报"文件数 + 合计容量 + 最早/最新"，
+     明细仍只铺 20 行但明确标注"前 20 条"。
+   - 非 InnoDB 按引擎分档：`MEMORY` → 重启即丢数据（`.33`/`.34`/`.125` 各 1 张 `test_patlist`）。
+   - **顺带修掉一个错列**：`object_counts.tsv` 的 `no_engine_objects` 在 MySQL 里恒等于视图数
+     （实测 37/37、138/138、138/138），呈现层却把它标成"非 InnoDB"，与 `non_innodb_tables.tsv`
+     的 1 张自相矛盾 → 改为按 `non_innodb_tables.tsv` 逐 Schema 真实计数。
+
+4. **B7/B6 结论一致性**：
+   - 「复制与高可用」主题结论写死 `未发现副本或集群成员运行证据`，与同章表格（源端有残留通道、
+     从库有运行通道）直接打架 → 改由本实例复制行推导（线程停 → risk；通道在跑 → normal；
+     只有指向自身的残留通道 → attention 源端；一条都没有 → attention 单实例）。
+   - 长事务 / SQL 摘要结论补「本节点采集时点 / 本节点采集窗口内」，避免被读成全集群结论。
+
+5. **A6/A7/B11 四条新规则进引擎**（规则包 33 → **38**）：
+   - `COMMON.SYSTEM.LOG_ROTATION`：单文件 >1GiB 提醒、>10GiB 告警（`severity_override=high`）；
+     并用 `global_status.tsv` 的 `Uptime` 折算**日增速率**。实测 `.34` error **132.89 GB**（≈1.54 GB/天）、
+     `.125` slow **51.28 GB**（≈194 MB/天）、`.33` error **16.09 GB**（≈633 MB/天）。
+   - `MYSQL.SECURITY.BINLOG_UNENCRYPTED`：三节点 `Encrypted=No` ×74 / ×129 / ×131。
+   - `MYSQL.CAPACITY.BINLOG_SIZE`：总量 >50GiB（73.3 / 129.1 / 130.8 GiB）。
+   - `MYSQL.REPLICATION.RETENTION_DRIFT`（跨实例，新增到 `attach_cluster_findings` 的求值器元组）：
+     源端 `.33`=259200s，副本 `.34`/`.125`=432000s → 倒挂。
+   - `MYSQL.CONFIG.RUNTIME_DRIFT`：`metrics.config_runtime_drift()` 比对
+     `mycnf_allowlist.tsv` vs `global_variables.tsv`。**归一化是这条规则的成败点**：按字符串比会把
+     `200M`↔`209715200`、`1`↔`ON`、`/usr/local/mysql`↔`/usr/local/mysql/` 全报成漂移
+     （首版实测 `.125` 报了 28 处，其中 25 处是假阳性）。改为分域比较（`bool`/`size`/`number`/`text`），
+     跨域（`log_bin` 路径 vs `ON`）直接跳过；`expire_logs_days` 走别名映射到
+     `binlog_expire_logs_seconds`（×86400）；`open_files_limit`/`table_open_cache` 因 MySQL 会按
+     OS 限制自动下调而列入排除集。去噪后实测：`.33` 1 处（`long_query_time` 1→5）、
+     `.34` 2 处（`long_query_time` 文件内自相矛盾 5/1、`super_read_only` 1→OFF）、
+     `.125` 4 处（`server_id` 100125/125、`log_bin` 两个不同路径、`expire_logs_days` 7→5 天、
+     `max_connections` 16000→4190）。
+
+**勘误（清单本身的错，已随本轮修正）**
+
+- 清单 C5 称"Binlog 采集端 LIMIT 截断"→ 实测 `tables/binary_logs.tsv` 是 **74 / 129 / 131 行**，
+  截断发生在**呈现层** `_select_rows(..., 20)`，采集端没问题。
+- 清单把"自增容量 100 条"当风险数 → 实际那 100 条是采集端按使用率倒序的明细，最高仅 22.79%。
+
+**实测**（三包 → `out_c`）：`analysis` **50 条风险：高 14 / 中 24 / 低 12**（批 B 后为 40，
+差额 = 新增 13 条 − 自增容量不再误报 3 条）。逐节点新规则状态：
+
+| rule_id | .33（源） | .34 | .125 |
+|---|---|---|---|
+| LOG_ROTATION | 触发（high 16.09 GB） | 触发（high 132.89 GB） | 触发（high 51.28 GB） |
+| BINLOG_UNENCRYPTED | 74/74 | 129/129 | 131/131 |
+| BINLOG_SIZE | 73.29 GB | 129.09 GB | 130.81 GB |
+| RUNTIME_DRIFT | 1 处 | 2 处 | 4 处 |
+| RETENTION_DRIFT | —（锚在 `.34`，事实列全成员） | 触发 | 触发 |
+| BACKUP.TASK_VISIBILITY | 触发（全注释） | `not_evaluated`（0 字节） | `not_evaluated`（0 字节） |
+| TIME_SYNC | attention（偏移 0） | attention（偏移 0） | **risk（偏移 131s）** |
+
+Word：`table[4]` 分节点健康表(7 列) / `table[5]` 综合结论(4 列) / `table[27–30]` 四组配置对比(5 列) /
+`table[31]` 配置文件白名单 / `table[49]` 日志表(6 列含"大小") / `table[52]` Binlog 表(3 列) /
+`table[55]` 风险台账(6 列 51 行，含节点) / `table[59]` 管理结论(5 列)。
+
+**验证**：`pytest tests/` → **184 passed / 5 failed / 31 subtests**，5 项全是缺 8/11 夹具的预存在失败。
+中途曾出现**新增失败** `test_object_detail_item_lists_candidates_with_source_columns`：
+我把自增明细的"关键信息"由 `已用 22.79%（bigint）` 改成追加"剩余百分比"，破坏了断言。
+修法是**保留原措辞、只在采集到 `remaining` 时追加绝对值**（`已用 22.79%（bigint），剩余 7,121,722,...`），
+断言与真实数据同时满足 —— 而不是去改测试。
+
+**作用域**：`plugins/mysql/{rules.py, metrics.py, presentation.py, analyzer.py, inspection_rules.json}`、
+`inspection_core/system_checks.py`（加 `parse_timedatectl` / `ntp_clock_offset_seconds` / `ntp_verdict`）。
+采集层未动、`docs/check-catalog.yaml` 未动。**基线指纹会变**（finding 40 → 50，多个 item 的结论与列结构变化），
+已在 `tests/baselines/mysql/current/README.md` 追加说明。
+
+**留档的方法论**：跨实例判据一律落在 `attach_cluster_findings` 的**求值器元组**里（本轮从 1 个扩到 2 个），
+不要在插件里各写一遍；新旧值比较类判据（配置漂移）**必须先做域归一**，否则单位/写法差异会淹没真信号——
+"报出来 28 条里 25 条是假的"比"没报"更伤报告可信度。
+
+---
+
+### 22.25 批 D：A9/A10/A12/A13 四条漏检落地（2026-09-22 第五轮）
+
+**触发**：清单 N6 把 A9/A10/A12/A13 列为"数据齐、没判据"的下一批候选。这四条都是**单实例内部事实**
+（A 类形态无关），不依赖对端、不需要角色守卫，但数据源各不相同：两个读 `global_status` 计数器、
+一个读 `large_tables_top`、一个扫多张对象表的表名。
+
+**逐条根因 / 修法 / 实测**：
+
+| 清单 | rule_id | 判据 | 三节点实测 |
+|---|---|---|---|
+| A9 | `MYSQL.RUNTIME.TABLE_CACHE`(medium) | `Open_tables >= table_open_cache`（顶格）或 `Opened_tables/Uptime > 20/s` | `.33` 顶格(4000/4000)+25.9/s、`.125` 顶格(683/400)、`.34` 通过 |
+| A10 | `MYSQL.RUNTIME.CONNECTION_ERRORS`(medium) | `Aborted_connects/Connections > 5%`，并提示 `max_connect_errors` 偏低封禁风险 | `.33` 20.1%、`.34` 10.8%（两者 max_connect_errors=1000 偏低）、`.125` 0.47% 通过 |
+| A12 | `MYSQL.CAPACITY.LARGE_TABLE`(low) | `large_tables_top.total_mb > 102400`（100 GiB）；`index_mb=0` 追加全表扫描提示 | `.33` 3 张、`.34` 3 张（`tb_doc_html` 111GB 且 index_mb=0）、`.125` 无 |
+| A13 | `MYSQL.SCHEMA.TEST_TABLE_LEFTOVER`(low) | 命名模式 `^test_` / `_bak\d+` / `_\d{4}$` / `_copy\d+$` | 三节点各命中 15 / 12 / 14 个（test_patlist、tb_template_bak*、tb_template_*_0728、admission_copy1 等） |
+
+**两个口径决策（都在落地前用三包数据核对过）**：
+
+1. **A13 剔除 `_duplication` 模式**：清单原模式含 `_duplication`，但实测该子串只会命中
+   `*_duplicationcheck`（"查重"业务表，如 `warddrugapply_duplicationcheck`、
+   `feechargerecord_duplicationcheck`），不是复制残留，收进来全是误报。改为只保留四个有实测证据的模式。
+2. **A13 的 `scanned` 返回值**：`leftover_table_items` 返回 `(items, scanned)`，`scanned` 是扫到的
+   含表名列的采集表数量，用于区分"没有残留"（passed）与"没采集到任何表信息"（not_evaluated）——
+   延续"未采集 ≠ 0"的硬规则。
+
+**关于 A9 的连带项（清单称"R003 编号复用"）**：核实后**不是缺陷**。`finding_id` 是按触发顺序动态编号
+（`R{len+1:03d}`），不同节点触发的规则不同、R003 指向不同规则是 by design，不是"编号复用 bug"。
+现有的 `MYSQL.PERFORMANCE.TABLE_CACHE_MISS`（采样窗口差分算未命中比例）与新增的
+`MYSQL.RUNTIME.TABLE_CACHE`（顶格 + 打开速率）是两个互补信号，不冲突、不合并。
+
+**实测**（三包 → `out_d`）：风险 **59 条：高 14 / 中 28 / 低 17**（批 C 为 50，净增 9 条 =
+A9 2 节点 + A10 2 节点 + A12 2 节点 + A13 3 节点）。逐节点新规则命中：
+
+| 节点 | 命中 |
+|---|---|
+| `.33`（源） | TABLE_CACHE、CONNECTION_ERRORS、LARGE_TABLE、TEST_TABLE_LEFTOVER（4 条全中） |
+| `.34` | CONNECTION_ERRORS、LARGE_TABLE、TEST_TABLE_LEFTOVER（3 条） |
+| `.125` | TABLE_CACHE、TEST_TABLE_LEFTOVER（2 条） |
+
+风险台账 `node` 列正确（`.33`→R019–R022、`.34`→R039–R041、`.125`→R058–R059）。
+
+**验证**：`pytest tests/` → **184 passed / 5 failed / 31 subtests**，5 项全是缺 8/11 基线夹具的预存在失败，
+**零新增回归**（改动不触碰冻结契约 —— 单实例路径不新增 finding 分支，`node` 仍只在 N≥2 注入）。
+
+**作用域**：`plugins/mysql/{metrics.py, rules.py, inspection_rules.json}`（`metrics.py` 新增
+`global_status_value` / `large_table_items` / `leftover_table_items`；`rules.py` 新增 4 个 `_check_*`；
+规则包 38 → 42 条）。呈现层、采集层、`docs/check-catalog.yaml` 均未动（新规则全进既有风险台账与
+`overall_health_summary`，无需新章节）。基线指纹会变（finding 50 → 59）。
+
+### 22.26 批 E：Word 展示层聚合与着色（2026-09-22 第六轮）
+
+**触发**：用户拿《可沉淀清单》对账，确认「分析层已基本吃干净（A 组 16 条吸收 14 条、B/J 全落地），
+缺口全在 Word 展示层」。第一批做四件事，全部**不需要扩图表渲染器、也不需要改采集脚本**。
+
+| 项 | 清单 | 改动 | 实测 |
+|---|---|---|---|
+| BACKUP 标题与触发态矛盾 | — | `MYSQL.BACKUP.TASK_VISIBILITY.title`：`未发现备份任务配置` → `备份任务配置未生效` | 四态里 empty/absent 是 `triggered=False` 不产生 finding，**唯一会触发的是 disabled 态**，其事实是"配置 2 条、全部被注释" → 原 title 在风险台账里渲染成"未发现…／证据：2 条"，自相矛盾且违反「禁用未发现」 |
+| events / routines 呈现 | E⑨ | 新增 item `mysql.capacity.programmable_objects`（8.5 节） | 存储程序 464 个（过程 413 / 函数 51）+ 24 个事件清单（Schema/事件名/状态/周期/最后执行/定义者） |
+| 待客户确认事项章节 | E③ | `CONFIRMATION_TEMPLATES` + `pending_confirmations()` + `attach_pending_confirmations()` + Word 第 14 章 | 16 项（`.33` 8 / `.34` 5 / `.125` 3），每条带节点 |
+| 参数对比表偏离着色 | F1 | `table(status_column=)` + `data_table` 自动识别「判定」列 | 不达标 `9B1C1C`+粗体 / 达标 `222222` / 不适用 `666666` |
+
+**四个防止回归的设计决策**：
+
+1. **`pending_confirmations` 必须条件注入**：`build_report_model` 只在键存在时才写入。冻结契约测试
+   `test_report_builder_matches_frozen_report_contract` 是对 `report_model.json` 做**逐字典等值比对**，
+   而它喂的是**旧基线 analysis.json**（不含该键）→ 不注入 → 契约继续通过。这与 §22.22 把 `node`
+   限制在 N≥2 注入是同一类约束。
+2. **按「已触发的规则」派生，不写第二份判据**：模板是 `rule_id → (主题, 问题)` 的映射。规则引擎已经
+   回答"这是不是风险"，本表只回答"要客户确认什么"。因此不存在两处口径打架的可能，也不会因新增规则
+   而漏配（未配模板的规则只是不进表，不会产生错误结论）。
+3. **判定列着色用前缀匹配**：单元格形如「不达标（.34 取 fsync/fdatasync，双重缓冲）」，说明文字在
+   括号里，等值比较会让**所有带说明的行全部失色**。列名「判定」是 MySQL 配置对比表的固定契约；
+   `mysql.config.file` 的表没有该列（实测其 35 行无判定键），自动不触发。
+4. **章节编号顺延**：待确认事项插在「分级整改与闭环计划」(13) 与「综合结论与管理建议」之间，
+   后者 `5+N → 6+N`、附录 `6+N → 7+N`。渲染层的编号是硬编码表达式，改了一处必须同步另一处。
+
+**待确认事项的派生口径**：只收两类规则 —— 需要业务语义决策的（副本定时事件归属、脏读依赖）、
+以及数据库侧无法自证的（备份可恢复性）。纯技术整改项（日志轮转、redo 容量、无主键表）**不进表**：
+那些直接改就行，问了只增加沟通成本，还会把清单做成第二个风险台账。此外多实例追加一条
+「节点间参数漂移是否有意设计」（呈现层结论、无对应 rule_id，只挂主体实例一次），
+其比对白名单 `CONSISTENCY_VARIABLES` 只含语义上应一致的参数，**刻意排除容量与规格类**
+（buffer pool、io capacity、连接数）——后者按节点硬件取值本就合理，报成漂移会淹没真问题。
+
+**实测**（三包 → `out_e`）：风险 **59 条：高 14 / 中 28 / 低 17**，**与批 D 逐项一致**（本轮不动规则层）；
+Word **67 张表**（批 D 为 65，+2 = 待确认事项表 16 行 + 事件清单 24 行）；章节编号
+`12 风险登记册 → 13 分级整改 → 14 待客户确认事项 → 15 综合结论 → 16 附录` 正确。
+
+**验证**：`pytest tests/` → **184 passed / 5 failed / 31 subtests**，5 项全是缺 8/11 基线夹具的预存在失败，
+**零新增回归**。
+
+**作用域**：`plugins/mysql/{presentation.py, analyzer.py, __init__.py, inspection_rules.json}`、
+`inspection_core/word_engine.py`、`docs/check-catalog.yaml`（新增 item 登记 + 从 `known_mapping_gaps`
+移除 events/routines）。
+
+**已知限制（本轮未做）**：`inspection_sections` 仍只渲染**主体实例**，因此 8.5 节呈现的是源端 `.33` 的
+24 个事件（全部 `ENABLED`），看不到 `.34` 上的 4 个 `SLAVESIDE_DISABLED`。这与 §22.22 只修风险台账
+是同一类限制（当时只合并了 `findings`，没动 `inspection_sections`）；要合并章节级数据会牵动所有 item
+的呈现方式与单实例冻结契约，另开一轮评估。
+
+**下一批候选**：F2 风险×节点矩阵（可用 Word 单元格着色实现，无需扩渲染器）、
+F3 慢 SQL TOP10 条形图 / F5 计数器横向对比柱状图（**须先给 `inspection_core/charts/render.py` 加
+bar 支持** —— 当前 `_render_matplotlib` 只有 `axis.plot` 折线，报告里 6 张图全是趋势线）、
+E⑥ 数据一致性与可靠性独立章节、D5 章尾「本章不确定项」、A15/A16。
+
+### 22.27 批 F：风险分级 × 节点矩阵（2026-09-22 第七轮）
+
+**触发**：《可沉淀清单》F2 —— 「风险压在哪台」原先只能靠通读几十条台账自己数。
+
+| 层 | 文件 | 改动 |
+|---|---|---|
+| 呈现层 | `plugins/mysql/presentation.py` | 新增 `_risk_matrix()`（classmethod）+ `RISK_MATRIX_SEVERITIES`；`build_report_model` 条件注入 `risk_matrix` |
+| 渲染层 | `inspection_core/word_engine.py` | 新增 `_risk_matrix_table()` + `RISK_MATRIX_STYLES` / `RISK_MATRIX_PEAK_FILL`，接在 12 章「登记口径」之后、台账明细之前 |
+| 测试 | `tests/test_mysql_risk_matrix.py`（新增） | 6 条边界用例 |
+
+**三个防止回归的设计决策**：
+
+1. **数据源就是台账本身**（`_merged_findings` 的产物），不另算一份口径 —— 矩阵必须与登记册逐条对得上，
+   否则同一章里两张表自相矛盾。实测各行合计之和 = 59 = 登记册条目数，且逐节点计数与台账现场统计三处
+   （矩阵 / `risk_register` / 各实例 `health_summary.counts`）完全一致。
+2. **行集合来自拓扑层，不来自 findings**：按 findings 反推行集合会把「一条风险都没有」的节点整行丢掉，
+   而「哪台干净」本身就是读者要的信息。行序取 `topology.nodes`（源端第一），**不得依赖调用者传包先后**
+   —— 实测把三包按 `.125 → .33 → .34` 传入，输出的 `instances` 与 `topology.nodes` 仍归一成
+   `.33(源) → .34 → .125`，矩阵行序不变；拓扑不可用时退化为 IP 字符串序，同样与传包顺序无关。
+3. **中文列头只在渲染层翻译**：呈现层只给英文档位（`severity_columns`），渲染层用 `SEVERITY_CN` 出表头，
+   保证严重度中文词汇表只有一处定义。未登记的新档位自动成列，否则各列之和小于合计、读者会以为算错。
+
+**着色口径**：只区分「该节点有没有这一级别的风险」，**不做数量渐变** —— 渐变需要图例，Word 表格里没
+地方放，客户看到深浅会问「这个颜色什么意思」。高危 `F6DEDE`+`9B1C1C` 粗体 / 中危 `FBF0DC`+`B26A00` /
+低危 `F2F2F2`+`6B5A00`；合计最高的一行加 `EDEDED` 底纹（并列最高时都标，不人为取舍）。
+
+**实测**（三包 → `out_f3`）：矩阵 3 行 × 5 列，`.33（源）` 5/12/7=24、`.34` 5/7/6=18、`.125` 4/9/4=17；
+Word 表数 67 → **68**，章节编号 `12 风险登记册 → 13 → 14 → 15 → 16` **不变**（矩阵不新增章节）。
+`pytest tests/` → **190 passed / 5 failed / 31 subtests**，5 项仍是缺 8/11 基线夹具的预存在失败，**零新增回归**。
+
+**作用域**：`plugins/mysql/presentation.py`、`inspection_core/word_engine.py`、`tests/test_mysql_risk_matrix.py`。
+单实例不注入该键（`_risk_matrix` 返回 `None`）→ 冻结的单实例报告契约不受影响。
+
+**顺带撞出的两个问题（本轮未修，待决策）**：
+
+1. `plugins/mysql/analyzer.py:75 stage()` 的 `finally` 在 **`BaseException`**（非 `Exception`）路径下
+   `status` / `reason` 未赋值 → 抛 `UnboundLocalError`，把真实异常整个顶掉。实测被环境的批量删除拦截
+   触发时，报错只剩 `ERROR: cannot access local variable 'status' where it is not associated with a value`，
+   真实原因完全丢失（当时误以为是自己改的矩阵炸了，排查绕了一圈）。修法：`try` 之前先
+   `status, reason = "running", ""`。
+2. `analyze.py` 的 `build_command()` **不透传** `--keep-extracted`（本体有这个参数）。AGENTS.md 明写
+   「统一入口的参数面必须是各库本体的超集」，并已点名 `unrecognized arguments` 这类事故；这里是
+   **静默不透传** —— 参数不报错、只是不生效，比报错更隐蔽。
+
+**下一批候选**：F3 慢 SQL TOP10 条形图 / F5 计数器横向对比柱状图（**须先给 `inspection_core/charts/render.py`
+加 bar 支持** —— 当前 `_render_matplotlib` 只有 `axis.plot` 折线）、E⑥ 数据一致性与可靠性独立章节、
+D5 章尾「本章不确定项」、A15/A16，以及上面顺带撞出的两条。
+
+
+### 22.28 批 G：摘要位瘦身 + 采集消费面审计修复（2026-09-22 第八轮）
+
+**触发**：用户反馈「我最上面的综合总结，全堆在一起，谁看的下去」，同时问「分析层还有没有可吸收的、
+是否通用（别换了包就不行）」。
+
+**问题定位（先量化再动手）**：第 1.1 节把 `comprehensive_conclusions` 原样拼成 `{topic}：{conclusion}`
+塞进一个单元格。三节点实测 **10 条 / 6585 字**，其中 4 条是「逐节点风险清单」，最长单条 **1988 字**
+（把该节点全部高/中/低风险标题与事实串成一句），且与第 12 章风险登记册逐条重复。同一份数据在第 15 章
+又渲染了一遍 —— 1 章与 15 章职责重叠，摘要位干了明细的活。
+
+| 层 | 文件 | 改动 |
+|---|---|---|
+| 呈现层 | `plugins/mysql/presentation.py` | 结论条目新增 `scope`（`cluster` / `node_detail`）；节点风险清单的 `conclusion` 由 1988 字压成一句计数摘要 + 指向第 12 章；节点风险分布删掉「高风险集中在：…」的条目标题罗列（那是明细）；顺带删除因此失去用途的 `locate()` / `highs_all` |
+| 渲染层 | `inspection_core/word_engine.py` | 1.1 只渲染 `scope != node_detail` 的条目；新增 **1.2 高风险项速览**（从 `risk_register` 现取 high，一行一条，带节点）；1 章小节号改为动态（`_summary_sub`），有速览时「管理关注与处置节奏」自动顺延为 1.3 |
+| 工具 | `tools/coverage_audit.py` | 修 evidence 读取模式漏判（见下） |
+| 测试 | `tests/test_mysql_summary_digest.py`（新增） | 5 条边界用例 |
+
+**四个防止回归的设计决策**：
+
+1. **数据层打 `scope`，渲染层不靠文案猜**。判断「哪条是明细」必须靠结构化字段，不能靠
+   `topic.endswith("节点风险清单")` 这种文案匹配 —— 文案一改就静默失效。
+2. **明细标题不得出现在任何结论条目里**。这是防「重新堆起来」的闸门，`test_detail_titles_never_leak_into_conclusions`
+   逐条断言明细标题不出现在 `conclusion` 中；压缩可以，但信息不能丢（计数、健康分、指向第 12 章都在）。
+3. **单实例路径逐字不变**：单实例直接 `return base`，条目不带 `scope`，1.1 自然全量渲染；速览表取
+   `risk_register` 里带 `node` 的条目，而 `node` 键只在 N≥2 注入 → 单实例报告不会多出这张表。
+   冻结契约（`report_model.json` 逐字典等值比对）实测 PASS。
+4. **风险速览取现成台账，不另算判断**。渲染层只做筛选+截断（`facts[:2]`，90 字上限），不重新计算
+   严重度或结论。
+
+**实测**（三包 → `out_h`）：`comprehensive_conclusions` 合计 **6585 → 1105 字（-83%）**；1.1 表
+10 行 → **7 行**，单格最长 **1988 → 239 字**；明细条目由 4864 字压到 **259 字/3 条**。Word 表数
+68 → **69**，1 章小节 `1.1 综合结论 → 1.2 高风险项速览 → 1.3 管理关注与处置节奏`，章节主编号
+`12 → 13 → 14 → 15 → 16` **不变**。`pytest tests/` → **195 passed / 5 failed / 31 subtests**
+（190 + 新增 5 条），5 项仍是缺 8/11 基线夹具的预存在失败，**零新增回归**。
+
+**顺带修掉的真缺陷（`tools/coverage_audit.py`）**：evidence 类的「真读取」模式只认单字符串路径
+`root / "evidence/x.txt"`，而项目里有两种更常见的写法被抓漏：
+
+- 两段式路径：`ctx.root / "evidence" / "timedatectl.txt"`（`metrics.py` / `rules.py`）
+- 目录变量 + 文件名常量：`evidence_dir = ctx.root / "evidence"`，`BACKUP_EVIDENCE_FILES = (...)`
+  再 `evidence_dir / name`（`metrics.py::backup_task_visibility`）
+
+后果是**每次审计都稳定报 5 项假阳性**（`timedatectl.txt`、`backup_cron/processes/timers.txt`、
+`innodb_status.txt` 全被打成「仅声明未读取」），而这几项上一轮刚确认过是真读的。补齐后实测
+evidence 类 **真读取 3 → 8、仅声明 4 → 0**，总账 `采集 83 / 真读取 49 → 54 / 仅声明 5 → 1 / 无人提 29 → 28`。
+**这类假阳性的危害是反向的**：它让「这条证据没人读、是缺口」的结论站不住，从而可能催生重复实现。
+
+**分析层通用性核查结论**（回答「换包会不会不行」）：
+
+- **零客户特征硬编码**：`plugins/mysql` 全目录 grep 业务 schema 名 / 主机名前缀 / 内网 IP 段均无命中 ——
+  库名、IP、主机名全部来自采集数据，判据不含环境常量。
+- **零 `missing`**：`coverage_audit` 的「源码读取但包内不存在」档为空（历史踩过 `rules.py` 读
+  `backup_evidence` 而采集端从不产出该表），说明不存在「读了某包不会有的键」这类换包即崩的写法。
+- **形态覆盖的边界是复制形态，不是客户**：主从（含一主多从）形态内判据通用（三态判定 + 角色守卫）；
+  但 **MGR / Galera 形态采集了却零分析** —— `group_replication_members.tsv`（87B 有内容）、
+  `group_replication_stats.tsv`（212B）、`wsrep_status.tsv` / `wsrep_variables.tsv` 均无人读取。
+  换成 MGR 或 PXC 的客户包，这一整块是哑的。这是「换包就不行」唯一坐实的场景。
+
+**分析层可吸收清单（按通用性排序，均已有数据、待实现）**：
+
+| 优先 | 采集项 | 实测数据量 | 缺口 |
+|---|---|---|---|
+| 1 | `history/sar_io.csv` / `sar_load.csv` / `sar_network.csv` / `sar_process.csv` | 18–116 KB | OS 历史只消费了 cpu/disk/memory/swap 四路，半数 SAR 数据零消费；IO await/%util、网络丢包重传、负载趋势都缺 |
+| 2 | `tables/inodes.tsv` | 548–694 B | 文件系统章节只报容量，不报 inode 用尽（小文件多的库是真实宕机原因） |
+| 3 | `tables/table_io_top.tsv` / `open_tables.tsv` | 5.4–5.8 KB / 163–222 B | 表级 IO 热点与表级打开数；现只有全局 `file_io_top` 与状态变量口径 |
+| 4 | `tables/replication_channels.tsv` / `replication_workers.tsv` | 266–887 B | 多源复制通道与并行复制（MTS）配置零消费，复制分析不完整 |
+| 5 | `tables/schema_privileges.tsv` | 1951 B | 库级授权最小化未评价（端口只为全局/主机级账号） |
+| 6 | `evidence/chronyc_tracking.txt` / `chronyc_sources.txt` | 26 B | 时间同步只判 `timedatectl` 的布尔同步位，不看时间源质量 |
+| 7 | `evidence/mycnf_path.txt` / `mycnf_includes.txt` | 12–71 B | 多配置文件（include）场景下，配置漂移判据可能读不到全部配置 |
+| 8 | MGR / Galera 形态支持 | 见表 | 见上，属独立立项（新增形态分支，非补一条规则） |
+
+**留档豁免（不补分析，写明理由即可）**：`redacted_findings.txt`（脱敏结果留档）、
+`tables/error_log_samples.tsv` 与 `partition_summary.tsv` / `triggers.tsv`（本包 41–47 B 仅表头，
+属客户环境偶然，按 AGENTS.md「不凭单包决定补什么」先记录不实现）。
+
+**作用域**：`plugins/mysql/presentation.py`、`inspection_core/word_engine.py`、
+`tools/coverage_audit.py`、`tests/test_mysql_summary_digest.py`。
+
+
