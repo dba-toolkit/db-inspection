@@ -18,12 +18,23 @@ from inspection_core import (
     safe_float,
     safe_int,
 )
-from inspection_core.system_checks import disk_media, is_persistent_fstype
+from inspection_core.system_checks import (
+    disk_media,
+    is_persistent_fstype,
+    ntp_clock_offset_seconds,
+    ntp_verdict,
+)
 from plugins.mysql.metrics import (
+    backup_task_visibility,
+    binlog_totals,
+    config_runtime_drift,
     local_host_names,
+    log_file_entries,
+    mysql_uptime_seconds,
     replica_threads_running,
     row_number,
     split_self_referencing_replica_rows,
+    time_evidence,
 )
 
 
@@ -41,6 +52,118 @@ MYSQL_SYSTEM_SCHEMAS = frozenset({
 # 才知道是哪几张表；这里把各类前 N 项直接落到正文，其余留在证据文件里。
 OBJECT_DETAIL_PER_KIND = 5
 
+# 「日志、持久性与复制参数」组的参数清单。报告表格与跨节点对比共用这一份定义，
+# 避免展示行与判定行各写一遍而错位。
+DURABILITY_VARIABLES: tuple[tuple[str, str], ...] = (
+    ("log_bin", "Binary Log"),
+    ("binlog_format", "Binlog 格式"),
+    ("gtid_mode", "GTID 模式"),
+    ("enforce_gtid_consistency", "GTID 一致性"),
+    ("sync_binlog", "Binlog 同步策略"),
+    ("innodb_flush_log_at_trx_commit", "事务日志刷盘策略"),
+    ("binlog_expire_logs_seconds", "Binlog 保留秒数"),
+)
+
+
+# 四组配置检查项的**唯一参数清单**：报告表格、跨节点对比、判定列全部读这一份，
+# 避免「展示的行」和「判定的行」各写一遍而错位。
+CONFIG_GROUP_VARIABLES: dict[str, tuple[tuple[str, str], ...]] = {
+    "mysql.config.memory": (
+        ("innodb_buffer_pool_size", "InnoDB Buffer Pool"),
+        ("innodb_buffer_pool_instances", "Buffer Pool 实例数"),
+        ("innodb_redo_log_capacity", "Redo Log 容量（变量值）"),
+        ("innodb_log_file_size", "单个 Redo 文件大小"),
+        ("innodb_log_files_in_group", "Redo 文件个数"),
+        ("innodb_log_buffer_size", "Redo Log Buffer"),
+        ("innodb_flush_method", "InnoDB 刷盘方式"),
+        ("innodb_io_capacity", "InnoDB IO 容量"),
+        ("innodb_io_capacity_max", "InnoDB IO 容量上限"),
+        ("innodb_adaptive_hash_index", "自适应哈希索引"),
+    ),
+    "mysql.config.connection": (
+        ("max_connections", "最大连接数"),
+        ("thread_cache_size", "线程缓存"),
+        ("table_open_cache", "表打开缓存"),
+        ("table_definition_cache", "表定义缓存"),
+        ("tmp_table_size", "内存临时表上限"),
+        ("max_heap_table_size", "MEMORY 表上限"),
+        ("open_files_limit", "打开文件上限"),
+        ("back_log", "连接等待队列"),
+        ("max_connect_errors", "连接错误上限"),
+    ),
+    "mysql.config.durability": DURABILITY_VARIABLES,
+    "mysql.config.charset": (
+        ("character_set_server", "服务端字符集"),
+        ("collation_server", "服务端排序规则"),
+        ("lower_case_table_names", "表名大小写策略"),
+        ("sql_mode", "SQL Mode"),
+        ("time_zone", "默认时区"),
+    ),
+}
+
+CONFIG_GROUP_TITLES: tuple[tuple[str, str], ...] = (
+    ("mysql.config.memory", "内存与 InnoDB 核心参数"),
+    ("mysql.config.connection", "连接、线程与缓存参数"),
+    ("mysql.config.durability", "日志、持久性与复制参数"),
+    ("mysql.config.charset", "字符集与 SQL 模式"),
+)
+
+# 「待客户确认事项」的模板，按**已触发的规则**派生（rule_id → 主题 / 问题）。
+# 刻意不重复判定：规则引擎已经回答"这是不是风险"，本表只回答"这件事要客户确认什么"。
+# 只收两类规则 —— 需要业务语义决策的（副本定时事件归属、脏读依赖）与数据库侧无法
+# 自证的（备份可恢复性）。纯技术整改项（日志轮转、redo 容量、无主键表）不进表：
+# 那些直接改就行，问了只增加沟通成本，还会把清单做成第二个风险台账。
+CONFIRMATION_TEMPLATES: dict[str, tuple[str, str]] = {
+    "MYSQL.BACKUP.TASK_VISIBILITY": (
+        "备份归属与恢复演练",
+        "本机没有可确认的生效备份任务。请确认备份由谁发起（本地脚本 / 备份平台 / "
+        "存储侧快照），并提供最近 3 次成功记录与至少 1 次恢复演练记录 —— "
+        "「有备份」以能恢复为准，不以存在任务配置为准。",
+    ),
+    "MYSQL.REPLICATION.REPLICA_WRITABLE": (
+        "副本定时事件的业务归属",
+        "副本上仍有 ENABLED 的写入型定时事件。请确认这些作业是否依赖「每个节点各自执行一份」"
+        "（例如自动生成费用、医嘱到期处理、病历拆分）；若否，应在副本侧收敛为 "
+        "SLAVESIDE_DISABLED 或改由外部调度统一发起。这属于业务语义决策，不由 DBA 单方面变更。",
+    ),
+    "MYSQL.REPLICATION.SKIP_ERRORS": (
+        "跳过复制错误的取舍与校验窗口",
+        "复制链路上配置了跳过错误，主从数据可能在无人察觉的情况下分叉。关闭前必须先完成一次"
+        "全量一致性校验并修复已积累的差异（否则复制会停在历史差异点上）。请确认该配置的引入"
+        "原因，以及可安排的一致性校验与修复窗口。",
+    ),
+    "MYSQL.TRANSACTION.ISOLATION_LEVEL": (
+        "隔离级别是否为应用侧要求",
+        "当前隔离级别允许读到未提交数据。请确认该取值是否为应用侧主动要求、是否存在依赖读未"
+        "提交数据的历史逻辑；否则建议调整为 READ-COMMITTED（动态参数，可先在低峰观察）。",
+    ),
+    "MYSQL.SYSTEM.IDENTITY_CONFLICT": (
+        "主机标识重复是否已知",
+        "集群内存在主机名或 machine-id 重复。请确认是否为模板克隆后未重置（会影响监控串数据、"
+        "systemd 实例标识、DHCP 标识与授权绑定），以及监控 / 备份侧是否已做过规避。",
+    ),
+    "MYSQL.CONFIG.RUNTIME_DRIFT": (
+        "配置值与运行值以哪一侧为准",
+        "配置文件与实例运行值存在不一致，下次重启会把线上行为改成配置文件里的版本。"
+        "请逐项确认期望值，并告知可安排的重启窗口（若需要）。",
+    ),
+    "MYSQL.RUNTIME.CONNECTION_ERRORS": (
+        "连接建立失败的来源",
+        "连接建立失败率偏高。请确认失败来源（连接池配置 / 防火墙 / SYN 半连接 / 口令错误）"
+        "是否已有记录，以便区分应用侧与网络侧问题。",
+    ),
+    "MYSQL.REPLICATION.RETENTION_DRIFT": (
+        "副本 Binlog 保留期与下游用途",
+        "副本的 Binlog 保留期长于源端。请确认副本是否需要保留 Binlog（是否存在级联复制或"
+        "下游消费者）；若不需要，可显著回收磁盘占用。",
+    ),
+    "MYSQL.REPLICATION.RESIDUAL_CHANNEL": (
+        "残留复制通道与历史角色互换",
+        "存在指向自身的残留复制通道，且 GTID 执行集可能包含非本集群的 UUID。请确认历史上是否"
+        "发生过主从角色互换；确认后清理残留通道，并在文档中固化当前角色基线，避免下次巡检重复误判。",
+    ),
+}
+
 
 def business_schema_names(rows: list[dict[str, Any]]) -> list[str]:
     """Return the non-system schema names present in ``tables/schemas.tsv``."""
@@ -52,8 +175,56 @@ def business_schema_names(rows: list[dict[str, Any]]) -> list[str]:
     return names
 
 
+def pending_confirmations(
+    instance: dict[str, Any], *, drift_note: str = ""
+) -> list[dict[str, Any]]:
+    """按已触发的规则派生「待客户确认事项」。
+
+    与风险台账的分工：台账答「是什么风险、怎么改」，本表答「哪几件事必须由客户拍板、
+    或必须由客户提供外部证据」。规则未触发则不进表 —— 没触发就说明本节点没有该问题，
+    不该把模板空转成一张「欢迎确认」清单。
+    """
+    node = str((instance.get("identity") or {}).get("ip") or "").strip()
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for finding in instance.get("findings") or []:
+        rule_id = str(finding.get("rule_id") or "").strip()
+        template = CONFIRMATION_TEMPLATES.get(rule_id)
+        if not template or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        items.append({
+            "topic": template[0],
+            "question": template[1],
+            "node": node,
+            "rule_id": rule_id,
+            "finding_id": finding.get("finding_id"),
+            "evidence": list(finding.get("facts") or []),
+        })
+    if drift_note:
+        items.append({
+            "topic": "节点间参数漂移是否有意设计",
+            "question": (
+                "集群内存在多组参数取值不一致。请确认这些差异是有意设计（例如按节点硬件规格或"
+                "读负载分别调优），还是缺少统一配置模板；若为后者，建议先收敛成基线模板再逐节点"
+                "下发，否则故障切换后性能表现不可预期。"
+            ),
+            "node": node,
+            "rule_id": "",
+            "finding_id": "",
+            "evidence": [drift_note],
+        })
+    return items
+
+
 class MySQLPresentationBuilder:
     """Build MySQL inspection sections and the report model."""
+
+    def __init__(self) -> None:
+        # 跨实例对比需要其它节点的运行参数。build_inspection_model 是逐实例调用的，
+        # 这里顺手记下各实例的 global_variables，供 attach_config_comparison 使用；
+        # 手工构造的 analysis 没有这层缓存，届时回退 facts.key_variables。
+        self._variables_by_instance: dict[str, dict[str, str]] = {}
 
     @staticmethod
     def _row_number(row: dict[str, str], *keys: str) -> float | None:
@@ -266,7 +437,7 @@ class MySQLPresentationBuilder:
                     "长时间未使用的连接占用内存和文件描述符，建议设为 600-1800 秒（10-30 分钟）"
                 )
 
-        elif item_id == "mysql.config.persistence":
+        elif item_id in ("mysql.config.durability", "mysql.config.persistence"):
             flush_log = str(v.get("innodb_flush_log_at_trx_commit", "")).strip()
             sync_binlog = str(v.get("sync_binlog", "")).strip()
             if flush_log != "1" or sync_binlog != "1":
@@ -398,11 +569,12 @@ class MySQLPresentationBuilder:
         self, ctx: PackageContext, metrics: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Build the report-ready evidence model while the extracted package is available."""
+        self._variables_by_instance[ctx.instance_id] = dict(ctx.variables)
         status = self._status_index(ctx)
         snapshot = ctx.snapshot
         identity = snapshot.get("instance_identity", {})
         host = snapshot.get("host_identity", {})
-        time_info = snapshot.get("time_evidence", {})
+        time_info = time_evidence(ctx)
         role = snapshot.get("role_evidence", {})
         mysql = metrics.get("mysql_realtime", {})
         sampling = metrics.get("sampling_context", {})
@@ -438,33 +610,35 @@ class MySQLPresentationBuilder:
         def value_row(name: str, value: Any, description: str = "") -> dict[str, Any]:
             return {"检查项": name, "采集值": value, "说明": description}
 
-        def evidence_line_count(name: str) -> int:
-            path = ctx.root / "evidence" / name
-            if not path.exists():
-                return 0
-            return sum(
-                1
-                for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
-                if line.strip()
-            )
-
         # 备份：采集端只提供"任务配置可见性"（cron / systemd timer / 备份进程），
-        # 现场证据无法证明"最近一次备份成功"或"可恢复"。三者按实际内容分档，
-        # 与规则 MYSQL.BACKUP.TASK_VISIBILITY 保持同一事实来源。
-        backup_sources = ("backup_cron.txt", "backup_processes.txt", "backup_timers.txt")
-        backup_lines = sum(evidence_line_count(name) for name in backup_sources)
-        backup_seen = any((ctx.root / "evidence" / name).exists() for name in backup_sources)
-        if backup_lines:
+        # 现场证据无法证明"最近一次备份成功"或"可恢复"。四态分类与规则
+        # MYSQL.BACKUP.TASK_VISIBILITY 共用 metrics.backup_task_visibility ——
+        # 尤其是"文件存在但 0 字节"必须落"无法判定"，不能被写成"没有备份任务"。
+        backup = backup_task_visibility(ctx)
+        if backup["state"] == "active":
             backup_status = "attention"
             backup_conclusion = (
-                "已取得备份任务配置线索，但任务配置不等同于最近一次备份成功；"
+                f"已取得 {backup['active_lines']} 条生效的备份任务配置线索，"
+                "但任务配置不等同于最近一次备份成功；"
                 "备份可恢复性仍需备份平台结果与恢复演练证据确认。"
             )
-            backup_evidence = [f"备份任务配置 {backup_lines} 条（cron / systemd timer / 备份进程）"]
-        elif backup_seen:
+            backup_evidence = [
+                f"生效的备份任务配置 {backup['active_lines']} 条（cron / systemd timer / 备份进程）"
+            ]
+        elif backup["state"] == "disabled":
+            backup_status = "attention"
+            backup_conclusion = (
+                "备份任务配置存在但全部处于注释状态，本机没有生效的备份任务；"
+                "备份有效性仍需备份平台结果与恢复演练证据确认。"
+            )
+            backup_evidence = [f"备份任务配置 {backup['commented_lines']} 条，全部被注释"]
+        elif backup["state"] == "empty":
             backup_status = "not_evaluated"
-            backup_conclusion = "已取得备份任务配置文件但内容为空，既无法判定备份任务是否存在，也不能判定备份有效。"
-            backup_evidence = ["备份任务配置文件存在但无有效内容（cron / systemd timer / 备份进程）"]
+            backup_conclusion = (
+                "已取得备份任务配置文件但内容为空（0 字节），既无法判定备份任务是否存在，"
+                "也不能判定备份有效。"
+            )
+            backup_evidence = ["备份任务证据文件存在但内容为空；空文件不能推出\"没有备份任务\""]
         else:
             backup_status = "not_evaluated"
             backup_conclusion = "采集包未包含可验证的最近备份成功记录与恢复演练证据，因此不能判定备份有效。"
@@ -492,13 +666,30 @@ class MySQLPresentationBuilder:
             *([value_row("磁盘介质", disk_media_label, "数据目录所在磁盘的介质类型")] if disk_media_label else []),
             value_row("本地目标", "是" if host.get("database_target_is_local") else "否", "主机指标是否适用于数据库实例"),
         ]
-        ntp_value = str(time_info.get("ntp_synchronized", "")).lower()
-        ntp_ok = ntp_value in {"yes", "true", "1", "active"}
+        # 时间同步按节点分档（判据见公共层 ntp_verdict）：
+        # `synchronized=no` 且有 RTC 偏移实锤 → risk；`enabled=no` 但已对齐 → attention。
+        # 原来只看 `ntp_synchronized` 是否等于 yes，采集侧该字段为空串时三台全判 risk，
+        # 把两台时间其实正确的主机也算进风险。
+        ntp = ntp_verdict(time_info)
+        ntp_tier = ntp["tier"]
+        offset_seconds = ntp_clock_offset_seconds(time_info)
         time_rows = [
             value_row("本地时间", self._format_host_time(time_info.get("host_local_time")), "采集时主机时间"),
-            value_row("时区", time_info.get("timezone"), "主机时区"),
-            value_row("NTP 同步", time_info.get("ntp_synchronized"), "系统时间同步状态"),
+            value_row("时区", time_info.get("time_zone") or time_info.get("timezone"), "主机时区"),
+            value_row("NTP 同步", time_info.get("ntp_synchronized"), "systemd-timedatectl 的 NTP synchronized 读数"),
+            value_row("NTP 已启用", time_info.get("ntp_enabled"), "是否配置了持续同步源（NTP enabled）"),
+            value_row("RTC 时间", time_info.get("rtc_time"), "硬件时钟读数"),
+            value_row(
+                "RTC 偏移",
+                None if offset_seconds is None else f"{offset_seconds:.0f} 秒",
+                "RTC 与参考时钟的绝对偏差；超过 10 秒判风险",
+            ),
         ]
+        time_recommendation = {
+            "risk": "启用并验证企业时间同步服务（chrony / ntpd），统一数据库节点时区。",
+            "attention": "确认该主机的时间对齐方式（虚拟化平台校时或手工校时），必要时启用持续同步服务。",
+            "unknown": "本次未采集到 timedatectl 证据，请补充采集后再判定时间同步。",
+        }.get(ntp_tier, "")
         capacity = metrics.get("capacity", {})
         # 指标层已按公共判据过滤过一次；这里再筛一次，是为了让"旧分析产物"
         # （analysis.json 里仍带着全量挂载点）重新生成报告时同样干净。
@@ -612,55 +803,10 @@ class MySQLPresentationBuilder:
             30,
         )
 
+        # 参数清单与跨节点对比共用 CONFIG_GROUP_VARIABLES，两者不可能错位。
         variable_groups = [
-            (
-                "mysql.config.memory",
-                "内存与 InnoDB 核心参数",
-                [
-                    ("innodb_buffer_pool_size", "InnoDB Buffer Pool"),
-                    ("innodb_buffer_pool_instances", "Buffer Pool 实例数"),
-                    ("innodb_redo_log_capacity", "Redo Log 容量"),
-                    ("innodb_log_file_size", "单个 Redo 文件大小"),
-                    ("innodb_log_buffer_size", "Redo Log Buffer"),
-                    ("innodb_flush_method", "InnoDB 刷盘方式"),
-                ],
-            ),
-            (
-                "mysql.config.connection",
-                "连接、线程与缓存参数",
-                [
-                    ("max_connections", "最大连接数"),
-                    ("thread_cache_size", "线程缓存"),
-                    ("table_open_cache", "表打开缓存"),
-                    ("table_definition_cache", "表定义缓存"),
-                    ("tmp_table_size", "内存临时表上限"),
-                    ("max_heap_table_size", "MEMORY 表上限"),
-                ],
-            ),
-            (
-                "mysql.config.durability",
-                "日志、持久性与复制参数",
-                [
-                    ("log_bin", "Binary Log"),
-                    ("binlog_format", "Binlog 格式"),
-                    ("gtid_mode", "GTID 模式"),
-                    ("enforce_gtid_consistency", "GTID 一致性"),
-                    ("sync_binlog", "Binlog 同步策略"),
-                    ("innodb_flush_log_at_trx_commit", "事务日志刷盘策略"),
-                    ("binlog_expire_logs_seconds", "Binlog 保留秒数"),
-                ],
-            ),
-            (
-                "mysql.config.charset",
-                "字符集与 SQL 模式",
-                [
-                    ("character_set_server", "服务端字符集"),
-                    ("collation_server", "服务端排序规则"),
-                    ("lower_case_table_names", "表名大小写策略"),
-                    ("sql_mode", "SQL Mode"),
-                    ("time_zone", "会话默认时区"),
-                ],
-            ),
+            (item_id, title, list(CONFIG_GROUP_VARIABLES[item_id]))
+            for item_id, title in CONFIG_GROUP_TITLES
         ]
         config_items: list[dict[str, Any]] = []
         config_issues = 0
@@ -700,13 +846,43 @@ class MySQLPresentationBuilder:
             [("parameter", "配置项"), ("configured_value", "配置文件值")],
             35,
         )
+        # 配置文件值 vs 运行值（B11）：采集包里两张表都在，但原先只在同一章里各展一张表，
+        # 读者要自己对。这里把不一致项直接写进结论并点名参数与两侧取值。
+        if "mycnf_allowlist" not in ctx.tables:
+            config_file_status = "not_evaluated"
+            config_file_conclusion = "未采集到配置文件参数，无法与运行值核对。"
+        else:
+            drift = config_runtime_drift(ctx)
+            if drift:
+                drift_brief = "；".join(
+                    "%s（配置文件 %s，运行值 %s）"
+                    % (item["parameter"], "、".join(item["configured_raw"]), item["runtime"])
+                    for item in drift
+                )
+                config_file_status = "attention"
+                config_file_conclusion = (
+                    f"已采集 {len(ctx.tables.get('mycnf_allowlist', []))} 项白名单参数；"
+                    f"其中 {len(drift)} 处与当前运行值不一致：{drift_brief}。"
+                    "这类不一致说明配置改过之后没有重启或没有生效，重启会让线上行为回退到配置文件版本。"
+                )
+            else:
+                config_file_status = "normal"
+                config_file_conclusion = (
+                    f"已采集 {len(ctx.tables.get('mycnf_allowlist', []))} 项白名单参数，"
+                    "已采集到的参数与当前运行值一致。"
+                )
         config_items.append(self._item(
             "mysql.config.file",
             "配置文件白名单参数",
             "tables/mycnf_allowlist.tsv",
             mycnf_rows,
-            "已采集允许范围内的配置文件参数，用于核对启动配置；敏感配置及完整配置文件未纳入采集包。",
-            recommendation="对关键参数同时核对配置文件值和运行值，避免重启后参数回退。",
+            config_file_conclusion,
+            status=config_file_status,
+            recommendation=(
+                "逐项确认哪一侧才是期望值：保留运行值就把配置文件同步过去，采用配置文件值则安排重启窗口。"
+                if config_file_status == "attention" else
+                "对关键参数同时核对配置文件值和运行值，避免重启后参数回退。"
+            ),
             collection=collection("system.mycnf_allowlist"),
             total_rows=len(ctx.tables.get("mycnf_allowlist", [])),
             note="最多展示 35 行；不包含密码及完整配置文件。",
@@ -764,31 +940,67 @@ class MySQLPresentationBuilder:
             [("database_name", "Schema"), ("total_mb", "总 MB"), ("table_count", "表数量")],
             20,
         )
+        # 采集侧 object_counts.tsv 的 `no_engine_objects` 是"没有存储引擎的对象"，
+        # 在 MySQL 里就等于视图（information_schema.TABLES 对视图不填 ENGINE），
+        # 实测三包逐个 Schema 都恰等于 views。直接把它当"非 InnoDB 表"展示会与
+        # non_innodb_tables.tsv（实测每节点 1 张 MEMORY 表）自相矛盾，因此改用后者
+        # 按 Schema 真实计数，标签也改回"非 InnoDB 表"。
+        non_innodb_by_schema: dict[str, int] = {}
+        for row in ctx.tables.get("non_innodb_tables", []):
+            key = row.get("TABLE_SCHEMA") or row.get("table_schema")
+            if key:
+                non_innodb_by_schema[str(key)] = non_innodb_by_schema.get(str(key), 0) + 1
+        object_rows: list[dict] = []
+        for row in ctx.tables.get("object_counts", []):
+            merged = dict(row)
+            merged["non_innodb_tables"] = non_innodb_by_schema.get(str(row.get("table_schema") or ""), 0)
+            object_rows.append(merged)
         object_counts = self._select_rows(
-            ctx.tables.get("object_counts", []),
-            [("table_schema", "Schema"), ("base_tables", "表"), ("views", "视图"), ("innodb_tables", "InnoDB 表"), ("no_engine_objects", "非 InnoDB")],
+            object_rows,
+            [("table_schema", "Schema"), ("base_tables", "表"), ("views", "视图"), ("innodb_tables", "InnoDB 表"), ("non_innodb_tables", "非 InnoDB 表")],
             20,
         )
+        schema_metrics = metrics.get("schema", {})
+        # 自增容量与碎片**不进候选项合计**：采集端给的是"按某列倒序的前 N 条明细"，
+        # 把条数当风险数会把 100 条明细算成 100 个风险对象（实测自增最高使用率仅
+        # 22.79%、碎片明细 TOP 全是"分配 0.02 MB"的极小表）。它们的判定在规则层按
+        # 外部化阈值完成；这里只如实展示明细条数与可核对的极值。
         object_risk_rows = [
-            {"检查项": "无主键表", "数量": metrics.get("schema", {}).get("tables_without_primary_key"), "证据文件": "tables/no_primary_key_summary.tsv"},
-            {"检查项": "非 InnoDB 表", "数量": metrics.get("schema", {}).get("non_innodb_table_count"), "证据文件": "tables/non_innodb_tables.tsv"},
-            {"检查项": "自增容量候选", "数量": metrics.get("schema", {}).get("auto_increment_warning_count"), "证据文件": "tables/auto_increment_usage.tsv"},
-            {"检查项": "碎片候选表", "数量": metrics.get("schema", {}).get("fragmentation_candidate_count"), "证据文件": "tables/fragmentation_top.tsv"},
-            {"检查项": "冗余索引候选", "数量": metrics.get("schema", {}).get("redundant_index_count"), "证据文件": "tables/redundant_indexes.tsv"},
-            {"检查项": "未使用索引候选", "数量": metrics.get("schema", {}).get("unused_index_candidate_count"), "证据文件": "tables/unused_indexes.tsv"},
+            {"检查项": "无主键表", "数量": schema_metrics.get("tables_without_primary_key"), "证据文件": "tables/no_primary_key_summary.tsv"},
+            {"检查项": "非 InnoDB 表", "数量": schema_metrics.get("non_innodb_table_count"), "证据文件": "tables/non_innodb_tables.tsv"},
+            {"检查项": "冗余索引候选", "数量": schema_metrics.get("redundant_index_count"), "证据文件": "tables/redundant_indexes.tsv"},
+            {"检查项": "未使用索引候选", "数量": schema_metrics.get("unused_index_candidate_count"), "证据文件": "tables/unused_indexes.tsv"},
         ]
         object_risk_total = sum(int(row.get("数量") or 0) for row in object_risk_rows)
         object_risk_detail = "、".join(
             f"{row['检查项']} {int(row.get('数量') or 0)}" for row in object_risk_rows
         )
+        detail_notes: list[str] = []
+        auto_detail = schema_metrics.get("auto_increment_collected_count")
+        if auto_detail is not None:
+            top_pct = schema_metrics.get("auto_increment_max_used_pct")
+            detail_notes.append(
+                f"自增容量明细 {auto_detail} 条（采集端按使用率倒序，属明细条数而非风险数）"
+                + (f"，最高使用率 {top_pct:.2f}%" if top_pct is not None else "")
+            )
+        frag_detail = schema_metrics.get("fragmentation_collected_count")
+        if frag_detail is not None:
+            top_free = schema_metrics.get("fragmentation_max_data_free_mb")
+            detail_notes.append(
+                f"碎片明细 {frag_detail} 条（采集端按碎片率倒序，本表按可回收空间重排）"
+                + (f"，最大可回收 {top_free:,.2f} MB" if top_free is not None else "")
+            )
+        detail_note = ("；".join(detail_notes) + "。") if detail_notes else ""
         if business_schemas:
             capacity_risk_status = "attention" if object_risk_total else "normal"
             capacity_risk_conclusion = (
-                f"业务 Schema {len(business_schemas)} 个；对象检查候选项合计 {object_risk_total} 项"
-                f"（{object_risk_detail}），需结合业务确认后纳入整改。"
+                (
+                    f"业务 Schema {len(business_schemas)} 个；对象检查候选项合计 {object_risk_total} 项"
+                    f"（{object_risk_detail}），需结合业务确认后纳入整改。"
+                )
                 if object_risk_total else
-                f"业务 Schema {len(business_schemas)} 个；无主键、非 InnoDB、碎片、自增容量与索引类检查均未发现候选项。"
-            )
+                f"业务 Schema {len(business_schemas)} 个；无主键、非 InnoDB 与索引类检查均未发现候选项。"
+            ) + detail_note
         else:
             capacity_risk_status = "not_applicable"
             capacity_risk_conclusion = "本实例未发现业务 Schema；无主键、非 InnoDB、碎片和自增容量检查没有业务对象可评价。"
@@ -875,8 +1087,46 @@ class MySQLPresentationBuilder:
             [("log_type", "日志类型"), ("path", "路径"), ("exists", "存在"), ("readable", "可读"), ("size_bytes", "大小字节"), ("modified_at", "修改时间")],
             20,
         )
-        for row in log_rows:
-            row["修改时间"] = self._format_host_time(row.get("修改时间"))
+        # 日志轮转（A6）：表里原先只有"大小字节"，读者得自己换算，也看不出该不该处理。
+        # 这里把原始字节换成人类可读大小（列序不变），并把判定写进结论
+        # （超阈值文件 + 折合日增速率）——绝对值只说明"大"，日增速率才说明"该不该马上处理"。
+        log_rows = [
+            {
+                "日志类型": row.get("日志类型"),
+                "路径": row.get("路径"),
+                "存在": row.get("存在"),
+                "可读": row.get("可读"),
+                "大小": self._format_bytes(row.get("大小字节")),
+                "修改时间": self._format_host_time(row.get("修改时间")),
+            }
+            for row in log_rows
+        ]
+        log_entries = log_file_entries(ctx)
+        biggest_log = max(log_entries, key=lambda item: item["size_bytes"], default=None)
+        log_uptime = mysql_uptime_seconds(ctx)
+        if biggest_log:
+            over_logs = [item for item in log_entries if item["size_bytes"] > 1024 ** 3]
+            log_rotation_status = "attention" if over_logs else "normal"
+            log_rotation_note = (
+                f"最大日志文件为 {biggest_log['log_type']} "
+                f"{self._format_bytes(biggest_log['size_bytes'])}（{biggest_log['path']}）"
+            )
+            if log_uptime and log_uptime > 0:
+                log_rotation_note += (
+                    f"，折合日增约 {self._format_bytes(biggest_log['size_bytes'] / (log_uptime / 86400.0))}/天"
+                    f"（实例已运行约 {log_uptime / 86400:.0f} 天）"
+                )
+            log_rotation_note += (
+                "；已超过 1 GiB 提醒档："
+                + "、".join(f"{i['log_type']} {self._format_bytes(i['size_bytes'])}" for i in over_logs)
+                + "，需确认 logrotate 是否真的在执行"
+                if over_logs else
+                "；全部日志文件均未超过 1 GiB 提醒档"
+            )
+            log_rotation_note += "。"
+        else:
+            log_rotation_status = "not_evaluated"
+            log_rotation_note = "未采集到日志文件大小，无法判断轮转是否正常。"
         error_rows = self._select_rows(
             ctx.tables.get("error_log_summary", []),
             [("PRIO", "级别"), ("ERROR_CODE", "错误代码"), ("occurrence_count", "次数"), ("first_seen", "首次出现"), ("last_seen", "最后出现")],
@@ -887,11 +1137,24 @@ class MySQLPresentationBuilder:
             [("File", "当前 Binlog"), ("Position", "位置"), ("Executed_Gtid_Set", "已执行 GTID 集")],
             5,
         )
-        binary_logs = self._select_rows(
-            ctx.tables.get("binary_logs", []),
-            [("Log_name", "Binlog 文件"), ("File_size", "大小字节"), ("Encrypted", "加密")],
-            20,
-        )
+        # Binlog 数量与容量必须从**全量行**算：表格只投影前 20 条用于展示，
+        # 用 len(投影) 当文件数会把 74 / 129 / 131 个文件写成"已配置 20 个"。
+        binary_log_source = ctx.tables.get("binary_logs", [])
+        binary_logs = [
+            {
+                "Binlog 文件": row.get("Log_name"),
+                "大小": self._format_bytes(row.get("File_size")),
+                "加密": row.get("Encrypted"),
+            }
+            for row in binary_log_source[:20]
+        ]
+        # 口径统一：文件数 / 合计容量 / 未加密数都走 metrics.binlog_totals，
+        # 规则层（MYSQL.SECURITY.BINLOG_UNENCRYPTED、MYSQL.CAPACITY.BINLOG_SIZE）
+        # 用的是同一个函数，避免"表格说 74 个、规则说 20 个"这种两处口径。
+        _binlog = binlog_totals(ctx)
+        binary_log_count = _binlog["count"]
+        binary_log_bytes = _binlog["bytes"]
+        binary_log_unencrypted = _binlog["unencrypted"]
         replica_rows = self._select_rows(
             ctx.tables.get("replica_status", []),
             [
@@ -967,10 +1230,12 @@ class MySQLPresentationBuilder:
                                "已取得数据库主机、操作系统、CPU 和内存基本信息；本实例为本地采集，系统指标可用于关联分析。",
                                evidence=[f"CPU {host.get('cpu_count')} Core", f"内存 {self._format_bytes(host.get('memory_total_bytes'))}"]),
                     self._item("system.time", "时间与时区", "snapshot.json#time_evidence", time_rows,
-                               "主机时间未与 NTP 同步，日志关联、复制诊断和故障时间线存在偏差风险。" if not ntp_ok else "主机时间同步状态正常。",
-                               status="risk" if not ntp_ok else "normal",
-                               recommendation="启用并验证企业时间同步服务，统一数据库节点时区。" if not ntp_ok else "",
-                               evidence=[f"NTP synchronized={time_info.get('ntp_synchronized')}"],
+                               ntp["reason"] + "。" if not ntp["reason"].endswith("。") else ntp["reason"],
+                               status={"risk": "risk", "attention": "attention", "unknown": "not_evaluated"}.get(
+                                   ntp_tier, "normal"
+                               ),
+                               recommendation=time_recommendation,
+                               evidence=list(ntp["facts"]),
                                collection=collection("system.time_status")),
                     self._item("system.filesystems", "文件系统容量", "tables/filesystems.tsv", fs_rows,
                                "已取得主要文件系统容量；个别失效挂载点读取失败，不影响已展示挂载点。" if collection("system.filesystems").get("status") == "partial" else "已取得文件系统容量信息。",
@@ -1106,9 +1371,14 @@ class MySQLPresentationBuilder:
                     self._item("mysql.capacity.risks", "对象结构与容量候选项", "tables/*capacity*.tsv", object_risk_rows,
                                capacity_risk_conclusion,
                                status=capacity_risk_status,
-                               evidence=[f"业务 Schema {len(business_schemas)} 个", f"候选项合计 {object_risk_total} 项"],
+                               evidence=[
+                                   f"业务 Schema {len(business_schemas)} 个",
+                                   f"候选项合计 {object_risk_total} 项",
+                                   *detail_notes,
+                               ],
                                collection=collection("mysql.object_counts"), total_rows=len(object_risk_rows)),
                     *self._object_detail_item(ctx),
+                    *self._programmable_objects_item(ctx, collection),
                 ],
             },
             {
@@ -1160,8 +1430,15 @@ class MySQLPresentationBuilder:
                 "title": "日志、备份与复制检查",
                 "items": [
                     self._item("mysql.logs.files", "日志文件元数据", "tables/log_files.tsv", log_rows,
-                               "日志文件路径、可读性、大小和修改时间已取得；默认未采集日志正文。",
-                               evidence=[f"日志文件 {len(log_rows)} 个"],
+                               "日志文件路径、可读性、大小和修改时间已取得；默认未采集日志正文。" + log_rotation_note,
+                               status=log_rotation_status,
+                               recommendation=(
+                                   "确认 logrotate 配置与定时任务是否真的执行，补齐 size+周期双条件轮转；"
+                                   "已超大的文件先压缩归档再重建，不要直接删除正在写入的句柄。"
+                                   if log_rotation_status == "attention" else ""
+                               ),
+                               evidence=[f"日志文件 {len(log_rows)} 个"]
+                               + ([f"最大文件 {biggest_log['log_type']} {self._format_bytes(biggest_log['size_bytes'])}"] if biggest_log else []),
                                collection=collection("mysql.log_file_metadata"), total_rows=len(ctx.tables.get("log_files", []))),
                     self._item("mysql.logs.summary", "错误日志汇总", "tables/error_log_summary.tsv", error_rows,
                                f"采集窗口内错误日志汇总未发现 Error/Critical/System 级事件；共展示 {len(error_rows)} 类事件。",
@@ -1171,8 +1448,27 @@ class MySQLPresentationBuilder:
                                f"Binary Log 已启用；当前 Binlog {binary_status[0].get('当前 Binlog', '-') if binary_status else '-'}，GTID 模式 {role.get('gtid_mode')}。",
                                evidence=[f"log_bin={role.get('log_bin')}", f"gtid_mode={role.get('gtid_mode')}"]),
                     self._item("mysql.replication.binlog.files", "Binlog 文件列表", "tables/binary_logs.tsv", binary_logs,
-                               f"已配置 {len(binary_logs)} 个 Binlog 文件。",
-                               evidence=[f"expire_logs_days={role.get('expire_logs_days') or role.get('binlog_expire_logs_seconds')}"]),
+                               (
+                                   f"共 {binary_log_count} 个 Binlog 文件，合计 {self._format_bytes(binary_log_bytes)}"
+                                   + (f"，其中 {binary_log_unencrypted} 个未加密" if binary_log_unencrypted else "")
+                                   + (
+                                       "；容量已超过 50 GiB 参考线，请核对保留期与实际恢复需求是否匹配"
+                                       if binary_log_bytes > 50 * 1024 ** 3 else ""
+                                   )
+                                   + f"；下表为前 {len(binary_logs)} 条明细，完整清单见证据文件。"
+                               ),
+                               status="attention" if (binary_log_unencrypted or binary_log_bytes > 50 * 1024 ** 3) else "normal",
+                               recommendation=(
+                                   "启用 binlog 加密（binlog_encryption=ON）需先确认下游复制链路与备份工具兼容性。"
+                                   if binary_log_unencrypted else ""
+                               ),
+                               evidence=[
+                                   f"Binlog 文件 {binary_log_count} 个",
+                                   f"合计容量 {self._format_bytes(binary_log_bytes)}",
+                                   f"expire_logs_days={role.get('expire_logs_days') or role.get('binlog_expire_logs_seconds')}",
+                               ] + (
+                                   [f"未加密 {binary_log_unencrypted} 个"] if binary_log_unencrypted else []
+                               )),
                     self._item("mysql.replication.status", "复制与高可用状态", "tables/replica_status.tsv; tables/group_replication_members.tsv", replica_rows,
                                replica_conclusion,
                                status=replica_status,
@@ -1205,6 +1501,36 @@ class MySQLPresentationBuilder:
             for row in digest_source
             if (self._row_number(row, "SUM_NO_INDEX_USED") or 0) > 0
         )
+        # 「复制与高可用」主题原先是写死的"未发现副本或集群成员运行证据"，
+        # 与同章「复制与高可用状态」表（源端有残留通道、从库有运行通道）自相矛盾。
+        # 改由本实例自己的复制行推导：线程停 → risk；通道在跑 → normal；
+        # 只有指向自身的残留通道 → attention（源端）；一条都没有 → attention（单实例）。
+        observed_role = role.get("role_observed")
+        if stopped_channels:
+            replication_topic_status = "risk"
+            replication_topic_conclusion = (
+                f"已启用 Binary Log 和 GTID，观测角色为 {observed_role}；"
+                f"配置 {len(real_replica_rows)} 条复制通道，其中 {stopped_channels} 条 IO/SQL 线程未运行。"
+            )
+        elif real_replica_rows:
+            replication_topic_status = "normal"
+            replication_topic_conclusion = (
+                f"已启用 Binary Log 和 GTID，观测角色为 {observed_role}；"
+                f"本节点作为副本运行 {len(real_replica_rows)} 条复制通道，IO/SQL 线程均正常。"
+            )
+        elif residual_replica_rows:
+            replication_topic_status = "attention"
+            replication_topic_conclusion = (
+                f"已启用 Binary Log 和 GTID，观测角色为 {observed_role}；"
+                f"仅存在 {len(residual_replica_rows)} 条指向自身的残留复制通道，"
+                "本节点未见上游连接、按复制源端处理；确认下游节点后需合并核对完整拓扑。"
+            )
+        else:
+            replication_topic_status = "attention"
+            replication_topic_conclusion = (
+                f"已启用 Binary Log 和 GTID，观测角色为 {observed_role}；"
+                "本节点未发现复制通道或集群成员运行证据，按单实例处理。"
+            )
         conclusions = [
             {
                 "topic": "参数配置合规",
@@ -1229,19 +1555,23 @@ class MySQLPresentationBuilder:
             {
                 "topic": "事务与并发锁",
                 "status": "normal" if lock_count == 0 else "risk",
-                "conclusion": "采集时未发现长事务、数据锁等待或元数据锁等待；结果仅代表现场时点。" if lock_count == 0 else f"采集时发现 {lock_count} 条事务或锁等待记录。",
+                "conclusion": (
+                    "本节点采集时点未发现长事务、数据锁等待或元数据锁等待。"
+                    if lock_count == 0 else
+                    f"本节点采集时点发现 {lock_count} 条事务或锁等待记录。"
+                ),
                 "evidence": ["tables/long_transactions.tsv", "tables/data_lock_waits.tsv", "tables/metadata_locks_pending.tsv"],
             },
             {
                 "topic": "SQL 执行特征",
                 "status": "attention" if no_index_exec else "normal",
-                "conclusion": f"SQL 摘要中未用索引累计执行 {no_index_exec} 次、累计耗时约 {no_index_seconds:.1f} 秒；需要结合业务 SQL 正文和执行计划复核，不能直接认定为问题 SQL。",
+                "conclusion": f"本节点采集窗口内，SQL 摘要中未用索引累计执行 {no_index_exec} 次、累计耗时约 {no_index_seconds:.1f} 秒；需要结合业务 SQL 正文和执行计划复核，不能直接认定为问题 SQL。",
                 "evidence": ["tables/sql_digests_top.tsv"],
             },
             {
                 "topic": "复制与高可用",
-                "status": "attention",
-                "conclusion": f"已启用 Binary Log 和 GTID，观测角色为 {role.get('role_observed')}；未发现副本或集群成员运行证据。",
+                "status": replication_topic_status,
+                "conclusion": replication_topic_conclusion,
                 "evidence": ["snapshot.json#role_evidence", "tables/replica_status.tsv"],
             },
             {
@@ -1252,6 +1582,594 @@ class MySQLPresentationBuilder:
             },
         ]
         return sections, conclusions
+
+    # 跨节点配置对比：本轮只作用于「日志、持久性与复制参数」组，作为机制验证。
+    # 多实例巡检里配置漂移是最高价值产出，而「参数 / 采集值 / 说明」的单实例结构
+    # 从根上无法呈现它。判定三态（达标 / 不达标 / 不适用）的语义见《可沉淀清单》J 节：
+    # 期望值随角色变化，单实例下不具复制语义的参数必须落「不适用」，不得伪装成通过。
+    CONFIG_VERDICT_STATES = ("达标", "不达标", "不适用")
+
+    @staticmethod
+    def _short_node_label(node: dict[str, Any]) -> str:
+        """节点短标签：取 IPv4 末位（与报告正文 .33 / .34 / .125 的写法一致）。"""
+        ip = str(node.get("ip") or "").strip()
+        if ip.count(".") == 3:
+            label = f".{ip.rsplit('.', 1)[-1]}"
+        else:
+            label = ip or str(node.get("hostname") or "节点")
+        if str(node.get("role_effective") or "").strip().lower() == "source":
+            label += "（源）"
+        return label
+
+    @staticmethod
+    def _instance_node_label(instance: dict[str, Any]) -> str:
+        """实例在风险台账里的节点标识。
+
+        优先用完整 IP —— 风险登记册是独立章节，读者要能据此直接定位机器，
+        不像配置对比表那样有"列名为 IPv4 末位"的表下说明。
+        """
+        identity = instance.get("identity") or {}
+        ip = str(identity.get("ip") or "").strip()
+        if ip:
+            return ip
+        return str(identity.get("hostname") or identity.get("instance_tag") or "本机")
+
+    def _merged_findings(self, instances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """把各实例的 findings 合成一份风险台账，并标注来源节点。
+
+        原先只取 ``instances[0]``（``primary``）的 findings —— 多实例巡检时
+        其余节点的风险完全不出现在风险登记册、安全章节和整改计划里，而
+        PostgreSQL（``analyzer.py`` 的 ``all_findings``）与 Oracle
+        （``findings_all``）都是全实例合并，MySQL 是唯一只取主体的插件。
+        实测三节点巡检：``overall_health_summary`` 统计到 27 条风险，
+        风险台账里只有 8 条。
+
+        编号在这里统一重排，保证全报告唯一可引用（各实例的 finding_id 都从
+        R001 起算，直接拼接会撞号）；单实例输入时逐条结果与原先一致。
+        """
+        merged: list[dict[str, Any]] = []
+        multi = len(instances) >= 2
+        for instance in instances:
+            label = self._instance_node_label(instance)
+            for finding in instance.get("findings") or []:
+                item = dict(finding)
+                item["finding_id"] = f"R{len(merged) + 1:03d}"
+                if multi:
+                    # 只有多实例才标节点：单实例正文本来就是它，加列没有信息量，
+                    # 且会让冻结的单实例报告契约（frozen report contract）漂移。
+                    item["node"] = label
+                merged.append(item)
+        return merged
+
+    @staticmethod
+    def _merged_confirmations(
+        instances: list[dict[str, Any]]
+    ) -> list[dict[str, Any]] | None:
+        """跨节点合并「待客户确认事项」（与 _merged_findings 同理）。
+
+        只取 ``instances[0]`` 会让其余节点需要客户确认的事项整段消失。同一主题在多个
+        节点都触发时**保留各自的行、各带节点**，不按主题归并 —— 不同节点的证据
+        （参数取值、涉及对象、失败来源）通常并不相同，归并会把差异吃掉。
+        返回 ``None`` 表示所有实例都没有该字段（旧分析产物），渲染层据此区分
+        「未产出清单」与「本次没有待确认事项」。
+        """
+        merged: list[dict[str, Any]] = []
+        present = False
+        for instance in instances:
+            items = instance.get("pending_confirmations")
+            if items is None:
+                continue
+            present = True
+            merged.extend(items)
+        if not present:
+            return None
+        merged.sort(key=lambda item: (str(item.get("topic") or ""), str(item.get("node") or "")))
+        return merged
+
+    # 矩阵列的档位顺序（严格档优先）。这里只声明顺序，**不声明中文名** ——
+    # 严重度中文词汇表只有一处（`inspection_core.word_engine.SEVERITY_CN`），
+    # 渲染层用它翻译列头，避免同一份映射在两层各写一遍后各自漂移。
+    RISK_MATRIX_SEVERITIES = ("critical", "high", "medium", "low", "info")
+
+    @classmethod
+    def _risk_matrix(
+        cls,
+        findings: list[dict[str, Any]],
+        topology: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """风险分级 × 节点矩阵（《可沉淀清单》F2）。
+
+        行 = 节点，列 = 严重度，单元格 = 该节点该级别的风险检出数。「风险压在哪台」
+        原先只能靠通读几十条台账自己数，这里给一张汇总表。
+
+        数据源就是风险台账本身（``_merged_findings`` 的产物），**不另算一份口径**
+        —— 矩阵必须与登记册逐条对得上，否则同一章里两张表自相矛盾。
+        单实例的 findings 不带 ``node``（见 ``_merged_findings``），没有第二个节点
+        可对比，返回 ``None``；模型不注入该键、渲染层跳过，单实例输出保持不变。
+
+        行序取拓扑层已排好的节点序（复制源端第一，见 AGENTS.md「顺序也由拓扑层定」），
+        不得依赖调用者传包的先后；拓扑未解析时退化为 findings 首次出现顺序。
+        **零风险的节点同样占一行**（计数为 0）——「哪台干净」本身就是读者要的信息，
+        按 findings 反推行集合会把干净的节点整行丢掉。
+        """
+        counts: dict[str, dict[str, int]] = {}
+        for finding in findings:
+            node = str(finding.get("node") or "").strip()
+            if not node:
+                continue
+            bucket = counts.setdefault(node, {})
+            severity = str(finding.get("severity") or "").strip().lower()
+            bucket[severity] = bucket.get(severity, 0) + 1
+        if not counts:
+            return None
+        severities = [s for s in cls.RISK_MATRIX_SEVERITIES
+                      if any(s in bucket for bucket in counts.values())]
+        # 规则包将来新增的档位（未登记在本表里的严重度）也要成列，否则各列之和
+        # 小于合计，读者会觉得算错了。按名称补在末尾。
+        severities += sorted({s for bucket in counts.values() for s in bucket} - set(severities))
+
+        order: list[str] = []
+        roles: dict[str, str] = {}
+        for node in (topology or {}).get("nodes") or []:
+            ip = str(node.get("ip") or "").strip()
+            if not ip:
+                continue
+            order.append(ip)
+            roles[ip] = str(node.get("role_effective") or "").strip().lower()
+        outside = sorted(ip for ip in counts if ip not in order)
+        rows: list[dict[str, Any]] = []
+        for ip in [*order, *outside]:
+            bucket = counts.get(ip) or {}
+            label = f"{ip}（源）" if roles.get(ip) == "source" else ip
+            rows.append({
+                "label": label,
+                "counts": {s: bucket.get(s, 0) for s in severities},
+                "total": sum(bucket.values()),
+            })
+        return {
+            "severity_columns": severities,
+            "rows": rows,
+            "note": (
+                "每一格是该节点在该级别上的风险检出数，与风险登记册逐条对应；"
+                "标注（源）的是复制源端，其余为副本。同一规则在多个节点触发时分别"
+                "计入各自节点，各行合计之和等于登记册条目总数。"
+            ),
+        }
+
+    @staticmethod
+    def _binlog_enabled(value: Any) -> bool:
+        return str(value or "").strip().upper() in {"ON", "1", "TRUE"}
+
+    @staticmethod
+    def _format_seconds(value: Any) -> str:
+        """把秒数渲染成人类可读的保留期（能整除到天/小时才转换，否则原样）。"""
+        number = safe_int(value)
+        if number is None:
+            return "未采集"
+        if number and number % 86400 == 0:
+            return f"{number // 86400} 天"
+        if number and number % 3600 == 0:
+            return f"{number // 3600} 小时"
+        return f"{number} 秒"
+
+    def _instance_parameters(self, instance: dict[str, Any]) -> dict[str, str]:
+        """取某个实例的全局参数。
+
+        优先用 build_inspection_model 逐实例记录的完整 global_variables；
+        手工构造的 analysis（单测、旧产物）没有这层缓存，回退 facts.key_variables。
+        """
+        cached = self._variables_by_instance.get(str(instance.get("instance_id") or ""))
+        if cached:
+            return cached
+        return dict((instance.get("facts") or {}).get("key_variables") or {})
+
+    def _config_comparison_nodes(
+        self, analysis: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """按拓扑排出参与对比的节点；判据不足时退化为单节点并说明原因。"""
+        instances = analysis.get("instances") or []
+        topology = analysis.get("topology") or {}
+        nodes = topology.get("nodes") or []
+        edges = topology.get("edges") or []
+        instances_by_id = {str(item.get("instance_id")): item for item in instances}
+        usable = (
+            len(instances) >= 2
+            and len(nodes) == len(instances)
+            and bool(edges)
+            and all(str(node.get("node_id")) in instances_by_id for node in nodes)
+        )
+        if usable:
+            records: list[dict[str, Any]] = []
+            labels: list[str] = []
+            for index, node in enumerate(nodes, 1):
+                instance = instances_by_id[str(node.get("node_id"))]
+                label = self._short_node_label(node)
+                if label in labels:  # 同名主机等导致的标签冲突，补序号避免覆盖同名列
+                    label = f"{label}#{index}"
+                labels.append(label)
+                records.append({
+                    "label": label,
+                    "role": str(node.get("role_effective") or ""),
+                    "values": self._instance_parameters(instance),
+                })
+            return records, ""
+        reason = (
+            "拓扑未解析，本表按单节点取值呈现，未生成跨节点对比"
+            if len(instances) >= 2
+            else "单实例巡检，本表按单节点取值呈现"
+        )
+        return [
+            {
+                "label": "采集值",
+                "role": "",
+                "values": self._instance_parameters(instances[0]),
+            }
+        ], reason
+
+    @staticmethod
+    def _format_size(value: Any) -> str:
+        """字节数渲染成人类可读单位（1024 进制）。"""
+        number = safe_float(value)
+        if number is None:
+            return "未采集"
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        index = 0
+        while abs(number) >= 1024 and index < len(units) - 1:
+            number /= 1024
+            index += 1
+        return f"{number:.2f} {units[index]}"
+
+    @staticmethod
+    def _node_value_groups(
+        records: list[dict[str, Any]], name: str, formatter: Any = None
+    ) -> str:
+        """把各节点取值按同值分组渲染，形如「`.33`=3 天；`.34`、`.125`=5 天」。
+
+        只写「节点间不一致」读者不知道去改哪一台，判定依据必须落到节点。
+        """
+        groups: dict[str, list[str]] = {}
+        for record in records:
+            raw = str(record["values"].get(name) or "").strip()
+            display = formatter(raw) if (formatter and raw) else (raw or "未采集")
+            groups.setdefault(display, []).append(str(record["label"]))
+        return "；".join(f"{'、'.join(labels)}={value}" for value, labels in groups.items())
+
+    def _drift_verdict(
+        self, records: list[dict[str, Any]], name: str, reason: str, formatter: Any = None
+    ) -> tuple[str, str]:
+        """通用「节点间取值应当一致」判定。"""
+        values = [str(record["values"].get(name) or "").strip() for record in records]
+        if any(value == "" for value in values):
+            return "不适用", f"{name} 在部分节点未采集，未参与对比"
+        if len(set(values)) > 1:
+            return "不达标", reason.format(values=self._node_value_groups(records, name, formatter))
+        return "达标", ""
+
+    def _memory_config_verdict(
+        self, name: str, records: list[dict[str, Any]]
+    ) -> tuple[str, str]:
+        if name == "innodb_redo_log_capacity":
+            # 该变量值**不代表实际容量**：容量由旧参数 innodb_log_file_size ×
+            # innodb_log_files_in_group 算出时不回写变量（MySQL 8.0 手册 §17.6.5）。
+            # 三节点变量值都是 100MB，而 .125 实际是 4GB —— 只看变量会得出假结论。
+            # 这里显式落「不适用」，实际容量由规则 MYSQL.INNODB.REDO_CAPACITY
+            # 读状态变量 Innodb_redo_log_capacity_resized 判定并进风险台账。
+            return "不适用", "变量值不代表实际容量（由旧参数算出时不回写），实际容量见风险台账 MYSQL.INNODB.REDO_CAPACITY"
+        if name == "innodb_flush_method":
+            bad = [
+                str(record["label"]) for record in records
+                if str(record["values"].get(name) or "").strip().lower() in {"fsync", "fdatasync"}
+            ]
+            if bad:
+                return "不达标", "、".join(bad) + " 取 fsync/fdatasync，InnoDB 与操作系统页缓存双重缓冲，写入路径变长"
+            return "达标", ""
+        if name == "innodb_io_capacity":
+            low: list[str] = []
+            for record in records:
+                number = safe_float(str(record["values"].get(name) or "").strip())
+                if number is not None and number <= 200:
+                    low.append(f"{record['label']}={int(number)}")
+            if low:
+                return "不达标", "、".join(low) + "（仍为默认值，未针对存储调优），SSD/云盘场景建议 2000-4000（HDD 需结合 await 判断）"
+            return "达标", ""
+        if name == "innodb_buffer_pool_size":
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}），副本缓存能力与源端不同；若为容量规划刻意设置请在文档注明",
+                self._format_size,
+            )
+        if name in {"innodb_log_file_size", "innodb_log_buffer_size"}:
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}）；这些旧参数参与 redo 实际容量的计算，"
+                "各节点取值不同会让实际容量也不一致（见风险台账 MYSQL.INNODB.REDO_CAPACITY）",
+                self._format_size,
+            )
+        if name == "innodb_log_files_in_group":
+            # 该参数是「个数」不是字节数，不能套 _format_size（否则 2 会渲染成 2.00 B）。
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}）；该参数是 redo 文件个数，与 innodb_log_file_size 相乘决定 "
+                "redo 实际容量，各节点取值不同会让实际容量也不一致（见风险台账 MYSQL.INNODB.REDO_CAPACITY）",
+            )
+        if name == "innodb_io_capacity_max":
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}），同型号存储上的写突发能力不同",
+            )
+        if name == "innodb_adaptive_hash_index":
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}），副本与源端的自适应哈希策略不同；"
+                "写密集场景 AHI 可能反而成为瓶颈，应统一后再评估",
+            )
+        return self._drift_verdict(records, name, "节点间不一致（{values}）")
+
+    def _connection_config_verdict(
+        self, name: str, records: list[dict[str, Any]]
+    ) -> tuple[str, str]:
+        if name in {"tmp_table_size", "max_heap_table_size"}:
+            # 两者不等时以较小者为准，超出部分会静默落成磁盘临时表。
+            unequal: dict[tuple[str, str], list[str]] = {}
+            for record in records:
+                low = safe_float(str(record["values"].get("tmp_table_size") or "").strip())
+                high = safe_float(str(record["values"].get("max_heap_table_size") or "").strip())
+                if low is None or high is None or low == high:
+                    continue
+                key = (self._format_size(low), self._format_size(high))
+                unequal.setdefault(key, []).append(str(record["label"]))
+            if unequal:
+                detail = "；".join(
+                    f"{'、'.join(labels)}：tmp_table_size {low} vs max_heap_table_size {high}"
+                    for (low, high), labels in unequal.items()
+                )
+                return "不达标", detail + " 两项取值不等，实际以较小者为准，会打出非预期的磁盘临时表"
+            return "达标", ""
+        if name == "max_connections":
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}），切换后承载能力不同，故障转移时可能出现连接被拒",
+            )
+        return self._drift_verdict(records, name, "节点间不一致（{values}），属于配置漂移")
+
+    def _charset_config_verdict(
+        self, name: str, records: list[dict[str, Any]]
+    ) -> tuple[str, str]:
+        if name == "lower_case_table_names":
+            return self._drift_verdict(
+                records, name,
+                "节点间不一致（{values}），副本的表名解析策略与源端不同，切换后可能找不到表",
+            )
+        if name == "collation_server":
+            values = [str(record["values"].get(name) or "").strip() for record in records]
+            if any(value == "" for value in values):
+                return "不适用", "部分节点未采集 collation_server，未参与对比"
+            if len(set(values)) == 1:
+                return "达标", ""
+            families = {value.split("_", 1)[0] for value in values}
+            flavors = {
+                "0900" if "_0900_" in value else ("general" if "_general_" in value else "other")
+                for value in values
+            }
+            groups = self._node_value_groups(records, name)
+            if len(families) == 1 and len(flavors) > 1:
+                return "不达标", f"同字符集混用不同排序规则（{groups}），字符串比较与排序结果跨节点不一致"
+            return "不达标", f"节点间不一致（{groups}），跨节点比较与排序语义不同"
+        if name == "time_zone":
+            values = [str(record["values"].get(name) or "").strip() for record in records]
+            if any(value == "" for value in values):
+                return "不适用", "部分节点未采集 time_zone，未参与对比"
+            if len(set(values)) > 1:
+                groups = self._node_value_groups(records, name)
+                return "不达标", f"节点间不一致（{groups}），同一时刻各节点写入的时间戳会不同"
+            if values[0].upper() == "SYSTEM":
+                return "不达标", "取值为 SYSTEM，依赖操作系统时区；各节点系统时区不一致时日志时间线会错位"
+            return "达标", ""
+        return self._drift_verdict(
+            records, name,
+            "节点间不一致（{values}），跨节点写入的字符集解释可能不同",
+        )
+
+    def _config_verdict(
+        self,
+        item_id: str,
+        name: str,
+        records: list[dict[str, Any]],
+        has_replication: bool,
+    ) -> tuple[str, str]:
+        if item_id == "mysql.config.memory":
+            return self._memory_config_verdict(name, records)
+        if item_id == "mysql.config.connection":
+            return self._connection_config_verdict(name, records)
+        if item_id == "mysql.config.charset":
+            return self._charset_config_verdict(name, records)
+        return self._durability_verdict(name, records, has_replication)
+
+    def _durability_verdict(
+        self,
+        name: str,
+        records: list[dict[str, Any]],
+        has_replication: bool,
+    ) -> tuple[str, str]:
+        """给出单个参数的判定状态与依据。
+
+        期望值随角色与拓扑形态变化：源端与从库的要求不同，单实例下部分参数
+        没有复制语义（应落「不适用」而不是伪装成达标）。缺失值一律保持「未采集」，
+        不得当成 0 参与判定（见 analysis contracts.missing_value_policy）。
+        """
+        values = {
+            str(record["label"]): str(record["values"].get(name) or "").strip()
+            for record in records
+        }
+        if any(value == "" for value in values.values()):
+            return "不适用", "部分节点缺少该参数，未参与对比，不计为达标"
+        binlog_on = [
+            record for record in records
+            if self._binlog_enabled(record["values"].get("log_bin"))
+        ]
+        if name == "log_bin":
+            if not has_replication:
+                return "不适用", "单实例无复制链路；是否开启取决于按时间点恢复的需求"
+            if any(not self._binlog_enabled(value) for value in values.values()):
+                return "不达标", "关闭 binlog 的节点无法为下游提供变更流，也无法按时间点恢复"
+            return "达标", ""
+        if name == "gtid_mode":
+            if not has_replication:
+                return "不适用", "单实例无 GTID 复制语义"
+            if any(value.upper() != "ON" for value in values.values()):
+                return "不达标", "GTID 未在所有节点开启，切换与故障转移依赖 GTID 连续性"
+            return "达标", ""
+        if name == "enforce_gtid_consistency":
+            gtid_off = any(
+                str(record["values"].get("gtid_mode") or "").strip().upper() != "ON"
+                for record in records
+            )
+            if not has_replication:
+                return "不适用", "单实例无 GTID 复制语义"
+            if gtid_off:
+                return "不适用", "gtid_mode 未开启时该参数不生效"
+            if any(value.upper() != "ON" for value in values.values()):
+                return "不达标", "一致性校验关闭，不安全语句可能进入 binlog 并破坏复制"
+            return "达标", ""
+        if name == "innodb_flush_log_at_trx_commit":
+            if any(value != "1" for value in values.values()):
+                return "不达标", "非 1 时崩溃可丢失已提交事务，持久性下降"
+            return "达标", ""
+        if not binlog_on:
+            return "不适用", "所有节点均未开启 binlog，该参数不生效"
+        if name == "binlog_format":
+            if any(
+                str(record["values"].get(name) or "").strip().upper() != "ROW"
+                for record in binlog_on
+            ):
+                return "不达标", "非 ROW 格式可能造成主从数据不一致"
+            return "达标", ""
+        if name == "sync_binlog":
+            if any(
+                str(record["values"].get(name) or "").strip() != "1"
+                for record in binlog_on
+            ):
+                return "不达标", "sync_binlog≠1 时崩溃可能丢失已提交事务的 binlog"
+            return "达标", ""
+        if name == "binlog_expire_logs_seconds":
+            parsed: list[int] = []
+            for record in binlog_on:
+                number = safe_int(str(record["values"].get(name) or "").strip())
+                if number is None:
+                    return "不适用", "保留期取值无法解析，未参与对比"
+                parsed.append(number)
+            if any(number == 0 for number in parsed):
+                return "不达标", "0 表示 binlog 永不过期，磁盘空间存在耗尽风险"
+            if len(set(parsed)) > 1:
+                return "不达标", (
+                    "节点间保留期不一致（"
+                    + self._node_value_groups(records, name, self._format_seconds)
+                    + "），按时间点恢复的窗口不同"
+                )
+            return "达标", ""
+        return "达标", ""
+
+    def attach_config_comparison(self, analysis: dict[str, Any]) -> None:
+        """把配置检查组改写为「跨节点并排 + 行级判定」。
+
+        11.6 原先只渲染本实例的 global_variables，多实例巡检时读不出配置漂移。
+        这里按拓扑把各节点取值并排（列名取 IP 末位），并逐行给出
+        「达标 / 不达标 / 不适用」。本轮只作用于耐久性参数组，作为机制验证；
+        拓扑判据不足时退化为单节点取值，绝不造出空节点列。
+        """
+        records, degraded = self._config_comparison_nodes(analysis)
+        instances = analysis.get("instances") or []
+        if not instances or not records:
+            return
+        multi = not degraded
+        primary = instances[0]
+        items_by_id: dict[str, dict[str, Any]] = {}
+        for section in primary.get("inspection_sections") or []:
+            for item in section.get("items") or []:
+                items_by_id[str(item.get("item_id"))] = item
+        for item_id, _title in CONFIG_GROUP_TITLES:
+            item = items_by_id.get(item_id)
+            if item is not None:
+                self._rewrite_config_item(item, item_id, records, degraded, multi)
+
+    def _rewrite_config_item(
+        self,
+        item: dict[str, Any],
+        item_id: str,
+        records: list[dict[str, Any]],
+        degraded: str,
+        multi: bool,
+    ) -> None:
+        """把一组配置项改写成「跨节点并排 + 行级判定」。
+
+        判定三态与角色守卫的语义见《可沉淀清单》J 节；节点列名取 IP 末位，
+        判定依据与结论里一律用完整节点标识，读者据此可以直接定位机器。
+        """
+        variables = CONFIG_GROUP_VARIABLES[item_id]
+        base_values = records[0]["values"] if records else {}
+        rows: list[dict[str, Any]] = []
+        failed: list[str] = []
+        skipped: list[str] = []
+        failed_nodes: dict[str, list[str]] = {}
+        for name, label in variables:
+            row: dict[str, Any] = {"参数": f"{label}（{name}）"}
+            if multi:
+                for record in records:
+                    value = record["values"].get(name)
+                    row[str(record["label"])] = value if str(value or "").strip() else "未采集"
+            else:
+                value = records[0]["values"].get(name) if records else None
+                row["采集值"] = value if str(value or "").strip() else "未采集"
+            state, reason = self._config_verdict(item_id, name, records, multi)
+            row["判定"] = f"{state}（{reason}）" if reason else state
+            if state == "不达标":
+                failed.append(name)
+                baseline = str(base_values.get(name) or "").strip()
+                for record in records:
+                    value = str(record["values"].get(name) or "").strip()
+                    if value and value != baseline:
+                        failed_nodes.setdefault(str(record["label"]), []).append(name)
+            elif state == "不适用":
+                skipped.append(name)
+            rows.append(row)
+        notes: list[str] = []
+        if degraded:
+            notes.append(degraded)
+        if multi:
+            notes.append("列名为节点 IPv4 末位，标注（源）的是复制源端")
+        notes.append(
+            "判定口径为 达标 / 不达标 / 不适用，「不适用」表示该参数在当前角色或拓扑形态下"
+            "没有判定语义（例如单实例的复制相关参数），不等于通过"
+        )
+        evidence = list(item["analysis"].get("evidence") or [])
+        evidence.append(f"跨节点对比节点数 {len(records)}")
+        if failed:
+            evidence.append("不达标参数：" + "、".join(failed))
+        if skipped:
+            evidence.append("不适用参数：" + "、".join(skipped))
+        conclusion = str(item["analysis"].get("conclusion") or "")
+        if failed:
+            # 结论必须点名节点：只写「有不一致」，读者不知道去改哪一台。
+            located = "；".join(
+                f"{node} 的 {'、'.join(names)}" for node, names in failed_nodes.items()
+            )
+            conclusion += (
+                f"跨节点逐项判定发现 {len(failed)} 项不达标（{'、'.join(failed)}）"
+                + (f"，涉及 {located}" if located else "")
+                + "，逐行判定见判定列。"
+            )
+        elif skipped:
+            conclusion += f"另有 {len(skipped)} 项在当前拓扑形态下不适用（非缺陷）。"
+        item["display"]["rows"] = rows
+        item["display"]["shown_rows"] = len(rows)
+        item["display"]["total_rows"] = len(rows)
+        item["display"]["note"] = "；".join(notes) + "。"
+        if multi:
+            item["source"] = "tables/global_variables.tsv（各节点）"
+        item["analysis"]["evidence"] = evidence
+        item["analysis"]["conclusion"] = conclusion
+        if failed:
+            item["analysis"]["status"] = "attention"
 
     def attach_topology_replication(self, analysis: dict[str, Any]) -> None:
         """把源端实例的复制状态从「本机上游行」改写为「下游从库」。
@@ -1528,6 +2446,13 @@ class MySQLPresentationBuilder:
             except (TypeError, ValueError):
                 return safe(value)
 
+        def count(value: Any) -> str:
+            """自增剩余量这类大整数：带千分位，别用科学计数法。"""
+            try:
+                return f"{int(float(value)):,}"
+            except (TypeError, ValueError):
+                return safe(value)
+
         rows: list[dict[str, Any]] = []
 
         def add(kind: str, records: Any, describe: Any, index_key: str = "") -> None:
@@ -1548,15 +2473,36 @@ class MySQLPresentationBuilder:
             lambda r: f"行数 {safe(pick(r, 'TABLE_ROWS'))}，共 {safe(pick(r, 'total_mb'), ' MB')}")
         add("非 InnoDB 表", ctx.tables.get("non_innodb_tables"),
             lambda r: f"引擎 {safe(pick(r, 'ENGINE'))}，行数 {safe(pick(r, 'TABLE_ROWS'))}")
-        add("高碎片表", ctx.tables.get("fragmentation_top"),
-            lambda r: f"碎片率 {safe(pick(r, 'fragmentation_pct'), '%')}，可回收 {safe(pick(r, 'data_free_mb'), ' MB')}")
+        # 碎片明细按**可回收空间**重排：采集端是碎片率倒序，TOP 会被"分配 0.02 MB /
+        # 空闲 18 MB"的极小表占满（99.91%），真正值得回收的表反而排在后面。
+        fragmentation_rows = sorted(
+            ctx.tables.get("fragmentation_top") or [],
+            key=lambda record: (
+                row_number(record, "data_free_mb") is None,
+                -(row_number(record, "data_free_mb") or 0.0),
+            ),
+        )
+        add("高碎片表", fragmentation_rows,
+            lambda r: (
+                f"可回收 {safe(pick(r, 'data_free_mb'), ' MB')}"
+                f"（分配 {safe(pick(r, 'allocated_mb'), ' MB')}，"
+                f"碎片率 {safe(pick(r, 'fragmentation_pct'), '%')}）"
+            ))
         add("冗余索引", ctx.tables.get("redundant_indexes"),
             lambda r: f"被 {safe(pick(r, 'dominant_index_name'))} 覆盖，可用 sql_drop_index 删除",
             index_key="redundant_index_name")
         add("未使用索引", ctx.tables.get("unused_indexes"),
             lambda r: "实例启动以来未见使用", index_key="index_name")
         add("自增容量", ctx.tables.get("auto_increment_usage"),
-            lambda r: f"已用 {number(pick(r, 'used_pct'))}%（{safe(pick(r, 'COLUMN_TYPE'))}）")
+            lambda r: (
+                f"已用 {number(pick(r, 'used_pct'))}%（{safe(pick(r, 'COLUMN_TYPE'))}）"
+                # 剩余量用绝对值而不是"剩余百分比"：100-22.79 这种数字没有行动价值，
+                # 而"还能写多少行"才是判断要不要扩容的依据。采集缺失时整段不出现。
+                + (
+                    f"，剩余 {count(pick(r, 'remaining'))}"
+                    if pick(r, "remaining") not in (None, "") else ""
+                )
+            ))
 
         if not rows:
             return []
@@ -1581,9 +2527,217 @@ class MySQLPresentationBuilder:
             total_rows=len(rows),
             note=(
                 f"每类最多展示前 {per_kind} 项；完整清单保留在采集包 tables/ 目录。"
+                "碎片明细已按可回收空间重排（采集端原序为碎片率倒序），因此本表不保证涵盖"
+                "全部「空闲空间大但碎片率低」的表。"
                 "碎片率仅指可回收空间占比，本表不构成任何删除或重建判定。"
             ),
         )]
+
+    def _programmable_objects_item(
+        self, ctx: PackageContext, collection: Any
+    ) -> list[dict[str, Any]]:
+        """存储程序与定时事件清单。
+
+        ``tables/routines.tsv`` 与 ``tables/events.tsv`` 一直是采集项，但报告从未呈现
+        （见 ``docs/check-catalog.yaml`` 的 ``known_mapping_gaps``）。事件必须按 STATUS
+        **三态**呈现：``SLAVESIDE_DISABLED`` 的语义是「源端执行、副本侧不执行」，是副本上
+        正确的收敛做法，不能与 ``ENABLED`` 混在一起计数 —— 否则会把运维已经做对的部分
+        当成没做。角色相关的风险判定仍归规则 ``MYSQL.REPLICATION.REPLICA_WRITABLE``，
+        本项只摆事实，避免同一个问题出现两份判据。
+        """
+        events = ctx.tables.get("events") or []
+        routines = ctx.tables.get("routines") or []
+        if not events and not routines:
+            return []
+        status_cn = {
+            "ENABLED": "已启用",
+            "SLAVESIDE_DISABLED": "副本侧禁用",
+            "DISABLED": "已禁用",
+        }
+        rows: list[dict[str, Any]] = []
+        event_counts: dict[str, int] = {}
+        for record in events:
+            raw_status = str(record.get("STATUS") or "").strip().upper()
+            event_counts[raw_status] = event_counts.get(raw_status, 0) + 1
+            interval = " ".join(
+                str(part) for part in (
+                    record.get("INTERVAL_VALUE"), record.get("INTERVAL_FIELD"),
+                ) if str(part or "").strip()
+            )
+            rows.append({
+                "Schema": record.get("EVENT_SCHEMA"),
+                "事件名": record.get("EVENT_NAME"),
+                "状态": status_cn.get(raw_status, raw_status or "未采集"),
+                "执行周期": interval or "-",
+                "最后执行": record.get("LAST_EXECUTED") or "未执行",
+                "定义者": record.get("DEFINER"),
+            })
+        routine_counts: dict[str, int] = {}
+        for record in routines:
+            kind = str(record.get("ROUTINE_TYPE") or "").strip().upper() or "UNKNOWN"
+            routine_counts[kind] = routine_counts.get(kind, 0) + 1
+        routine_total = sum(routine_counts.values())
+        if not rows:
+            # 没有事件对象时仍要让 routines 的统计有落脚点，否则整项渲染成"无记录"。
+            rows = [
+                {
+                    "对象类型": {"PROCEDURE": "存储过程", "FUNCTION": "函数"}.get(kind, kind),
+                    "数量": value,
+                }
+                for kind, value in sorted(routine_counts.items(), key=lambda pair: -pair[1])
+            ]
+        conclusion_parts: list[str] = []
+        if routine_total:
+            label = {"PROCEDURE": "存储过程", "FUNCTION": "函数"}
+            detail = "、".join(
+                f"{label.get(kind, kind)} {value} 个"
+                for kind, value in sorted(routine_counts.items(), key=lambda pair: -pair[1])
+            )
+            conclusion_parts.append(
+                f"本节点采集到存储程序 {routine_total} 个（{detail}）；存储程序密集的实例，"
+                "慢查询往往来自过程内部的语句，优化需结合定义正文定位。"
+            )
+        if events:
+            enabled = event_counts.get("ENABLED", 0)
+            slaveside = event_counts.get("SLAVESIDE_DISABLED", 0)
+            conclusion_parts.append(
+                f"本节点定时事件 {len(events)} 个，其中已启用 {enabled} 个"
+                + (f"、副本侧禁用 {slaveside} 个" if slaveside else "")
+                + "。「副本侧禁用」表示该事件只在源端执行，是副本上正确的收敛做法；"
+                "其余已启用事件在副本上是否应当执行属业务语义决策 —— "
+                "角色相关的风险判定见风险台账的 MYSQL.REPLICATION.REPLICA_WRITABLE 与报告末尾的待确认事项。"
+            )
+        evidence: list[str] = []
+        if routine_total:
+            evidence.append(f"存储程序 {routine_total} 个")
+        for status, value in sorted(event_counts.items(), key=lambda pair: -pair[1]):
+            evidence.append(f"事件 {status_cn.get(status, status)} {value} 个")
+        return [self._item(
+            "mysql.capacity.programmable_objects",
+            "存储程序与定时事件",
+            "tables/routines.tsv; tables/events.tsv",
+            rows,
+            "".join(conclusion_parts) or "本次未采集到存储程序或定时事件对象。",
+            evidence=evidence,
+            collection=collection("mysql.events") if events else collection("mysql.routines"),
+            total_rows=len(events) or len(routines),
+        )]
+
+    def _node_role_text(self, analysis: dict[str, Any], instance: dict[str, Any]) -> str:
+        nodes = {
+            str(node.get("node_id")): node
+            for node in (analysis.get("topology") or {}).get("nodes") or []
+        }
+        node = nodes.get(str(instance.get("instance_id"))) or {}
+        role = str(node.get("role_effective") or (instance.get("identity") or {}).get("role_observed") or "")
+        if role == "source":
+            return "复制源端"
+        if role == "replica":
+            return "副本"
+        return "角色未判定"
+
+    def _node_health_entry(self, analysis: dict[str, Any], instance: dict[str, Any]) -> dict[str, Any]:
+        summary = instance.get("health_summary") or {}
+        counts = summary.get("counts") or {}
+        return {
+            "node": self._instance_node_label(instance),
+            "hostname": (instance.get("identity") or {}).get("hostname"),
+            "role": self._node_role_text(analysis, instance),
+            "score": summary.get("score"),
+            "grade": summary.get("grade"),
+            "high": counts.get("high", 0),
+            "medium": counts.get("medium", 0),
+            "low": counts.get("low", 0),
+        }
+
+    def _node_attributed_conclusions(
+        self, analysis: dict[str, Any], primary: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """把综合结论落到具体节点。
+
+        分析层的综合结论原先只有 6 个主题，且完全不提节点 —— 多实例巡检时读者
+        看到「2 组参数存在可优化项」却不知道是哪一台。多实例输入时在原有主题之前
+        补「节点风险分布」与逐节点风险清单，并给原有主题标注主体节点；
+        单实例输入保持原样（冻结契约不漂移）。
+        """
+        base = [dict(item) for item in (primary.get("comprehensive_conclusions") or [])]
+        instances = analysis.get("instances") or []
+        if len(instances) < 2:
+            return base
+
+        rows: list[dict[str, Any]] = []
+        digests: list[str] = []
+        has_high = False
+        for instance in instances:
+            label = self._instance_node_label(instance)
+            identity = instance.get("identity") or {}
+            summary = instance.get("health_summary") or {}
+            counts = summary.get("counts") or {}
+            instance_findings = instance.get("findings") or []
+            highs = [f for f in instance_findings if f.get("severity") == "high"]
+            has_high = has_high or bool(highs)
+            digests.append(
+                f"{label}（{identity.get('hostname') or '主机名未采集'}，{self._node_role_text(analysis, instance)}）"
+                f"健康分 {summary.get('score')}/100，风险 {len(instance_findings)} 项"
+                f"（高 {len(highs)} / 中 {counts.get('medium', 0)} / 低 {counts.get('low', 0)}）"
+            )
+        rows.append({
+            "topic": "节点风险分布",
+            "node": "全部节点",
+            "scope": "cluster",
+            "status": "risk" if has_high else "attention",
+            # 只保留「跨节点对比」这一句结论，不再把高风险条目的标题与事实抄进来：
+            # 那是明细，第 12 章风险登记册逐条列着，抄一遍会让这一格涨到 758 字，
+            # 又重新变成"全堆在一起"。
+            "conclusion": "；".join(digests) + "。逐条事实、建议与证据见第 12 章风险登记册。",
+            "evidence": ["risk_register"],
+        })
+        for instance in instances:
+            label = self._instance_node_label(instance)
+            identity = instance.get("identity") or {}
+            summary = instance.get("health_summary") or {}
+            instance_findings = instance.get("findings") or []
+            if not instance_findings:
+                rows.append({
+                    "topic": f"{label} 节点风险清单",
+                    "node": label,
+                    "scope": "node_detail",
+                    "status": "normal",
+                    "conclusion": (
+                        f"{identity.get('hostname') or '主机名未采集'}（{label}，"
+                        f"{self._node_role_text(analysis, instance)}）健康分 {summary.get('score')}/100，未发现风险项。"
+                    ),
+                    "evidence": ["risk_register"],
+                })
+                continue
+            highs = [f for f in instance_findings if f.get("severity") == "high"]
+            meds = [f for f in instance_findings if f.get("severity") == "medium"]
+            lows = [f for f in instance_findings if f.get("severity") == "low"]
+            rows.append({
+                "topic": f"{label} 节点风险清单",
+                "node": label,
+                # scope=node_detail：这是「明细」而不是「结论」。摘要位（1.1 综合结论）
+                # 会跳过它，明细由第 12 章风险登记册承载。此前把每个节点的全部条目
+                # 拼进 conclusion，三节点实测最长一条 1988 字，整坨挤在摘要表格的
+                # 一个单元格里——读者根本读不下去，且与登记册逐条重复。
+                "scope": "node_detail",
+                "status": "risk" if highs else ("attention" if meds else "normal"),
+                "conclusion": (
+                    f"{identity.get('hostname') or '主机名未采集'}（{label}，"
+                    f"{self._node_role_text(analysis, instance)}）健康分 {summary.get('score')}/100，"
+                    f"风险 {len(instance_findings)} 项（高 {len(highs)} / 中 {len(meds)} / 低 {len(lows)}）；"
+                    f"逐条事实、建议与证据见第 12 章风险登记册。"
+                ),
+                "evidence": ["risk_register"],
+            })
+        primary_label = self._instance_node_label(primary)
+        for item in base:
+            entry = dict(item)
+            entry["node"] = f"{primary_label}（主体）"
+            entry["scope"] = "cluster"
+            entry["conclusion"] = f"【{primary_label}】" + str(item.get("conclusion") or "")
+            rows.append(entry)
+        return rows
 
     def build_report_model(self, analysis: dict[str, Any]) -> dict[str, Any]:
         instances = analysis.get("instances", [])
@@ -1593,8 +2747,26 @@ class MySQLPresentationBuilder:
         facts = primary.get("facts", {})
         host = facts.get("host_identity", {}) or {}
         metrics = primary.get("metrics", {})
-        findings = primary.get("findings", [])
-        health = primary.get("health_summary", {})
+        # 风险台账跨节点合并（见 _merged_findings）：多实例巡检时只取
+        # instances[0] 会让其余节点的风险整段消失。安全章节、整改计划与
+        # 附录风险索引都由这一份派生，所以四处同源。
+        findings = self._merged_findings(instances)
+        health = dict(primary.get("health_summary") or {})
+        if len(instances) >= 2:
+            # 单看主体节点会把"集群健康"讲成"主机 .33 健康"。多实例时补一份
+            # 分节点明细：读者要能一眼看出是哪台在拉低整体。
+            health["nodes"] = [self._node_health_entry(analysis, instance) for instance in instances]
+            worst = min(
+                (entry for entry in health["nodes"] if entry.get("score") is not None),
+                key=lambda entry: entry["score"],
+                default=None,
+            )
+            health["scope_note"] = (
+                "总分反映报告主体节点（复制源端）；各节点独立评分见下表，"
+                "集群可用性由最弱节点决定"
+                + (f"（当前最弱为 {worst['node']}，{worst['score']}/100）" if worst else "")
+                + "。"
+            )
         generated = analysis.get("analyzer", {}).get("generated_at")
         collection_date = str(collector.get("started_at") or generated or "")[:10]
         comments = self._metric_commentary(primary) if primary else {}
@@ -1644,7 +2816,7 @@ class MySQLPresentationBuilder:
                 reason="数据库现场采集不能证明备份任务成功或备份可恢复",
                 recommended_action="补充备份平台任务结果、保留策略与恢复演练记录。",
             ).to_legacy_gap())
-        return {
+        model = {
             "schema_version": "2.0",
             "generator_contract": "mysql_inspection_report_model",
             "cover": {
@@ -1684,7 +2856,7 @@ class MySQLPresentationBuilder:
             "capacity": metrics.get("capacity"),
             "risk_register": findings,
             "optimization_plan": priorities,
-            "comprehensive_conclusions": primary.get("comprehensive_conclusions", []),
+            "comprehensive_conclusions": self._node_attributed_conclusions(analysis, primary),
             "inspection_sections": primary.get("inspection_sections", []),
             "collection_gaps": collection_gaps,
             "appendix": {
@@ -1694,3 +2866,14 @@ class MySQLPresentationBuilder:
                 "disclaimer": "本报告基于采集窗口内可获得的证据自动生成。短时采样不代表全天负载；未采集或证据不足的项目不作通过结论，变更前应完成业务确认、备份与回滚评估。",
             },
         }
+        pending = self._merged_confirmations(instances)
+        if pending is not None:
+            # 条件注入：旧基线 analysis.json 里没有这个键，无条件写入会打穿
+            # test_report_builder_matches_frozen_report_contract（逐字典等值比对）。
+            model["pending_confirmations"] = pending
+        # 风险分级 × 节点矩阵（清单 F2）。单实例返回 None（无 node 可分组），
+        # 同样走条件注入 —— 它由已合并的 findings 派生，不新增数据来源。
+        matrix = self._risk_matrix(findings, analysis.get("topology"))
+        if matrix is not None:
+            model["risk_matrix"] = matrix
+        return model

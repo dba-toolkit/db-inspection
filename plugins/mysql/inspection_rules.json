@@ -1,11 +1,11 @@
 {
   "_comment": "MySQL巡检规则配置文件 — 修改此文件可调整阈值和规则行为，无需改动代码。OS 压力类阈值（CPU/iowait/内存/文件系统）不在此配置，统一由 inspection_core/system_checks.py 的 DEFAULT_THRESHOLDS 提供。",
   "version": "2.0",
-
   "globals": {
-    "connection_usage_warning": 0.85
+    "connection_usage_warning": 0.85,
+    "memory_available_floor_percent": 10.0,
+    "swap_usage_warning": 0.3
   },
-
   "rules": {
     "COMMON.COLLECTION.INTEGRITY": {
       "category": "collection",
@@ -14,17 +14,23 @@
       "title": "采集包完整性校验失败",
       "summary": "采集包存在缺失或哈希不一致，分析结果不可直接采信。",
       "recommendation": "重新采集并传输完整压缩包。",
-      "evidence_refs": ["manifest.json"]
+      "evidence_refs": [
+        "manifest.json"
+      ]
     },
     "COMMON.COLLECTION.QUALITY": {
       "category": "collection",
       "severity": "medium",
       "confidence": 1.0,
-      "threshold": { "quality_score_min": 80 },
+      "threshold": {
+        "quality_score_min": 80
+      },
       "title": "采集数据完整度偏低",
       "summary": "关键采集项缺失可能使部分检查无法执行。",
       "recommendation": "检查失败采集项并在补足权限后重采。",
-      "evidence_refs": ["collection_status.json"]
+      "evidence_refs": [
+        "collection_status.json"
+      ]
     },
     "COMMON.SYSTEM.TIME_SYNC": {
       "category": "system",
@@ -33,7 +39,10 @@
       "title": "服务器时间未同步",
       "summary": "时间不同步会影响日志关联、复制诊断和故障时间线。",
       "recommendation": "启用并验证企业时间同步服务，统一各节点时区。",
-      "evidence_refs": ["snapshot.json#time_evidence", "evidence/timedatectl.txt"]
+      "evidence_refs": [
+        "snapshot.json#time_evidence",
+        "evidence/timedatectl.txt"
+      ]
     },
     "COMMON.SYSTEM.CPU_PRESSURE": {
       "category": "system",
@@ -41,7 +50,10 @@
       "title": "CPU 使用率出现高峰",
       "summary": "持续 CPU 高负载可能造成数据库响应时间抖动。",
       "recommendation": "结合业务高峰历史与运行队列确认持续性，再定位 SQL 或系统进程。",
-      "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
+      "evidence_refs": [
+        "history/sar_cpu.csv",
+        "timeseries/system_cpu.csv"
+      ]
     },
     "COMMON.SYSTEM.IOWAIT_PRESSURE": {
       "category": "system",
@@ -49,7 +61,10 @@
       "title": "CPU IO wait 出现高峰",
       "summary": "较高 IO wait 可能表明存储响应不足或集中写入。",
       "recommendation": "关联磁盘 util、await、数据库物理读写和存储层监控。",
-      "evidence_refs": ["history/sar_cpu.csv", "timeseries/system_cpu.csv"]
+      "evidence_refs": [
+        "history/sar_cpu.csv",
+        "timeseries/system_cpu.csv"
+      ]
     },
     "COMMON.SYSTEM.MEMORY_PRESSURE": {
       "category": "system",
@@ -57,7 +72,10 @@
       "title": "主机内存使用率偏高",
       "summary": "持续内存压力可能触发回收或交换，影响数据库稳定性。",
       "recommendation": "结合 available、swap、OOM 记录和 MySQL 内存预算综合判断。",
-      "evidence_refs": ["history/sar_memory.csv", "timeseries/system_memory.csv"]
+      "evidence_refs": [
+        "history/sar_memory.csv",
+        "timeseries/system_memory.csv"
+      ]
     },
     "MYSQL.SECURITY.ROOT_REMOTE": {
       "category": "security",
@@ -66,7 +84,9 @@
       "title": "存在远程 root 高权限账户",
       "summary": "root 允许从非本地地址登录，扩大高权限凭据泄露后的影响范围。",
       "recommendation": "创建具名管理账户并限制 root 登录来源。",
-      "evidence_refs": ["tables/accounts.tsv"]
+      "evidence_refs": [
+        "tables/accounts.tsv"
+      ]
     },
     "MYSQL.INNODB.BUFFER_POOL_RATIO": {
       "category": "performance",
@@ -80,47 +100,67 @@
       "title": "Buffer Pool 与主机内存比例需复核",
       "summary": "Buffer Pool 占比过低可能增加物理读，过高则可能挤压系统与连接内存。",
       "recommendation": "结合数据规模、并发和系统余量核算 Buffer Pool。",
-      "evidence_refs": ["tables/global_variables.tsv", "snapshot.json#host_identity"]
+      "evidence_refs": [
+        "tables/global_variables.tsv",
+        "snapshot.json#host_identity"
+      ]
     },
     "MYSQL.PERFORMANCE.TMP_DISK_RATIO": {
       "category": "performance",
       "severity": "medium",
       "confidence": 0.75,
-      "threshold": { "tmp_disk_ratio_warning": 0.25 },
+      "threshold": {
+        "tmp_disk_ratio_warning": 0.25
+      },
       "title": "临时表落盘比例偏高",
       "summary": "内部临时表频繁落盘可能增加查询延迟和磁盘压力。",
       "recommendation": "优先定位产生大型临时表的 SQL，再评估索引和相关参数。",
-      "evidence_refs": ["timeseries/mysql_status.csv"]
+      "evidence_refs": [
+        "timeseries/mysql_status.csv"
+      ]
     },
     "MYSQL.INNODB.BUFFER_POOL_MISS": {
       "category": "performance",
       "severity": "medium",
       "confidence": 0.75,
-      "threshold": { "buffer_pool_miss_warning": 0.01 },
+      "threshold": {
+        "buffer_pool_miss_warning": 0.01
+      },
       "title": "Buffer Pool 物理读比例偏高",
       "summary": "较高的物理读比例可能表明热点数据未充分缓存。",
       "recommendation": "结合更长业务窗口与磁盘延迟确认，再评估 SQL 和缓存容量。",
-      "evidence_refs": ["timeseries/mysql_status.csv"]
+      "evidence_refs": [
+        "timeseries/mysql_status.csv"
+      ]
     },
     "MYSQL.PERFORMANCE.TABLE_CACHE_MISS": {
       "category": "performance",
       "severity": "medium",
       "confidence": 0.7,
-      "threshold": { "table_cache_miss_warning": 0.10 },
+      "threshold": {
+        "table_cache_miss_warning": 0.1
+      },
       "title": "表缓存未命中比例偏高",
       "summary": "表打开缓存未命中可能带来额外元数据与文件打开开销。",
       "recommendation": "延长采样确认持续性，并结合 Open_tables 调整表缓存。",
-      "evidence_refs": ["timeseries/mysql_status.csv"]
+      "evidence_refs": [
+        "timeseries/mysql_status.csv"
+      ]
     },
     "MYSQL.CONNECTION.USAGE": {
       "category": "performance",
       "severity": "high",
       "confidence": 0.8,
-      "threshold": { "connection_usage_warning": 0.85 },
+      "threshold": {
+        "connection_usage_warning": 0.85
+      },
       "title": "数据库连接使用率接近上限",
       "summary": "连接数接近上限时新连接可能失败并放大故障。",
       "recommendation": "检查连接泄漏和连接池配置，先治理使用方式再评估上限。",
-      "evidence_refs": ["timeseries/mysql_status.csv", "tables/global_variables.tsv#max_connections"]
+      "evidence_refs": [
+        "timeseries/mysql_status.csv",
+        "tables/global_variables.tsv#max_connections"
+      ]
     },
     "COMMON.CAPACITY.FILESYSTEM_USAGE": {
       "category": "capacity",
@@ -129,7 +169,9 @@
       "title": "文件系统使用率过高",
       "summary": "高使用率会增加数据库写入失败和服务中断风险。",
       "recommendation": "确认数据目录对应挂载点，清理或扩容并设置容量告警。",
-      "evidence_refs": ["tables/filesystems.tsv"]
+      "evidence_refs": [
+        "tables/filesystems.tsv"
+      ]
     },
     "MYSQL.SCHEMA.NO_PRIMARY_KEY": {
       "category": "schema",
@@ -138,7 +180,10 @@
       "title": "存在无主键业务表",
       "summary": "无主键表可能影响复制、在线变更和行定位效率。",
       "recommendation": "按业务唯一性设计主键并分批变更。",
-      "evidence_refs": ["tables/no_primary_key_summary.tsv", "tables/no_primary_key_top.tsv"]
+      "evidence_refs": [
+        "tables/no_primary_key_summary.tsv",
+        "tables/no_primary_key_top.tsv"
+      ]
     },
     "MYSQL.SCHEMA.REDUNDANT_INDEX": {
       "category": "schema",
@@ -147,25 +192,37 @@
       "title": "发现疑似冗余索引",
       "summary": "冗余索引会增加写放大、缓存占用和维护成本。",
       "recommendation": "结合唯一约束和执行计划逐项复核后再删除。",
-      "evidence_refs": ["tables/redundant_indexes.tsv"]
+      "evidence_refs": [
+        "tables/redundant_indexes.tsv"
+      ]
     },
     "MYSQL.SCHEMA.AUTO_INCREMENT_CAPACITY": {
       "category": "schema",
       "severity": "medium",
       "confidence": 0.95,
+      "threshold": {
+        "used_pct_warning": 60.0
+      },
       "title": "自增键容量接近风险阈值",
       "summary": "自增列剩余空间不足可能导致写入中断。",
       "recommendation": "确认增长速度和类型上限，制定字段扩容及变更窗口。",
-      "evidence_refs": ["tables/auto_increment_usage.tsv"]
+      "evidence_refs": [
+        "tables/auto_increment_usage.tsv"
+      ]
     },
     "MYSQL.SCHEMA.FRAGMENTATION": {
       "category": "schema",
       "severity": "low",
       "confidence": 0.75,
+      "threshold": {
+        "data_free_mb_min": 100.0
+      },
       "title": "发现高碎片候选表",
       "summary": "较高碎片可能增加空间占用，但不应仅凭比例直接重建。",
       "recommendation": "结合表增长、空闲空间和维护窗口逐表复核。",
-      "evidence_refs": ["tables/fragmentation_top.tsv"]
+      "evidence_refs": [
+        "tables/fragmentation_top.tsv"
+      ]
     },
     "MYSQL.SCHEMA.NON_INNODB": {
       "category": "schema",
@@ -174,27 +231,38 @@
       "title": "存在非 InnoDB 业务表",
       "summary": "非 InnoDB 表可能不具备一致的事务、崩溃恢复和行级锁特性。",
       "recommendation": "确认引擎使用原因与兼容性，评估迁移至 InnoDB。",
-      "evidence_refs": ["tables/non_innodb_tables.tsv"]
+      "evidence_refs": [
+        "tables/non_innodb_tables.tsv"
+      ]
     },
     "MYSQL.SQL.NO_INDEX_DIGEST": {
       "category": "performance",
       "severity": "medium",
       "confidence": 0.7,
-      "threshold": { "no_index_exec_min": 100, "no_index_seconds_min": 60 },
+      "threshold": {
+        "no_index_exec_min": 100,
+        "no_index_seconds_min": 60
+      },
       "title": "存在较多未使用索引的语句执行",
       "summary": "频繁全扫描可能增加 CPU 与 IO，但小表扫描也可能合理。",
       "recommendation": "按总耗时、扫描行数和业务场景审查对应摘要，使用 EXPLAIN 验证。",
-      "evidence_refs": ["tables/sql_digests_top.tsv"]
+      "evidence_refs": [
+        "tables/sql_digests_top.tsv"
+      ]
     },
     "MYSQL.TRANSACTION.LONG_RUNNING": {
       "category": "performance",
       "severity": "high",
       "confidence": 0.95,
-      "threshold": { "long_transaction_seconds": 300 },
+      "threshold": {
+        "long_transaction_seconds": 300
+      },
       "title": "存在长时间未结束事务",
       "summary": "长事务可能导致锁等待、Undo 膨胀并延迟清理。",
       "recommendation": "定位会话和业务调用链，确认后尽快提交或回滚。",
-      "evidence_refs": ["tables/long_transactions.tsv"]
+      "evidence_refs": [
+        "tables/long_transactions.tsv"
+      ]
     },
     "MYSQL.LOCK.WAITING": {
       "category": "performance",
@@ -203,17 +271,24 @@
       "title": "采集时存在锁等待",
       "summary": "锁等待会直接影响请求延迟，持续时可能形成阻塞链。",
       "recommendation": "分析阻塞链、事务边界和相关 SQL，避免直接盲目终止会话。",
-      "evidence_refs": ["tables/data_lock_waits.tsv", "tables/metadata_locks_pending.tsv"]
+      "evidence_refs": [
+        "tables/data_lock_waits.tsv",
+        "tables/metadata_locks_pending.tsv"
+      ]
     },
     "MYSQL.REPLICATION.HEALTH": {
       "category": "availability",
       "severity": "high",
       "confidence": 0.95,
-      "threshold": { "replication_lag_seconds": 60 },
+      "threshold": {
+        "replication_lag_seconds": 60
+      },
       "title": "复制状态异常",
       "summary": "复制线程停止或延迟过高会降低高可用和数据保护能力。",
       "recommendation": "检查复制错误、网络和源端状态，制定可回滚的恢复步骤。",
-      "evidence_refs": ["tables/replica_status.tsv"]
+      "evidence_refs": [
+        "tables/replica_status.tsv"
+      ]
     },
     "MYSQL.REPLICATION.RESIDUAL_CHANNEL": {
       "category": "availability",
@@ -222,7 +297,9 @@
       "title": "存在指向自身的残留复制通道",
       "summary": "复制状态行的上游声明指向本机（Source_UUID 为空），属残留或未启动的通道，不构成真实主从关系，但会在巡检判断和切换演练中造成误判。",
       "recommendation": "确认该通道为历史配置遗留后清理（RESET REPLICA ALL）或补全上游信息；清理前确认不影响现有下游复制链路。",
-      "evidence_refs": ["tables/replica_status.tsv"]
+      "evidence_refs": [
+        "tables/replica_status.tsv"
+      ]
     },
     "MYSQL.LOG.ERROR_EVENTS": {
       "category": "availability",
@@ -231,16 +308,253 @@
       "title": "错误日志存在错误级事件",
       "summary": "错误事件可能反映启动、存储、复制或连接异常。",
       "recommendation": "按错误代码和时间窗口与业务告警关联，必要时经授权采集脱敏日志片段。",
-      "evidence_refs": ["tables/error_log_summary.tsv"]
+      "evidence_refs": [
+        "tables/error_log_summary.tsv"
+      ]
     },
     "MYSQL.BACKUP.TASK_VISIBILITY": {
       "category": "backup",
       "severity": "low",
       "confidence": 0.6,
-      "title": "未发现备份任务配置",
-      "summary": "主机上未见 cron / systemd timer / 备份进程，无法确认备份是否已经配置。",
+      "title": "备份任务配置未生效",
+      "summary": "主机侧备份证据（cron / systemd timer / 备份进程）显示本机没有生效的备份任务；证据文件为空或缺失时无法判定是否存在备份，不代表没有备份。",
       "recommendation": "确认备份机制（本地脚本 / 备份平台 / 存储侧快照）归属，并补充可验证的备份结果与恢复演练证据。",
-      "evidence_refs": ["evidence/backup_cron.txt", "evidence/backup_timers.txt", "evidence/backup_processes.txt"]
+      "evidence_refs": [
+        "evidence/backup_cron.txt",
+        "evidence/backup_timers.txt",
+        "evidence/backup_processes.txt"
+      ]
+    },
+    "MYSQL.TRANSACTION.ISOLATION_LEVEL": {
+      "category": "reliability",
+      "severity": "high",
+      "confidence": 1.0,
+      "title": "事务隔离级别低于已提交读",
+      "summary": "READ-UNCOMMITTED 允许读到其它事务尚未提交的数据（脏读），一致性读也不保证可重复；业务读到中间态数据时，对账与报表会出现无法复现的差异。",
+      "recommendation": "把 transaction_isolation 调整为 READ-COMMITTED（或按业务要求 REPEATABLE-READ）。该参数是动态参数，SET GLOBAL 后只对新会话生效，需重启应用连接池或等待连接自然轮换；变更前确认业务对可重复读的依赖。",
+      "evidence_refs": [
+        "tables/global_variables.tsv#transaction_isolation"
+      ]
+    },
+    "MYSQL.INNODB.REDO_CAPACITY": {
+      "category": "reliability",
+      "severity": "medium",
+      "confidence": 0.95,
+      "threshold": {
+        "redo_capacity_min_bytes": 1073741824
+      },
+      "title": "Redo 日志实际容量偏小",
+      "summary": "实际 redo 容量停留在默认值区间时，写密集场景容易触发 redo 文件等待（MY-013865），表现为周期性写入抖动，严重时阻塞提交。注意 innodb_redo_log_capacity 的变量值不代表实际容量，容量由旧参数算出时不回写该变量。",
+      "recommendation": "以状态变量 Innodb_redo_log_capacity_resized 为准，按写入速率把实际容量提升到能容纳数分钟以上写入量（1G~4G 起步）。该参数为动态参数，可在业务低峰 SET GLOBAL 在线调整，观察 Innodb_redo_log_resize_status 直到变为 OK。",
+      "evidence_refs": [
+        "tables/global_status.tsv#Innodb_redo_log_capacity_resized",
+        "tables/global_variables.tsv#innodb_log_file_size"
+      ]
+    },
+    "MYSQL.REPLICATION.SKIP_ERRORS": {
+      "category": "availability",
+      "severity": "medium",
+      "confidence": 1.0,
+      "title": "复制配置了跳过错误",
+      "summary": "replica_skip_errors 非 OFF 时，指定的错误码不再中断复制而是被静默吞掉，主从数据会在无人察觉的情况下持续分叉，直到某次查询或切换才暴露。",
+      "recommendation": "确认这些错误码当初为何被加入；治理根因（主键/唯一键冲突、数据不一致）后将其恢复为 OFF。清理前先做 pt-table-checksum 一类的一致性校验，并保留校验报告作为整改证据。",
+      "evidence_refs": [
+        "tables/global_variables.tsv#replica_skip_errors"
+      ]
+    },
+    "MYSQL.REPLICATION.REPLICA_WRITABLE": {
+      "category": "availability",
+      "severity": "high",
+      "confidence": 0.95,
+      "title": "副本实例允许写入",
+      "summary": "副本 super_read_only 关闭，且存在可写入路径（read_only 关闭，或事件调度器开启并挂着 ENABLED 事件）。写入副本的数据不会回流到源端，主从切换后这部分数据可能被覆盖或造成复制中断。",
+      "recommendation": "副本上开启 super_read_only=ON（该参数为动态参数，SET GLOBAL 立即生效）；如确需在副本跑定时任务，改用外部调度并保证任务只读，或先关闭 event_scheduler 再逐个确认 ENABLED 事件的写入行为。",
+      "evidence_refs": [
+        "tables/global_variables.tsv#super_read_only",
+        "tables/events.tsv",
+        "tables/replica_status.tsv"
+      ]
+    },
+    "MYSQL.INNODB.DEADLOCK": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "InnoDB 死锁历史",
+      "summary": "SHOW ENGINE INNODB STATUS 保留着最近一次死锁现场。死锁本身被 InnoDB 自动回滚处理，但反复出现说明事务访问顺序或加锁范围需要调整，被选中回滚的事务会直接失败。",
+      "recommendation": "按证据里的 SQL 与索引定位冲突事务，统一多表写入顺序、缩短事务边界、补齐 WHERE 条件上的索引；应用侧对死锁错误码做重试而不是直接报错。",
+      "evidence_refs": [
+        "evidence/innodb_status.txt"
+      ]
+    },
+    "MYSQL.SYSTEM.TRANSPARENT_HUGEPAGE": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "透明大页处于 always",
+      "summary": "透明大页开启时内核会异步合并内存页，数据库这类大内存进程容易出现分配延迟抖动和瞬时停顿；MySQL 官方建议关闭透明大页。",
+      "recommendation": "把 /sys/kernel/mm/transparent_hugepage/enabled 调整为 never（写入 /etc/rc.local 或 systemd 单元以持久化），并同步确认 defrag 不为 always；如已规划静态大页，改配 vm.nr_hugepages。",
+      "evidence_refs": [
+        "tables/hugepages.tsv"
+      ]
+    },
+    "MYSQL.SYSTEM.IDENTITY_CONFLICT": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.95,
+      "title": "集群内主机标识重复",
+      "summary": "多个节点共用同一主机名或同一 machine-id。machine-id 重复通常意味着虚机由模板克隆而未重新生成（未执行 sysprep / 未清空 /etc/machine-id），会让系统日志、监控采集和授权绑定指向错误的机器；主机名重复会让 SSH、备份和切换脚本连到错误的节点。",
+      "recommendation": "为每个节点设置唯一主机名并同步 hosts/DNS；克隆出来的虚机按发行版方式重新生成 machine-id（清空 /etc/machine-id 与 /var/lib/dbus/machine-id 后重启，或 systemd-machine-id-setup）。改完重新采集核对。",
+      "evidence_refs": [
+        "snapshot.json#host_identity",
+        "snapshot.json#instance_identity"
+      ]
+    },
+    "COMMON.SYSTEM.SWAP_PRESSURE": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.9,
+      "threshold": {
+        "swap_usage_warning": 0.3
+      },
+      "title": "Swap 使用率偏高",
+      "summary": "swap 已被大量占用说明内存曾经吃紧，数据库进程的内存页被换出后，一次访问就可能触发磁盘读，表现为不可预测的延迟尖刺。",
+      "recommendation": "核对 innodb_buffer_pool_size 与主机内存预算，找出内存占用增长来源；用 vm.swappiness 降低换出倾向，必要时扩容内存而不是继续依赖 swap。",
+      "evidence_refs": [
+        "tables/memory_snapshot.tsv",
+        "history/sar_memory.csv"
+      ]
+    },
+    "COMMON.SYSTEM.LOG_ROTATION": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.9,
+      "threshold": {
+        "log_file_warning_bytes": 1073741824,
+        "log_file_critical_bytes": 10737418240
+      },
+      "title": "日志文件体积超阈值，轮转可能失效",
+      "summary": "单个日志文件长到 GB 级说明 logrotate 没生效或轮转周期过长；日志继续膨胀会吃满所在分区，进而拖垮写入和备份。",
+      "recommendation": "确认 logrotate 配置与 cron/timer 是否真的执行，补上 size+周期双条件轮转；已超大的文件先压缩归档再重建，勿直接删除正在写入的句柄。",
+      "evidence_refs": [
+        "tables/log_files.tsv",
+        "tables/filesystems.tsv"
+      ]
+    },
+    "MYSQL.SECURITY.BINLOG_UNENCRYPTED": {
+      "category": "security",
+      "severity": "medium",
+      "confidence": 0.95,
+      "threshold": {
+        "binlog_unencrypted_warning": 1
+      },
+      "title": "Binlog 未加密",
+      "summary": "Binlog 以明文落盘，任何能读到数据目录或备份文件的人都能还原出全部行级变更，主从复制链路之间也是明文传输。",
+      "recommendation": "评估 binlog_encryption=ON 的开启窗口，先确认下游复制、备份工具与版本均支持；开启需重启或至少切换一次日志，安排在维护窗口。",
+      "evidence_refs": [
+        "tables/binary_logs.tsv"
+      ]
+    },
+    "MYSQL.CAPACITY.BINLOG_SIZE": {
+      "category": "capacity",
+      "severity": "low",
+      "confidence": 0.9,
+      "threshold": {
+        "binlog_total_warning_bytes": 53687091200
+      },
+      "title": "Binlog 总容量占用偏高",
+      "summary": "磁盘上保留的 Binlog 总量已相当可观，除占用空间外，也意味着保留窗口内可重放的数据量很大。",
+      "recommendation": "核对 binlog_expire_logs_seconds 保留期是否与实际恢复需求匹配；从库保留期不应长于主库，否则主库已轮转的日志在从库仍长期留存。",
+      "evidence_refs": [
+        "tables/binary_logs.tsv",
+        "tables/global_variables.tsv"
+      ]
+    },
+    "MYSQL.REPLICATION.RETENTION_DRIFT": {
+      "category": "replication",
+      "severity": "low",
+      "confidence": 0.9,
+      "title": "副本 Binlog 保留期长于源端",
+      "summary": "副本保留 Binlog 的时间比源端更长，源端已经轮转掉的日志在副本上仍占着磁盘；一旦需要基于更早的位点重建，能用的日志范围与预期不符。",
+      "recommendation": "把副本的 binlog_expire_logs_seconds 调整为不高于源端；若副本确实需要更长历史，请明确记录原因并单独核算磁盘容量。",
+      "evidence_refs": [
+        "tables/global_variables.tsv",
+        "tables/replica_status.tsv"
+      ]
+    },
+    "MYSQL.CONFIG.RUNTIME_DRIFT": {
+      "category": "config",
+      "severity": "medium",
+      "confidence": 0.9,
+      "threshold": {
+        "runtime_drift_ignore": 1
+      },
+      "title": "配置文件与运行值不一致",
+      "summary": "my.cnf 里写的值与实例当前运行值不同，说明配置改过之后没有重启或没有生效，下次重启会把线上行为改成配置文件的版本。",
+      "recommendation": "逐项确认哪一侧才是期望值：若要保留运行值，请把配置文件同步成运行值并补文档；若要采用配置文件值，需安排重启窗口并评估影响。",
+      "evidence_refs": [
+        "tables/mycnf_allowlist.tsv",
+        "tables/global_variables.tsv"
+      ]
+    },
+    "MYSQL.RUNTIME.TABLE_CACHE": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.8,
+      "threshold": {
+        "table_cache_open_ops_per_sec": 20
+      },
+      "title": "表缓存已顶格或打开速率偏高",
+      "summary": "Open_tables 触及 table_open_cache，或累计打开速率异常，说明表缓存偏小，会带来元数据与文件打开开销。",
+      "recommendation": "结合业务表数量上调 table_open_cache（受 open_files_limit 约束），低峰 SET GLOBAL 观察后再落配置。",
+      "evidence_refs": [
+        "tables/global_status.tsv",
+        "tables/global_variables.tsv"
+      ]
+    },
+    "MYSQL.RUNTIME.CONNECTION_ERRORS": {
+      "category": "performance",
+      "severity": "medium",
+      "confidence": 0.8,
+      "threshold": {
+        "aborted_connects_ratio_warning": 0.05,
+        "max_connect_errors_low": 10000
+      },
+      "title": "连接失败率偏高",
+      "summary": "累计 Aborted_connects 占 Connections 比例偏高，常见原因是密码错误、网络异常或应用频繁重连。",
+      "recommendation": "结合 error log 与来源 IP 定位失败原因；若 max_connect_errors 偏低，来源 IP 连续失败达阈值即被拒绝，需 FLUSH HOSTS。",
+      "evidence_refs": [
+        "tables/global_status.tsv",
+        "tables/global_variables.tsv",
+        "tables/error_log_summary.tsv"
+      ]
+    },
+    "MYSQL.CAPACITY.LARGE_TABLE": {
+      "category": "capacity",
+      "severity": "low",
+      "confidence": 0.9,
+      "threshold": {
+        "large_table_warning_mb": 102400
+      },
+      "title": "存在超大单表",
+      "summary": "单表数据量超过 100 GiB，备份、DDL、归档与容量规划需重点评估。",
+      "recommendation": "评估分区/归档/冷热分离；索引体积为 0 的表需重点核对是否存在全表扫描路径。",
+      "evidence_refs": [
+        "tables/large_tables_top.tsv"
+      ]
+    },
+    "MYSQL.SCHEMA.TEST_TABLE_LEFTOVER": {
+      "category": "schema",
+      "severity": "low",
+      "confidence": 0.6,
+      "title": "存在疑似测试/备份残留表",
+      "summary": "按命名模式（test_ 前缀、_bak 日期、日期后缀、_copyN）识别出疑似残留对象，需确认是否仍在使用。",
+      "recommendation": "确认后下线不再使用的表；确需保留的备份表建议移入独立归档库或统一命名规范。",
+      "evidence_refs": [
+        "tables/non_innodb_tables.tsv",
+        "tables/no_primary_key_top.tsv",
+        "tables/redundant_indexes.tsv",
+        "tables/large_tables_top.tsv"
+      ]
     }
   }
 }

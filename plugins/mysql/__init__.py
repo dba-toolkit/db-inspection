@@ -9,7 +9,7 @@ from .metrics import (
     replica_threads_running,
     split_self_referencing_replica_rows,
 )
-from .presentation import MySQLPresentationBuilder
+from .presentation import MySQLPresentationBuilder, pending_confirmations
 from .rules import MySQLRuleProvider
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "MySQLPresentationBuilder",
     "MySQLRuleProvider",
     "PackageAdapterError",
+    "pending_confirmations",
     "is_self_referencing_replica_row",
     "local_host_names",
     "replica_threads_running",

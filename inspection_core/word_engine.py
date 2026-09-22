@@ -577,7 +577,8 @@ class WordReportEngine:
         set_run_font(p.add_run(value), size=10.5, color=COLOR_TEXT)
 
     def table(self, headers: list[str], rows: Iterable[Iterable[Any]], widths_dxa: list[int],
-              *, compact: bool = False, severity_column: int | None = None) -> Any:
+              *, compact: bool = False, severity_column: int | None = None,
+              status_column: int | None = None) -> Any:
         table = self.doc.add_table(rows=1, cols=len(headers))
         table.style = "Table Grid"
         header = table.rows[0]
@@ -628,6 +629,17 @@ class WordReportEngine:
                     elif rendered == "低" or lowered == "low":
                         color, bold = COLOR_LOW, True
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                elif status_column == column:
+                    # 三态判定列（达标 / 不达标 / 不适用）。单元格形如
+                    # 「不达标（.34 取 fsync/fdatasync，双重缓冲）」，说明跟在括号里，
+                    # 所以用前缀匹配 —— 等值比较会让所有带说明的行全部失色。
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    if rendered.startswith("不达标"):
+                        color, bold = COLOR_HIGH, True
+                    elif rendered.startswith("达标"):
+                        color = COLOR_GOOD
+                    elif rendered.startswith(("不适用", "未采集")):
+                        color = COLOR_MUTED
                 cell_size = 9.0 if compact and self.layout == "professional" else 8.7 if compact else 9.5
                 set_run_font(p.add_run(rendered), size=cell_size, bold=bold, color=color)
         set_table_geometry(table, widths_dxa)
@@ -671,7 +683,11 @@ class WordReportEngine:
         widths = self._dynamic_widths(headers, rows)
         compact = len(headers) >= 5
         rendered_rows = [[row.get(header) for header in headers] for row in rows]
-        table = self.table(headers, rendered_rows, widths, compact=compact)
+        # 「判定」列按三态着色（达标 / 不达标 / 不适用）。这是 MySQL 配置对比表的
+        # 固定列名，其他库或没有该列的表格不会命中，因此对既有输出零影响。
+        status_column = headers.index("判定") if "判定" in headers else None
+        table = self.table(headers, rendered_rows, widths, compact=compact,
+                           status_column=status_column)
         if note:
             p = self.doc.add_paragraph()
             p.paragraph_format.space_before = Pt(0)
@@ -881,25 +897,97 @@ class WordReportEngine:
             ]],
             [3000, 2120, 2120, 2120],
         )
+        # 多实例：把各节点独立评分单列一张表。首页只给主体节点的分数会让
+        # 读者以为"集群健康 = 主体主机健康"，看不出是哪台在拉低整体。
+        node_health = health.get("nodes") or []
+        if node_health:
+            self.table(
+                ["节点", "主机名", "角色", "健康分", "高风险", "中风险", "低风险"],
+                [[
+                    text(entry.get("node")),
+                    text(entry.get("hostname")),
+                    text(entry.get("role")),
+                    f"{number(entry.get('score'), 0)} / 100",
+                    number(entry.get("high"), 0),
+                    number(entry.get("medium"), 0),
+                    number(entry.get("low"), 0),
+                ] for entry in node_health],
+                [1700, 1900, 1200, 1200, 1120, 1120, 1120],
+                compact=True,
+            )
+        scope_note = health.get("scope_note")
+        if scope_note:
+            self.paragraph(text(scope_note), color=self.theme.muted)
+        self._summary_sub = 1
         if conclusions:
+            has_node = any(item.get("node") for item in conclusions)
+            # 摘要位只放「结论」不放「明细」：节点风险清单（scope=node_detail）在三节点
+            # 实测单条 1988 字，塞进摘要表格就是"全堆在一起"。明细落在第 12 章风险
+            # 登记册，摘要改用下面的「高风险项速览」给出最要紧的若干条。
+            # 单实例的结论条目不带 scope 键，因此全部保留，外观不变。
+            summary_items = [item for item in conclusions if item.get("scope") != "node_detail"]
             rows = []
             status_map = {
                 "normal": "正常", "attention": "关注", "risk": "风险",
                 "not_evaluated": "证据不足", "not_applicable": "不适用",
             }
-            for index, item in enumerate(conclusions, 1):
-                rows.append([
+            for index, item in enumerate(summary_items, 1):
+                cells = [
                     index,
                     status_map.get(str(item.get("status")), text(item.get("status"))),
-                    f"{text(item.get('topic'))}：{text(item.get('conclusion'))}",
-                ])
+                ]
+                if has_node:
+                    cells.append(text(item.get("node"), "全部节点"))
+                cells.append(f"{text(item.get('topic'))}：{text(item.get('conclusion'))}")
+                rows.append(cells)
             self.heading("1.1 综合结论", 2)
-            table = self.table(["序号", "状态", "结论内容"], rows, [800, 1200, 7360], compact=False)
-            for row, item in zip(table.rows[1:], conclusions):
+            if has_node:
+                table = self.table(
+                    ["序号", "状态", "节点", "结论内容"], rows, [700, 1000, 1500, 6160], compact=False,
+                )
+            else:
+                table = self.table(["序号", "状态", "结论内容"], rows, [800, 1200, 7360], compact=False)
+            for row, item in zip(table.rows[1:], summary_items):
                 status = str(item.get("status"))
                 color = COLOR_HIGH if status == "risk" else COLOR_MEDIUM if status == "attention" else COLOR_TEXT
                 for run in row.cells[1].paragraphs[0].runs:
                     set_run_font(run, size=9.5, bold=True, color=color)
+        # 高风险项速览：只列 high，一行一条，让读者翻开第一页就知道最要紧的是什么。
+        # 取 risk_register 现成条目（不重算判断）；其 node 键只在多实例注入，
+        # 所以单实例报告不会多出这张表。
+        highlights = [
+            finding
+            for finding in (self.model.get("risk_register") or [])
+            if str(finding.get("severity")) == "high" and finding.get("node")
+        ]
+        if highlights:
+            self._summary_sub = 2
+            self.heading("1.2 高风险项速览", 2)
+
+            def brief_facts(values: Any) -> str:
+                parts = [str(value) for value in (values or [])[:2] if str(value).strip()]
+                joined = "；".join(parts)
+                return joined if len(joined) <= 90 else joined[:88] + "…"
+
+            self.note_box(
+                "速览口径",
+                f"仅列风险登记册中的 {len(highlights)} 条高风险项，"
+                "完整事实、建议与证据见第 12 章；中低风险不在本节重复。",
+                accent=COLOR_HIGH,
+            )
+            table = self.table(
+                ["节点", "风险项", "关键事实"],
+                [[
+                    text(finding.get("node")),
+                    text(finding.get("title")),
+                    brief_facts(finding.get("facts")) or "未提供事实",
+                ] for finding in highlights],
+                [1500, 2700, 5160],
+                compact=True,
+            )
+            for row in table.rows[1:]:
+                for run in row.cells[1].paragraphs[0].runs:
+                    set_run_font(run, size=9, bold=True, color=COLOR_HIGH)
         self.note_box(
             "结论口径",
             "健康评分、风险等级和检查结论均直接读取分析结果；Word 生成器仅负责呈现，不重新计算或改变判断。",
@@ -1038,7 +1126,8 @@ class WordReportEngine:
         quality = appendix.get("data_quality") or {}
         plan = self.model.get("optimization_plan") or {}
         self.page_break()
-        self.heading("1.2 管理关注与处置节奏", 2)
+        # 小节号跟着 1 章实际渲染了几个小节走：有高风险速览时本节是 1.3，没有则 1.2。
+        self.heading(f"1.{getattr(self, '_summary_sub', 1) + 1} 管理关注与处置节奏", 2)
         self.table(
             ["管理视角", "当前结果", "处置说明"],
             [
@@ -1123,6 +1212,72 @@ class WordReportEngine:
             self._render_section_conclusion(section, f"{main_number}.{next_subsection}")
             main_number += 1
 
+    # 矩阵着色只区分「该节点有没有这一级别的风险」，不做数量渐变 —— 渐变需要
+    # 图例，Word 表格里没地方放，客户看到深浅会问「这个颜色什么意思」。数量
+    # 本身就在格子里，颜色只负责把有风险的格子从一片数字里挑出来。
+    RISK_MATRIX_STYLES = {
+        "critical": ("EFD2D2", COLOR_HIGH),
+        "high": ("F6DEDE", COLOR_HIGH),
+        "medium": ("FBF0DC", COLOR_MEDIUM),
+        "low": ("F2F2F2", COLOR_LOW),
+        "info": ("F2F2F2", COLOR_MUTED),
+    }
+    RISK_MATRIX_PEAK_FILL = "EDEDED"
+
+    def _risk_matrix_table(self, matrix: dict[str, Any]) -> None:
+        """风险分级 × 节点矩阵（《可沉淀清单》F2）。
+
+        数据由 ``plugins/mysql/presentation.py:_risk_matrix`` 产出，且只给英文
+        严重度档位；中文列头在这里用 ``SEVERITY_CN`` 翻译，保证严重度中文词汇表
+        只有一处定义，不会两层各写一份后漂移。
+        """
+        severities = [str(item) for item in matrix.get("severity_columns") or []]
+        rows = matrix.get("rows") or []
+        if not severities or not rows:
+            return
+        headers = ["节点", *(SEVERITY_CN.get(item, item) for item in severities), "合计"]
+        rendered = [
+            [text(row.get("label"))]
+            + [str((row.get("counts") or {}).get(item, 0)) for item in severities]
+            + [str(row.get("total", 0))]
+            for row in rows
+        ]
+        columns = len(headers)
+        node_width, total_width = 3000, 2160
+        middle = max(900, (CONTENT_DXA - node_width - total_width) // max(1, columns - 2))
+        widths = [node_width] + [middle] * (columns - 2)
+        widths.append(CONTENT_DXA - sum(widths))
+        self.paragraph("各节点风险检出数按级别汇总：", after=4)
+        table = self.table(headers, rendered, widths, compact=True)
+        for row in table.rows[1:]:
+            for cell in row.cells[1:]:
+                for paragraph in cell.paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        peak = max(int(row.get("total") or 0) for row in rows)
+        for index, row in enumerate(rows, start=1):
+            highlights: dict[int, tuple[str, str]] = {}
+            for column, severity in enumerate(severities, start=1):
+                triggered = int((row.get("counts") or {}).get(severity, 0))
+                if triggered and severity in self.RISK_MATRIX_STYLES:
+                    highlights[column] = self.RISK_MATRIX_STYLES[severity]
+            if peak and int(row.get("total") or 0) == peak:
+                # 合计最高的一行标出来 —— 这就是「风险压在哪台」的答案。并列最高时
+                # 几行都标，不做人为取舍。
+                highlights[columns - 1] = (self.RISK_MATRIX_PEAK_FILL, COLOR_TEXT)
+            for column, (fill, color) in highlights.items():
+                cell = table.rows[index].cells[column]
+                set_cell_shading(cell, fill)
+                for paragraph in cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.color.rgb = RGBColor.from_string(color)
+                        run.font.bold = True
+        note = matrix.get("note")
+        if note:
+            p = self.doc.add_paragraph()
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(7)
+            set_run_font(p.add_run(f"说明：{note}"), size=8.5, color=COLOR_MUTED, italic=True)
+
     def build_risk_register_professional(self) -> None:
         findings = self.model.get("risk_register") or []
         main_number = 3 + len(self._ordered_sections())
@@ -1136,23 +1291,46 @@ class WordReportEngine:
         if not findings:
             self.note_box("风险结论", "本次已评价规则未发现风险。", accent=COLOR_TEXT)
             return
+        if self.model.get("risk_matrix"):
+            self._risk_matrix_table(self.model["risk_matrix"])
+        # 多实例报告的风险台账由各节点合并而成，每条带节点标识；单实例
+        # （无 node 键）保持原 5 列，Oracle / PostgreSQL 的既有输出不变。
+        has_node = any(str(finding.get("node") or "").strip() for finding in findings)
         rows = []
         for finding in findings:
             evidence = "；".join(str(value) for value in finding.get("facts") or [])
-            rows.append([
-                text(finding.get("finding_id")),
+            recommendation = text(finding.get("recommendation"))
+            if finding.get("requires_restart"):
+                # 规则包已声明生效方式，但渲染层此前从未读取 —— 读者无从判断
+                # 该整改是否需要停机窗口。只在明确为真时追加，None 不臆断。
+                restart_note = "该变更需重启实例生效"
+                recommendation = f"{recommendation}（{restart_note}）" if recommendation else restart_note
+            row = [text(finding.get("finding_id"))]
+            if has_node:
+                row.append(text(finding.get("node")))
+            row.extend([
                 SEVERITY_CN.get(finding.get("severity"), text(finding.get("severity"))),
                 text(finding.get("title")),
                 evidence or text(finding.get("summary")),
-                text(finding.get("recommendation")),
+                recommendation,
             ])
-        self.table(
-            ["编号", "级别", "风险事项", "事实依据", "处置建议"],
-            rows,
-            [700, 700, 1900, 2780, 3280],
-            compact=True,
-            severity_column=1,
-        )
+            rows.append(row)
+        if has_node:
+            self.table(
+                ["编号", "节点", "级别", "风险事项", "事实依据", "处置建议"],
+                rows,
+                [620, 1100, 600, 1750, 2400, 2890],
+                compact=True,
+                severity_column=2,
+            )
+        else:
+            self.table(
+                ["编号", "级别", "风险事项", "事实依据", "处置建议"],
+                rows,
+                [700, 700, 1900, 2780, 3280],
+                compact=True,
+                severity_column=1,
+            )
 
     def build_remediation_plan_professional(self) -> None:
         plan = self.model.get("optimization_plan") or {}
@@ -1183,21 +1361,79 @@ class WordReportEngine:
                 compact=True,
             )
 
+    def build_pending_confirmations_professional(self) -> None:
+        """待客户确认事项。
+
+        与风险登记册的分工：登记册答「是什么风险、怎么改」，本章答「哪几件事必须由
+        客户拍板、或必须由客户提供外部证据」。它由**规则触发情况**派生，所以没有
+        事项时不留空章，而是写清「本次没有」；而模型根本没提供该字段（旧模型 /
+        未接入）时不得写成「没有」，只能声明未产出清单 —— 延续「未采集 ≠ 0」。
+        """
+        items = self.model.get("pending_confirmations")
+        main_number = 5 + len(self._ordered_sections())
+        self.page_break()
+        self.heading(f"{main_number}. 待客户确认事项", 1)
+        if items is None:
+            self.note_box(
+                "数据状态",
+                "本次分析未产出待确认事项清单，不对是否存在此类事项作结论。",
+                accent=COLOR_TEXT,
+            )
+            return
+        self.note_box(
+            "确认口径",
+            "以下事项需要客户侧决策或提供外部证据，DBA 不单方面变更；技术性整改项"
+            "（容量、参数、对象治理）不进本章，见风险登记册与分级整改计划。",
+        )
+        if not items:
+            self.note_box(
+                "确认结论",
+                "本次已评价规则中，没有需要客户确认或提供外部证据的事项。",
+                accent=COLOR_TEXT,
+            )
+            return
+        has_node = any(str(item.get("node") or "").strip() for item in items)
+        header = ["#", "主题", "待确认内容", "依据"]
+        widths = [420, 1500, 4300, 3140]
+        if has_node:
+            header = ["#", "节点", "主题", "待确认内容", "依据"]
+            widths = [400, 900, 1400, 3900, 2760]
+        rows = []
+        for index, item in enumerate(items, 1):
+            evidence = "；".join(str(value) for value in item.get("evidence") or [])
+            row = [str(index)]
+            if has_node:
+                row.append(text(item.get("node")))
+            row.extend([
+                text(item.get("topic")),
+                text(item.get("question")),
+                evidence or "见对应风险项",
+            ])
+            rows.append(row)
+        self.table(header, rows, widths, compact=True)
+
     def build_management_conclusion_professional(self) -> None:
         conclusions = self.model.get("comprehensive_conclusions") or []
-        main_number = 5 + len(self._ordered_sections())
+        main_number = 6 + len(self._ordered_sections())
         self.page_break()
         self.heading(f"{main_number}. 综合结论与管理建议", 1)
         if conclusions:
+            has_node = any(item.get("node") for item in conclusions)
+            header = ["主题", "状态", "综合结论", "证据"]
+            widths = [1700, 900, 3900, 2860]
+            if has_node:
+                header = ["主题", "状态", "节点", "综合结论", "证据"]
+                widths = [1500, 900, 1500, 3300, 2160]
             self.table(
-                ["主题", "状态", "综合结论", "证据"],
+                header,
                 [[
                     text(item.get("topic")),
                     self._analysis_status_text(item.get("status")),
+                ] + ([text(item.get("node"), "全部节点")] if has_node else []) + [
                     text(item.get("conclusion")),
                     "；".join(str(value) for value in item.get("evidence") or []) or "未提供补充依据",
                 ] for item in conclusions],
-                [1700, 900, 3900, 2860],
+                widths,
                 compact=True,
                 severity_column=1,
             )
@@ -1257,7 +1493,7 @@ class WordReportEngine:
         quality = appendix.get("data_quality") or {}
         evaluations = appendix.get("rule_evaluations") or []
         gaps = self.model.get("collection_gaps") or []
-        main_number = 6 + len(self._ordered_sections())
+        main_number = 7 + len(self._ordered_sections())
         self.page_break()
         self.heading(f"{main_number}. 附录", 1)
         self.heading(f"{main_number}.1 采集窗口与数据完整性", 2)
@@ -1471,6 +1707,7 @@ class WordReportEngine:
             self.build_detailed_sections_professional()
             self.build_risk_register_professional()
             self.build_remediation_plan_professional()
+            self.build_pending_confirmations_professional()
             self.build_management_conclusion_professional()
             self.build_appendix_professional()
         self.output_path.parent.mkdir(parents=True, exist_ok=True)

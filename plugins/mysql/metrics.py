@@ -16,7 +16,7 @@ from inspection_core import PackageContext, safe_float, safe_int
 from inspection_core.charts import disk_throughput_value
 from inspection_core.sampling import sar_history_quality
 from inspection_core.statistics import summarize
-from inspection_core.system_checks import is_persistent_fstype
+from inspection_core.system_checks import is_persistent_fstype, parse_timedatectl
 
 
 MYSQL_COUNTERS = (
@@ -39,6 +39,85 @@ def row_number(row: dict[str, str], *keys: str) -> float | None:
         if value is not None:
             return value
     return None
+
+
+def time_evidence(ctx: PackageContext) -> dict[str, Any]:
+    """时间同步证据：``snapshot.time_evidence`` 打底，缺失字段用 ``timedatectl`` 原文回填。
+
+    采集侧在部分版本把 ``ntp_synchronized`` 落成了空串（解析缺失），而
+    ``evidence/timedatectl.txt`` 一直在包里。只补空值、**不覆盖采集已有值**，
+    解析算法取自公共层 —— 规则引擎和呈现层因此共用同一份证据，不会再出现
+    "规则拿空值所以不判、呈现层拿空值所以判 risk" 这种两处打架。
+    """
+    raw = ctx.snapshot.get("time_evidence")
+    evidence: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    path = ctx.root / "evidence" / "timedatectl.txt"
+    if path.is_file():
+        parsed = parse_timedatectl(path.read_text(encoding="utf-8", errors="replace"))
+        for key, value in parsed.items():
+            if not evidence.get(key):
+                evidence[key] = value
+    return evidence
+
+
+# 采集端提供的备份**任务配置**证据（不含"最近一次是否成功"）。
+BACKUP_EVIDENCE_FILES = ("backup_cron.txt", "backup_processes.txt", "backup_timers.txt")
+
+
+def backup_task_visibility(ctx: PackageContext) -> dict[str, Any]:
+    """备份任务配置的可见性 —— 关键是「证据为空」不能写成「没有备份任务」。
+
+    实测：``.34`` / ``.125`` 的 ``evidence/backup_*.txt`` 是 **0 字节**（不是
+    "读到空列表"），无法区分"确实没有备份任务"与"无权限读 crontab"；而 ``.33``
+    的 crontab 有内容但**整段被注释** —— 那才是唯一可以判"本机无生效任务"的情况。
+    四态因此是：
+
+    - ``absent``   文件不存在          → 未采集，不判定
+    - ``empty``    文件存在且全为 0 字节 → 证据为空，**不能判定**（≠ 不存在）
+    - ``disabled`` 有内容但全部被注释   → 本机任务已停用（可判"无生效任务"）
+    - ``active``   存在未注释的任务行   → 发现生效的备份任务配置
+
+    规则层与呈现层共用这一份分类，避免出现"章节说无法判定、风险台账说 0 条"。
+    """
+    evidence_dir = ctx.root / "evidence"
+    present: list[str] = []
+    missing: list[str] = []
+    empty: list[str] = []
+    active_lines = 0
+    commented_lines = 0
+    for name in BACKUP_EVIDENCE_FILES:
+        path = evidence_dir / name
+        if not path.is_file():
+            missing.append(name)
+            continue
+        present.append(name)
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if not text.strip():
+            empty.append(name)
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            if line.lstrip().startswith("#"):
+                commented_lines += 1
+            else:
+                active_lines += 1
+    if active_lines:
+        state = "active"
+    elif commented_lines:
+        state = "disabled"
+    elif empty:
+        state = "empty"
+    else:
+        state = "absent"
+    return {
+        "state": state,
+        "active_lines": active_lines,
+        "commented_lines": commented_lines,
+        "present": present,
+        "missing": missing,
+        "empty": empty,
+    }
 
 
 # ----------------------------------------------------------------------
@@ -188,6 +267,82 @@ def collected_count(ctx: PackageContext, table_name: str) -> int | None:
     if table_name not in ctx.tables:
         return None
     return len(ctx.tables[table_name])
+
+
+def _object_label(row: dict[str, Any], *names: str) -> str:
+    parts = [str(row.get(name) or "").strip() for name in names]
+    return ".".join(part for part in parts if part)
+
+
+def auto_increment_items(ctx: PackageContext) -> list[dict[str, Any]]:
+    """自增容量候选清单（按 ``used_pct`` 倒序）。
+
+    采集端给的是**按使用率倒序的前 N 条明细**，所以条数**不是**风险对象数：
+    实测那 100 条里最高只有 22.79%，一个都没到阈值。判定留给规则层（阈值外置在
+    规则包的 ``MYSQL.SCHEMA.AUTO_INCREMENT_CAPACITY.threshold``），这里只把可算的
+    量算出来：使用率、剩余可用量、对象标识。
+    """
+    items: list[dict[str, Any]] = []
+    for row in ctx.tables.get("auto_increment_usage") or []:
+        auto = row_number(row, "AUTO_INCREMENT", "auto_increment")
+        max_value = row_number(row, "max_value")
+        remaining = None
+        if auto is not None and max_value:
+            remaining = max(max_value - auto, 0.0)
+        items.append({
+            "object": _object_label(row, "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"),
+            "column_type": row.get("COLUMN_TYPE") or row.get("column_type"),
+            "used_pct": row_number(row, "used_pct"),
+            "remaining": remaining,
+        })
+    items.sort(key=lambda item: (item["used_pct"] is None, -(item["used_pct"] or 0.0)))
+    return items
+
+
+def fragmentation_items(ctx: PackageContext) -> list[dict[str, Any]]:
+    """碎片候选清单，**按空闲空间（data_free_mb）重排**。
+
+    采集端按 ``fragmentation_pct`` 倒序，TOP 会被"分配 0.02 MB / 空闲 18 MB"的极小表
+    占满（99.91%），真正值得回收的表（空闲 2.8 GB）反而落在后面。重排只发生在已采集
+    的明细内，因此可能漏掉"空闲很大但碎片率低"的表 —— 这一点必须写进报告，不能让
+    读者以为这就是全集。
+    """
+    items: list[dict[str, Any]] = []
+    for row in ctx.tables.get("fragmentation_top") or []:
+        items.append({
+            "object": _object_label(row, "TABLE_SCHEMA", "TABLE_NAME"),
+            "engine": row.get("ENGINE") or row.get("engine"),
+            "allocated_mb": row_number(row, "allocated_mb"),
+            "data_free_mb": row_number(row, "data_free_mb"),
+            "fragmentation_pct": row_number(row, "fragmentation_pct"),
+        })
+    items.sort(key=lambda item: (item["data_free_mb"] is None, -(item["data_free_mb"] or 0.0)))
+    return items
+
+
+def non_innodb_items(ctx: PackageContext) -> list[dict[str, Any]]:
+    """非 InnoDB 表清单（含引擎），供按引擎分档给结论。
+
+    MEMORY 与 MyISAM 的后果完全不同：MEMORY 重启即丢数据且不支持事务，
+    MyISAM 有索引与磁盘持久化、只是崩溃恢复弱。同一档文案会误导处置优先级。
+    """
+    items: list[dict[str, Any]] = []
+    for row in ctx.tables.get("non_innodb_tables") or []:
+        items.append({
+            "object": _object_label(row, "TABLE_SCHEMA", "TABLE_NAME"),
+            "engine": str(row.get("ENGINE") or row.get("engine") or "").upper(),
+            "table_rows": row_number(row, "TABLE_ROWS", "table_rows"),
+            "total_mb": row_number(row, "total_mb"),
+        })
+    return items
+
+
+def non_innodb_engine_counts(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        engine = str(item.get("engine") or "UNKNOWN").upper()
+        counts[engine] = counts.get(engine, 0) + 1
+    return counts
 
 
 class MySQLMetricProvider:
@@ -393,10 +548,28 @@ class MySQLMetricProvider:
                 default=None,
             ),
         }
+        auto_increment = auto_increment_items(ctx)
+        fragmentation = fragmentation_items(ctx)
+        non_innodb = non_innodb_items(ctx)
+        # 自增 / 碎片是**明细清单**（采集端按某列倒序取前 N 条），不是"候选项集合"。
+        # 旧口径把清单条数直接当风险对象数（实测 100 条里最高使用率仅 22.79%），
+        # 现在只暴露明细与可算的极值，判定交给规则层按外部化阈值做。
         metrics["schema"] = {
             "tables_without_primary_key": no_primary_key_count,
-            "auto_increment_warning_count": collected_count(ctx, "auto_increment_usage"),
-            "fragmentation_candidate_count": collected_count(ctx, "fragmentation_top"),
+            "auto_increment_items": auto_increment,
+            "auto_increment_collected_count": collected_count(ctx, "auto_increment_usage"),
+            "auto_increment_max_used_pct": max(
+                (item["used_pct"] for item in auto_increment if item["used_pct"] is not None),
+                default=None,
+            ),
+            "fragmentation_items": fragmentation,
+            "fragmentation_collected_count": collected_count(ctx, "fragmentation_top"),
+            "fragmentation_max_data_free_mb": max(
+                (item["data_free_mb"] for item in fragmentation if item["data_free_mb"] is not None),
+                default=None,
+            ),
+            "non_innodb_items": non_innodb,
+            "non_innodb_engines": non_innodb_engine_counts(non_innodb),
             "non_innodb_table_count": collected_count(ctx, "non_innodb_tables"),
             "redundant_index_count": collected_count(ctx, "redundant_indexes"),
             "unused_index_candidate_count": collected_count(ctx, "unused_indexes"),
@@ -412,3 +585,323 @@ class MySQLMetricProvider:
             metrics["mysql_realtime"]["buffer_pool_to_memory_ratio"] = None
             metrics["mysql_realtime"]["buffer_pool_to_memory_ratio_reason"] = "remote_database_target"
         return metrics
+
+
+# ---------------------------------------------------------------------------
+# 共享取值入口：日志轮转 / binlog 容量 / uptime
+#
+# 这三份数据同时被规则层（判据）和呈现层（表格结论）消费。原先呈现层自己
+# 在 build_inspection_model 里就地算一遍文件数与总容量，规则层另写一份的话
+# 就会出现"表格说 74 个文件、规则说 20 个"这种两处口径 —— 所以取值只留这里。
+# ---------------------------------------------------------------------------
+
+
+def mysql_uptime_seconds(ctx: PackageContext) -> float | None:
+    """``global_status.tsv`` 里的 ``Uptime``（秒）。
+
+    用于把日志体积折算成"日增速率"：绝对值 132 GiB 说明大，除以 uptime 才能说明
+    "每天涨多少"，后者才是运维判断该不该立刻加轮转的依据。采集不到返回 None。
+    """
+    for row in ctx.tables.get("global_status", []) or []:
+        name = str(row.get("VARIABLE_NAME") or row.get("Variable_name") or "").strip()
+        if name.lower() == "uptime":
+            return safe_float(row.get("VARIABLE_VALUE") or row.get("Value"))
+    return None
+
+
+def log_file_entries(ctx: PackageContext) -> list[dict[str, Any]]:
+    """已存在且大小可读的日志文件：``log_type`` / ``path`` / ``size_bytes``。
+
+    只保留 ``exists=1`` 且 ``size_bytes`` 能解析成数字的行 —— 未采集 ≠ 0，
+    缺大小的行不能当"0 字节"参与阈值判断。
+    """
+    entries: list[dict[str, Any]] = []
+    for row in ctx.tables.get("log_files", []) or []:
+        if str(row.get("exists") or "").strip().lower() not in {"1", "true", "yes"}:
+            continue
+        size = safe_float(row.get("size_bytes"))
+        if size is None:
+            continue
+        entries.append(
+            {
+                "log_type": str(row.get("log_type") or "").strip() or "unknown",
+                "path": str(row.get("path") or "").strip(),
+                "size_bytes": size,
+            }
+        )
+    return entries
+
+
+def binlog_totals(ctx: PackageContext) -> dict[str, Any]:
+    """Binlog 文件数 / 合计字节 / 未加密文件数（口径唯一来源）。"""
+    rows = ctx.tables.get("binary_logs", []) or []
+    total = 0.0
+    unencrypted = 0
+    for row in rows:
+        total += row_number(row, "File_size") or 0.0
+        if str(row.get("Encrypted") or "").strip().lower() in {"no", "false", "0", "off"}:
+            unencrypted += 1
+    return {"count": len(rows), "bytes": total, "unencrypted": unencrypted}
+
+
+def runtime_variables(ctx: PackageContext) -> dict[str, str]:
+    """``global_variables.tsv`` 的运行值（键统一小写）。"""
+    result: dict[str, str] = {}
+    for row in ctx.tables.get("global_variables", []) or []:
+        name = str(row.get("VARIABLE_NAME") or row.get("Variable_name") or "").strip()
+        if name:
+            result[name.lower()] = str(row.get("VARIABLE_VALUE") or row.get("Value") or "").strip()
+    return result
+
+
+def mycnf_entries(ctx: PackageContext) -> list[dict[str, str]]:
+    """``mycnf_allowlist.tsv`` 的配置项（parameter / configured_value / section / source_file）。"""
+    entries: list[dict[str, str]] = []
+    for row in ctx.tables.get("mycnf_allowlist", []) or []:
+        parameter = str(row.get("parameter") or "").strip()
+        if not parameter:
+            continue
+        entries.append(
+            {
+                "parameter": parameter,
+                "configured_value": str(row.get("configured_value") or "").strip(),
+                "section": str(row.get("section") or "").strip(),
+                "source_file": str(row.get("source_file") or "").strip(),
+            }
+        )
+    return entries
+
+
+_UNIT_FACTORS = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4, "p": 1024 ** 5}
+_SIZE_SETTING = re.compile(r"^([0-9]+(?:\.[0-9]+)?)\s*([kmgtp])i?b?$", re.IGNORECASE)
+
+# MySQL 会按 OS 限制自动下调这两个值：``open_files_limit`` 受 systemd / ulimit 约束，
+# ``table_open_cache`` 再受 ``open_files_limit`` 约束。运行值低于配置文件属正常调整
+# （不是"配置没生效"），报出来只会制造噪音，因此不参与"配置 vs 运行"比对。
+RUNTIME_DRIFT_AUTO_ADJUSTED = frozenset({"open_files_limit", "table_open_cache"})
+
+# MySQL 8.0 的已弃用别名：配置文件的 ``expire_logs_days`` 实际映射到运行值
+# ``binlog_expire_logs_seconds``（天 × 86400），而旧的 ``expire_logs_days`` 变量只会读到 0。
+# 直接按名字比会把"配置 7 天、实际 5 天"错报成"配置 7、运行 0"。
+RUNTIME_DRIFT_ALIASES: dict[str, tuple[str, float]] = {
+    "expire_logs_days": ("binlog_expire_logs_seconds", 86400.0),
+}
+
+
+def _setting_value(text: Any) -> tuple[str, Any] | None:
+    """把一侧取值归成 ``(域, 归一值)``。
+
+    域决定"这两个值能不能直接比"：``bool``（ON/OFF/TRUE/FALSE）、``size``（200M/1G）、
+    ``number``、``text``（路径等）。``log_bin`` 在配置文件里是路径、在运行值里是 ON，
+    跨域比较没有意义，返回 None 让调用方跳过，而不是报一条假漂移。
+    """
+    raw = str(text or "").strip().strip("'\"").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered in {"on", "true"}:
+        return ("bool", True)
+    if lowered in {"off", "false"}:
+        return ("bool", False)
+    matched = _SIZE_SETTING.match(lowered)
+    if matched:
+        return ("size", float(matched.group(1)) * _UNIT_FACTORS[matched.group(2).lower()])
+    try:
+        return ("number", float(raw))
+    except ValueError:
+        # 路径统一去掉尾斜杠：``/usr/local/mysql`` 与 ``/usr/local/mysql/`` 是同一个目录。
+        return ("text", re.sub(r"/+$", "", lowered))
+
+
+def _settings_match(left: Any, right: Any) -> bool | None:
+    """两侧取值是否等价；None = 不可比（域不同，不能判成不一致）。"""
+    a = _setting_value(left)
+    b = _setting_value(right)
+    if a is None or b is None:
+        return None
+
+    def as_bool(pair: tuple[str, Any]) -> bool | None:
+        kind, value = pair
+        if kind == "bool":
+            return value
+        if kind == "number":
+            return value != 0
+        return None
+
+    # ON/OFF 与 1/0 是同一件事的两种写法。
+    if a[0] == "bool" or b[0] == "bool":
+        left_bool, right_bool = as_bool(a), as_bool(b)
+        if left_bool is None or right_bool is None:
+            return None
+        return left_bool == right_bool
+
+    def as_size(pair: tuple[str, Any]) -> float | None:
+        kind, value = pair
+        if kind == "size":
+            return value
+        if kind == "number":
+            return value  # 无单位的一侧按字节理解（200M vs 209715200）
+        return None
+
+    # 只要有一侧带单位（200M / 1G），两边都按字节比。
+    if a[0] == "size" or b[0] == "size":
+        left_size, right_size = as_size(a), as_size(b)
+        if left_size is None or right_size is None:
+            return None
+        return abs(left_size - right_size) < 0.5
+
+    if a[0] == "number" and b[0] == "number":
+        return abs(a[1] - b[1]) < 1e-9
+    if a[0] == "text" and b[0] == "text":
+        return a[1] == b[1]
+    return None
+
+
+def config_runtime_drift(ctx: PackageContext) -> list[dict[str, Any]]:
+    """配置文件值 vs 运行值的不一致项（已过滤单位/写法差异带来的假阳性）。
+
+    两类都算不一致，且要分开说：
+    * **单一配置值 ≠ 运行值** —— 改了配置没重启 / 没加载，下次重启行为会翻转；
+    * **同一参数在配置文件里被写了多个不同的值** —— 生效值取决于加载顺序，
+      本身就是隐患，即使其中一个恰好等于运行值。
+
+    归一到同一"域"后仍然不同的才算；域不同（如 ``log_bin`` 路径 vs ``ON``）或
+    运行值取不到时直接跳过，不制造假漂移。
+    """
+    runtime = runtime_variables(ctx)
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for entry in mycnf_entries(ctx):
+        grouped.setdefault(entry["parameter"].lower(), []).append(entry)
+
+    result: list[dict[str, Any]] = []
+    for parameter, entries in grouped.items():
+        if parameter in RUNTIME_DRIFT_AUTO_ADJUSTED:
+            continue
+        running = runtime.get(parameter)
+        divisor = 1.0
+        alias = RUNTIME_DRIFT_ALIASES.get(parameter)
+        if alias is not None:
+            target, divisor = alias
+            raw_alias = safe_float(runtime.get(target))
+            if raw_alias is None:
+                continue
+            running = f"{raw_alias / divisor:g}"
+        if running is None:
+            continue
+
+        configured_raw = [item["configured_value"] for item in entries]
+        mismatch = _settings_match(configured_raw[0], running) is False
+        for value in configured_raw[1:]:
+            matched = _settings_match(value, running)
+            if matched is False:
+                mismatch = True
+                break
+        distinct: list[str] = []
+        for value in configured_raw:
+            if not any(_settings_match(value, seen) for seen in distinct):
+                distinct.append(value)
+        conflict = len(distinct) > 1
+        if not (conflict or mismatch):
+            continue
+        result.append(
+            {
+                "parameter": parameter,
+                "runtime": running,
+                "configured_raw": configured_raw,
+                "configured_distinct": distinct,
+                "sources": sorted({item["source_file"] for item in entries if item["source_file"]}),
+                "sections": sorted({item["section"] for item in entries if item["section"]}),
+                "conflict_in_file": conflict,
+                "mismatch_runtime": mismatch,
+                "alias_of": alias[0] if alias else None,
+            }
+        )
+    return result
+
+
+def global_status_value(ctx: PackageContext, name: str) -> str | None:
+    """``global_status.tsv`` 单个状态变量的原始值；取不到返回 None。
+
+    与 ``mysql_uptime_seconds`` 的专用取值不同，这是通用入口 —— 表缓存（A9）与连接
+    失败率（A10）各要读好几个 status 键，重复遍历不如一个 helper 统一口径。
+    """
+    for row in ctx.tables.get("global_status", []) or []:
+        key = str(row.get("VARIABLE_NAME") or row.get("Variable_name") or "").strip()
+        if key.lower() == name.lower():
+            return str(row.get("VARIABLE_VALUE") or row.get("Value") or "").strip()
+    return None
+
+
+def large_table_items(ctx: PackageContext, min_total_mb: float) -> list[dict[str, Any]]:
+    """``large_tables_top.tsv`` 里 ``total_mb`` 超阈值的表（A12）。
+
+    只做阈值筛选，顺序沿用采集端（已按 total_mb 倒序）；``index_mb`` 为 0 的表单独
+    带出，供规则层追加"全表扫描风险"提示。
+    """
+    items: list[dict[str, Any]] = []
+    for row in ctx.tables.get("large_tables_top", []) or []:
+        total = safe_float(row.get("total_mb"))
+        if total is None or total < min_total_mb:
+            continue
+        items.append(
+            {
+                "schema": str(row.get("TABLE_SCHEMA") or "").strip(),
+                "table": str(row.get("TABLE_NAME") or "").strip(),
+                "engine": str(row.get("ENGINE") or "").strip(),
+                "rows": str(row.get("TABLE_ROWS") or "").strip(),
+                "total_mb": total,
+                "index_mb": safe_float(row.get("index_mb")),
+            }
+        )
+    return items
+
+
+# 疑似测试/备份/复制残留的命名模式（A13）。刻意不收 ``_duplication``：实测该子串
+# 只会命中 ``*_duplicationcheck`` 这类"查重"业务表（如 warddrugapply_duplicationcheck、
+# feechargerecord_duplicationcheck），不是复制残留，收进来全是误报。
+_LEFTOVER_PATTERNS: tuple[tuple[Any, str], ...] = (
+    (re.compile(r"^test_"), "test_ 前缀"),
+    (re.compile(r"_bak\d+"), "_bak 备份表"),
+    (re.compile(r"_\d{4}$"), "_mmdd 日期后缀"),
+    (re.compile(r"_copy\d+$"), "_copyN 复制表"),
+)
+
+
+def leftover_table_items(ctx: PackageContext) -> tuple[list[dict[str, Any]], int]:
+    """按命名模式识别疑似残留表（A13）。
+
+    扫 ``ctx.tables`` 里所有带 ``TABLE_NAME`` / ``table_name`` 列的采集表，跨表去重后
+    返回 ``(items, scanned)``。``items`` 每项带 ``schema`` / ``table`` / ``source``（来源
+    采集表）/ ``pattern``（命中的模式）；``scanned`` 是扫到的含表名列的采集表数量，
+    用于区分"没有残留"与"没有采集到任何表信息"（未采集 ≠ 0）。
+    """
+    found: dict[tuple[str, str], dict[str, Any]] = {}
+    scanned = 0
+    for source, rows in (ctx.tables or {}).items():
+        if not rows or not isinstance(rows, list):
+            continue
+        keys = set(rows[0].keys())
+        scol = "TABLE_SCHEMA" if "TABLE_SCHEMA" in keys else ("table_schema" if "table_schema" in keys else None)
+        tcol = "TABLE_NAME" if "TABLE_NAME" in keys else ("table_name" if "table_name" in keys else None)
+        if not tcol:
+            continue
+        scanned += 1
+        for row in rows:
+            name = str(row.get(tcol) or "").strip()
+            if not name:
+                continue
+            for pattern, label in _LEFTOVER_PATTERNS:
+                if pattern.search(name):
+                    schema = str(row.get(scol) or "").strip() if scol else ""
+                    key = (schema, name)
+                    if key not in found:
+                        found[key] = {
+                            "schema": schema,
+                            "table": name,
+                            "source": source,
+                            "pattern": label,
+                        }
+                    break
+    items = sorted(found.values(), key=lambda d: (d["pattern"], d["schema"], d["table"]))
+    return items, scanned
+

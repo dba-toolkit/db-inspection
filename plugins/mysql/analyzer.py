@@ -17,6 +17,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 
 # 本文件位于 plugins/mysql/：以 `python <本文件>` 方式被调用时 sys.path[0] 是所在目录，
@@ -34,6 +35,11 @@ from plugins.mysql import (
     MySQLPresentationBuilder,
     MySQLRuleProvider,
     is_self_referencing_replica_row,
+    pending_confirmations,
+)
+from plugins.mysql.rules import (
+    evaluate_identity_conflicts,
+    evaluate_replication_retention,
 )
 
 ANALYZER_VERSION = "2.1.0"
@@ -62,6 +68,9 @@ class Analyzer:
         self.package_adapter = MySQLPackageAdapter(self.work)
         self.metric_provider = MySQLMetricProvider()
         self.chart_provider = MySQLChartProvider(self.output, self.charts_dir)
+        # 跨实例检查（主机标识冲突）要看到全部实例，AnalyzerV2 的后处理阶段
+        # 只有 analysis 字典，这里留一份 PackageContext 引用。
+        self._contexts: list[PackageContext] = []
 
     def stage(self, name: str, fn):
         started = now_iso()
@@ -176,6 +185,28 @@ class Analyzer:
         while len(octets) < 4:
             octets.append(999)
         return (0 if role == "source" else 1, tuple(octets[:4]), str(node.get("instance_tag") or ""))
+
+    @staticmethod
+    def order_instances_by_topology(
+        instances: list[dict[str, Any]], topology: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """把实例结果按拓扑序重排，让报告正文主体与节点序同源。
+
+        ``presentation.build_report_model`` 取 ``instances[0]`` 作正文主体
+        （封面、概览、环境、性能、安全、章节、风险台账都挂在它身上），而
+        ``instances`` 原先按调用者传包顺序排列 —— 同样的三台机器换个传参顺序，
+        报告正文就从主库漂到从库。``_topology_sort_key`` 已经定义了"源端第一"
+        的节点序，这里让实例序与它一致，正文主体不再依赖命令行顺序。
+        拓扑未解析（节点不足两个、或存在对不上 node_id 的实例）时保持原序，
+        不猜、不丢实例。
+        """
+        nodes = topology.get("nodes") or []
+        if len(nodes) < 2 or not instances:
+            return instances
+        rank = {str(node.get("node_id")): index for index, node in enumerate(nodes)}
+        if any(str(item.get("instance_id")) not in rank for item in instances):
+            return instances
+        return sorted(instances, key=lambda item: rank[str(item.get("instance_id"))])
 
     @staticmethod
     def topology(contexts: list[PackageContext]) -> dict[str, Any]:
@@ -336,6 +367,7 @@ class Analyzer:
             lambda: [self.load_package(src, i) for i, src in enumerate(sources, 1)],
         )
         self.stage("normalize_instances", lambda: contexts)
+        self._contexts = contexts
         metrics_list = self.stage("calculate_metrics", lambda: [self.derive_metrics(ctx) for ctx in contexts])
         quality_list = self.stage("evaluate_collection_quality", lambda: [self.collection_quality(ctx) for ctx in contexts])
         findings_list = self.stage(
@@ -398,6 +430,8 @@ class Analyzer:
 
         instance_results = self.stage("build_instance_results", build_instance_results)
         topology = self.stage("build_topology", lambda: self.topology(contexts))
+        # 正文主体取 instances[0]，必须先按拓扑序定格，否则报告会随传包顺序换主角。
+        instance_results = self.order_instances_by_topology(instance_results, topology)
         all_findings = [finding for instance in instance_results for finding in instance["findings"]]
         analysis = {
             "schema_version": ANALYSIS_SCHEMA_VERSION,
@@ -586,6 +620,111 @@ class AnalyzerV2(Analyzer):
     def generate_charts(self, ctx: PackageContext, metrics: dict[str, Any]) -> list[dict[str, Any]]:
         return self.chart_provider.generate(ctx, metrics)
 
+    def attach_cluster_findings(self, analysis: dict[str, Any]) -> None:
+        """把跨实例的标识冲突（主机名 / machine-id 重复）并入各实例结果。
+
+        冲突组只产出一条 finding，挂在组内 IP 最小的节点上（锚点确定，不随传包
+        顺序漂移），事实里列全所有成员 —— 同一个问题不该按节点数重复计数。
+        编号沿用该实例内的 finding 序号，与规则引擎产出的编号规则一致；
+        报告层的 ``_merged_findings`` 会再统一重排成全报告连续编号。
+        """
+        contexts = self._contexts or []
+        if len(contexts) < 2:
+            return
+        # 跨实例判据统一入口：规则引擎逐实例执行、看不到对端，凡是要"和对端比"的
+        # 判据都必须落到这里。新增一条就在这个元组里加一个求值器即可。
+        extra: dict[str, tuple[list[Any], list[Any]]] = {}
+        for evaluator in (evaluate_identity_conflicts, evaluate_replication_retention):
+            for instance_id, payload in evaluator(contexts).items():
+                bucket = extra.setdefault(instance_id, ([], []))
+                bucket[0].extend(payload[0])
+                bucket[1].extend(payload[1])
+        if not extra:
+            return
+        by_id = {str(instance.get("instance_id")): instance for instance in analysis.get("instances", [])}
+        for ctx in contexts:
+            payload = extra.get(ctx.instance_id)
+            if not payload:
+                continue
+            instance = by_id.get(str(ctx.instance_id))
+            if instance is None:
+                continue
+            findings, evaluations = payload
+            bucket = instance.setdefault("findings", [])
+            for finding in findings:
+                finding.finding_id = f"R{len(bucket) + 1:03d}"
+                bucket.append(finding.to_dict())
+            rule_evaluations = instance.setdefault("rule_evaluations", [])
+            for evaluation in evaluations:
+                rule_evaluations.append(evaluation.to_dict())
+            # 健康分与计数必须在补条之后重算，否则台账里多一条、汇总里少一条。
+            # 评分策略仍由 AnalyzerV2.health_summary 单点提供，这里只喂严重级别，
+            # 不复制一份扣分公式。
+            instance["health_summary"] = self.health_summary([
+                SimpleNamespace(severity=str(item.get("severity") or "low"))
+                for item in bucket
+            ])
+        all_findings = [
+            finding
+            for instance in analysis.get("instances", [])
+            for finding in instance.get("findings", [])
+        ]
+        analysis["overall_health_summary"].update({
+            "high_count": sum(1 for f in all_findings if f.get("severity") == "high"),
+            "medium_count": sum(1 for f in all_findings if f.get("severity") == "medium"),
+            "low_count": sum(1 for f in all_findings if f.get("severity") == "low"),
+        })
+
+    # 「应一致」参数白名单：只比对语义上必须一致的项。容量与规格类参数
+    # （buffer pool、io capacity、连接数、排序缓冲）按节点硬件规格取值本就合理，
+    # 报成"漂移"只会制造大量无意义的待确认项，把真正需要客户拍板的问题淹掉。
+    CONSISTENCY_VARIABLES: tuple[str, ...] = (
+        "transaction_isolation",
+        "sql_mode",
+        "character_set_server",
+        "collation_server",
+        "lower_case_table_names",
+        "binlog_format",
+        "gtid_mode",
+        "sync_binlog",
+        "innodb_flush_log_at_trx_commit",
+        "innodb_page_size",
+    )
+
+    def consistency_drift_note(self, contexts: dict[str, PackageContext]) -> str:
+        """统计节点间取值不一致的「应一致」参数，作为待确认事项的证据行。"""
+        drifted: list[str] = []
+        for name in self.CONSISTENCY_VARIABLES:
+            values = {
+                str(ctx.variables.get(name) or "").strip()
+                for ctx in contexts.values()
+            }
+            values.discard("")
+            if len(values) > 1:
+                drifted.append(name)
+        if not drifted:
+            return ""
+        return f"{len(drifted)} 项应一致的参数在节点间取值不同：" + "、".join(sorted(drifted))
+
+    def attach_pending_confirmations(self, analysis: dict[str, Any]) -> None:
+        """给每个实例挂上「待客户确认事项」。
+
+        派生自该实例**已触发的规则**（模板见 ``presentation.CONFIRMATION_TEMPLATES``），
+        外加一条多实例专属的「节点间参数漂移是否有意设计」—— 后者是呈现层的结论、
+        没有对应 rule_id，所以在能同时看到各节点配置的这一层生成，且只挂主体实例一次
+        （挂给每个节点会让报告里重复出现同一问题）。
+
+        单实例同样会产出本键（只要有触发项）。它是新增字段、旧基线 analysis.json 中
+        并不存在，因此报告层必须**条件注入**，否则会打穿冻结契约测试。
+        """
+        instances = analysis.get("instances", [])
+        contexts = {ctx.instance_id: ctx for ctx in (self._contexts or [])}
+        drift_note = self.consistency_drift_note(contexts) if len(contexts) >= 2 else ""
+        for index, instance in enumerate(instances):
+            instance["pending_confirmations"] = pending_confirmations(
+                instance, drift_note=drift_note if index == 0 else ""
+            )
+
     def analyze(self, sources: list[Path]) -> dict[str, Any]:
         analysis = super().analyze(sources)
         contract_started = now_iso()
@@ -599,8 +738,17 @@ class AnalyzerV2(Analyzer):
                 status: sum(1 for evaluation in evaluations if evaluation.status == status)
                 for status in ("triggered", "passed", "not_evaluated", "not_applicable")
             }
+        # 跨实例的标识冲突必须拿到全部实例才能判定，规则层逐实例执行看不到对端，
+        # 所以在规则与拓扑都就绪之后补一轮；结果同样进 findings 与 rule_evaluations，
+        # 保证风险台账、健康分与附录规则表三处口径一致。
+        self.attach_cluster_findings(analysis)
         # 拓扑建好后，把源端实例的复制状态从"本机上游行"改写为"下游从库"。
         self.presentation_builder.attach_topology_replication(analysis)
+        # 拓扑就绪后再做配置对比：跨节点取值与角色判定都依赖 topology.nodes。
+        self.presentation_builder.attach_config_comparison(analysis)
+        # 待确认事项派生自「已触发的规则」，必须排在 attach_cluster_findings /
+        # attach_config_comparison 之后 —— 这两步会补 finding，取早了会漏项。
+        self.attach_pending_confirmations(analysis)
         all_findings = [finding for instance in analysis.get("instances", []) for finding in instance.get("findings", [])]
         scores = [instance.get("health_summary", {}).get("score", 0) for instance in analysis.get("instances", [])]
         analysis["overall_health_summary"].update({

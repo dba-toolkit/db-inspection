@@ -64,8 +64,17 @@ READ_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "evidence": (
         r"""\broot\s*/\s*["']evidence/([A-Za-z0-9_.\-\*]+)["']""",
+        # 两段式路径：``ctx.root / "evidence" / "timedatectl.txt"``。曾经漏判，
+        # 把真读了的证据打成「仅声明未读取」（timedatectl / innodb_status 都中过）。
+        r"""\broot\s*/\s*["']evidence["']\s*/\s*["']([A-Za-z0-9_.\-\*]+)["']""",
     ),
 }
+
+# 「目录变量 + 文件名常量」的写法：``evidence_dir = ctx.root / "evidence"``，
+# 文件名存在模块级常量里（如 ``BACKUP_EVIDENCE_FILES``），再 ``evidence_dir / name``。
+# 静态正则抓不到这种字面量引用，需要在命中该写法的文件里回收裸文件名常量。
+_EVIDENCE_DIR_VAR = re.compile(r"""\broot\s*/\s*["']evidence["'](?!\s*/\s*["'])""")
+_EVIDENCE_NAME_LITERAL = re.compile(r"""["']([A-Za-z0-9_\-]+\.txt)["']""")
 
 # 仅声明：出现在 source / evidence_refs 字符串里，不代表读了数据。
 # 不要求左右引号，以便覆盖 "tables/a.tsv; tables/b.tsv" 这类拼接串里的每一项。
@@ -122,6 +131,24 @@ def collect_references(
     return references
 
 
+def collect_evidence_via_directory_variable(sources: list[Path]) -> set[str]:
+    """回收「目录变量 + 文件名常量」写法的 evidence 引用。
+
+    仅当同一文件里确实出现 ``root / "evidence"``（**不带**尾随字面量，即赋给
+    变量）时才回收该文件内的 ``*.txt`` 裸文件名，避免把无关的 .txt 字面量
+    误当成 evidence 引用。
+    """
+    found: set[str] = set()
+    for source in sources:
+        files = [source] if source.is_file() else sorted(source.rglob("*.py"))
+        for path in files:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if not _EVIDENCE_DIR_VAR.search(text):
+                continue
+            found.update(_EVIDENCE_NAME_LITERAL.findall(text))
+    return found
+
+
 def _matches(name: str, keys: set[str]) -> bool:
     if name in keys:
         return True
@@ -141,6 +168,7 @@ def audit(
     """对比「采集面」与「消费面」，返回结构化结果。"""
     collected = enumerate_collected(package)
     read = collect_references(sources, READ_PATTERNS)
+    read["evidence"] |= collect_evidence_via_directory_variable(sources)
     declared = collect_references(sources, DECLARE_PATTERNS)
     categories: dict[str, object] = {}
     totals = {"collected": 0, "consumed": 0, "declared_only": 0, "unused": 0}
