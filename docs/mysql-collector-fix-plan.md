@@ -8,7 +8,7 @@
 
 ---
 
-## 执行进度（2026-09-20 更新）
+## 执行进度（2026-09-22 更新）
 
 | 批次 | 项 | 状态 |
 |---|---|---|
@@ -18,6 +18,7 @@
 | 批 2 附带 | F-12 随 F-05 一起落（同一段代码，按 F-12 形态实施）；`sanitize_tsv_columns` 重复列 bug（新发现，见下） | ✅ 已落地 |
 | 批 3 补采集项 | F-09 / F-13 / F-14 / F-22 / F-23 / F-25 / F-26 | ⬜ 未开始 |
 | 批 0 注释 | F-27 | 🟡 L3/L4 函数头注释已随批 1/批 2 落；L1 文件头、L2 阶段分隔、L5 其余函数头待补 |
+| 批 4 外部复核回吐 | F-28 / F-29 / F-30 | ✅ **已落地**（2026-09-22，来源见文末「批 4」节）：F-28 `long_transactions.query_sample` 裸 CR → **已补三层 REPLACE**（脚本已改，`bash -n` 通过）；F-29 快照 `Com_*` 缺失（P_S 按设计排除）→ **已定 B：不改采集、写死口径**（契约 §8.4 + 分析层注释）；F-30 `host=''` 语义等于 `%` → **不改采集**，已补契约 §8.4 与分析层判据 |
 
 ### 本轮新发现（不在初版清单里）
 
@@ -164,6 +165,10 @@ F-01 是全清单里影响最大的一条，改法是否成立完全取决于 my
 | F-25 | P2 | L663 + L675 | sar 时间戳按 UTC 输出、采集时间戳为本地 +08:00，包内无时区声明 → Python 混画会错位 8 小时 | 3 |
 | F-26 | P2 | L1144 / L723 | summary"请求 24 小时 / 覆盖 63 小时"文案误导（实为只导全量原始数据、裁剪交 Python） | 3 |
 | F-27 | P2 | 全脚本 | 1373 行 / **73 个函数** / 仅 **18 行**注释（**1.3%**），**零函数级说明**；主流程 L1227-1373 是裸代码、无 `main()` 包裹 | **0** |
+| F-28 | P2 | `collect_mysql_trx` L1230 | `query_sample` 保留裸 CR(0x0D)：MySQL batch 转义集合是 `\n` / `\t` / `\0` / `\\`，**不含 `\r`**；`processlist`(L1243) 已做 `REPLACE`，此项漏了 | 4 |
+| F-29 | P1 | `collect_mysql_basic` L1189 | 主查询走 `performance_schema.global_status`，该表**按设计不含 `Com_xxx`**（手册 10.14 / Bug #87645 = by design）→ 快照缺 TPS 必需项，下游静默出 `nan` | 4 |
+| F-30 | —— | `collect_mysql_security_objects` L1342 + 契约 | **【非缺陷 · 契约澄清】** `mysql.user.Host` 可为空字符串，官方语义（8.2.6）**等价于 `%`（any host）**；须在 `INTERFACE.md` 写明，分析层并档处理 | 4 |
+| F-31 | P2 | `generate_snapshot_json` L1531 | `ntp_synchronized` 用 `awk '/System clock synchronized/'` 匹配，但 systemd ≥239 的 `timedatectl status` 输出是 `NTP synchronized`，字段名对不上 → 三节点该字段全为空，`snapshot.json#time_evidence` 拿到空值 | 5 |
 
 > 结构调整（不阻塞上线，建议随 schema 2.0 一起做）：
 > - `system.mycnf_allowlist` 属于数据库配置，现挂在 `system.static` 下（L452 由 `collect_system_static` 调用）
@@ -1295,6 +1300,131 @@ mysql.error_log_summary: unsupported，performance_schema.error_log unavailable
 
 ---
 
+## 批 4：外部独立复核回吐（2026-09-22，三套 MySQL 8.0.30 生产采集包）
+
+来源：对三套 8.0.30 生产包（一主两从）绕过分析层、直读原始字节做独立复核，得到 3 条与采集层直接相关的结论。**其中两条的初版判断经核实后被推翻**，一并留档，避免以后重复讨论。
+
+### F-28 `long_transactions.query_sample` 保留裸 CR，通用换行读取会拆行【P2】
+
+**现象**：`tables/long_transactions.tsv` 用「通用换行」读取时会出现"270 行、其中 244 行是 0 个 TAB 的碎片"的假象（Python 文本模式、`csv` 模块、多数 ETL/BI 导入都会这样）。
+
+**核实（二进制模式逐字节读）**：
+
+| 包 | 文件大小 | LF 行数 | 数据行（7 个 TAB） | 裸 CR 字节数 |
+|---|---:|---:|---:|---:|
+| 主库 | 10,882 B | 28 | **26** | **244** |
+| 从库 A | 119 B | 2 | 0 | 0 |
+| 从库 B | 2,056 B | 6 | 4 | 0 |
+
+**结论：F-01 的修复是生效的。** `\n` / `\t` 已被客户端转义成字面量，行结构完好，**不存在碎片行**。剩下的真缺陷是：源 SQL 文本里的 `\r\n`，只转义了 `\n`，**`\r`(0x0D) 原样落盘**。
+
+**依据**：MySQL 客户端 batch 模式的转义集合是 `\n` / `\t` / `\0` / `\\`，**不含 `\r`**（`--raw` 才关闭全部转义）。所以这不是脚本参数问题，是客户端行为。
+
+**影响**：任何做通用换行归一化的读取方都会把一行拆成多行 → 行数虚高、长事务统计失真。本次三包里只有主库命中（只有它的长事务 SQL 含 Windows 换行），**属于偶发但会静默发生的一类**。
+
+**修法**：与 `processlist` 对齐即可 —— 两个采集项本来是同一类，只有一处做了清洗：
+
+- `collect_mysql_performance` 里的 processlist 项（L1243）已经是
+  `LEFT(REPLACE(REPLACE(IFNULL(INFO,''),'\n',' '),'\r',' '),500)`
+- 同一函数里的 long_transactions 项（L1230）的 `query_sample` 只有 `LEFT(IFNULL(trx_query,''),500)`，**没有 REPLACE**
+
+**改法（已落地，2026-09-22）** —— 与 `processlist` 对齐：
+
+```sql
+LEFT(REPLACE(REPLACE(REPLACE(IFNULL(trx_query,''),'\\r',' '),'\\n',' '),'\\t',' '),500) AS query_sample
+```
+
+> 顺带把 TAB 也换掉更稳妥：SQL 文本里的制表符会污染 TSV 的列语义。**这一点已一并落地**（三层 REPLACE）。
+
+**验收**：`LC_ALL=C grep -c $'\r' tables/long_transactions.tsv` 为 0；`awk -F'\t' 'NF!=8' tables/long_transactions.tsv` 无输出。
+
+---
+
+### F-29 单点快照走 `performance_schema.global_status`，**该表按设计不含 `Com_*`**【P1】
+
+**现象**：三包 `tables/global_status.tsv` 均为 **317 行**，`Com_` 开头的只有 `Com_stmt_reprepare` 一项。分析层实测 TPS 正常（51.87 / 17.66 / 5.07，走 `timeseries` 差分），所以风险不在"算不出"，而在**契约没写清**：任何下游都可能误拿快照去算，然后静默拿到空值。
+
+**根因（已核到官方原文）**：主查询（L1189）是
+
+```sql
+SELECT VARIABLE_NAME,VARIABLE_VALUE FROM performance_schema.global_status ORDER BY VARIABLE_NAME
+```
+
+而 **`performance_schema.global_status` 按设计排除 `Com_xxx`**：
+
+- MySQL 手册 *10.14 Performance Schema Status Variable Tables*：**"The Performance Schema does not collect statistics for Com_xxx status variables in the status variable tables."**
+- Bug #87645（官方判定 **not a bug / by design**，引 WL#6629）：**"Existing status counters named 'COM_' are excluded from the performance schema status tables."**
+
+**这不是白名单问题** —— 脚本对 `global_status` 没有任何列白名单，是源表里就没有这些行。`Innodb_*` 等其余变量都在，所以报告里 redo 容量一类的结论不受影响。
+
+**影响**：凡依赖 `Com_commit` / `Com_rollback` / `Com_select` / `Com_insert` / `Com_update` / `Com_delete` 的派生指标（TPS、读写比、语句构成）在单点快照里**必然拿不到**。
+
+**修法（二选一，已定 B，2026-09-22）**：
+
+- **A（改采集，未采纳）**：主查询改走 `SHOW GLOBAL STATUS`（客户端语句），或在 P_S 查询之后**补一条** `SHOW GLOBAL STATUS LIKE 'Com\_%'` 追加/另存。`SHOW GLOBAL STATUS` 约 495 行，增量不大。
+  - 若想保留 P_S 路径，官方给的替代是 `events_statements_summary_global_by_event_name` 里 `statement/sql/%` 的 `COUNT_STAR`，**但那是另一套口径，不要混进 `global_status.tsv`**。
+- **B（不改采集）← 已采纳（2026-09-22）**：在 `docs/mysql-collector-interface.md` §8.4 写死口径 —— **"派生 TPS / 读写比一律用 `timeseries/mysql_status.csv` 首末行差分，不要用 `global_status.tsv`"**，并在 `inspection_core/models.py` 与 `plugins/mysql/package_adapter.py` 的字段旁加注释。**分析层无分支可删** —— `ctx.global_status` 本就是"只读入、无消费方"的字段（全仓只有赋值处、无读取处）。
+
+> 原本的风险是"采集端不报错、下游静默拿到空值"，读报告的人看不出是缺数据还是真为 0。**选 B 后用契约 §8.4 + 分析层字段注释双重拦截**。
+
+**联动**：选 A 时 `global_status.tsv` 行数由 317 → 约 500（**只增行、不增列**），`known_tsv_header` 不用改；若 `snapshot.json` 里有"status 变量总数"一类统计需同步。
+
+---
+
+### F-30 【非缺陷 · 契约澄清】`mysql.user.Host` 可以是空字符串，语义等价 `%`
+
+**现象**：`tables/accounts.tsv` 的 `host` 列在 28 行中有 **10 行为空**（`CDRReplication`、`cpoe_to_cdss_hm`、`cpoe_to_cgzx`、`cpoe_to_hlyy_phhc`、`docaremssd`、`emr`、`emr_to_jc`、`nis_to_ydhl_lx`、`nis_to_zzsys_mdsd`、`ygxhRead`）。第一反应是"采集把 host 弄丢了"。
+
+**核实：不是采集问题，源端即如此。** 旁证就在同一个采集包里 —— `tables/schema_privileges.tsv` 的 `GRANTEE` 列把这些账号渲染成 **`'cpoe_to_cgzx'@''`**。`information_schema.SCHEMA_PRIVILEGES` 的 GRANTEE 由 `mysql.user` 的 `User` / `Host` 拼出，host 为空才会得到 `@''`；且这些账号确实在 `processlist.tsv` 里有活动连接（否则会和"空 host 不可连"的直觉冲突）。
+
+**官方语义**：MySQL 8.0 手册 8.2.6 *Access Control, Stage 1: Connection Verification* ——
+
+> "The pattern `'%'` means 'any host' and is least specific. **The empty string `''` also means 'any host' but sorts after `'%'`.**"
+
+**所以这 10 个账号是"任意主机可连"**，与 `root@%` 同级。比显式 `%` 更隐蔽的地方在于：排序在 `%` 之后，且**极易被读成"来源未知 / 待补齐"** —— 本次复核第一遍就这么误读了，把暴露面反向低估。
+
+**要做的（都不改 SQL）**：
+
+1. **契约文档（`INTERFACE.md`）加一句**：`accounts.tsv` 的 `host` 列**允许为空字符串**，语义等于 `%`（any host），不得当作"列缺失 / 错位 / 未采集"处理。
+2. **`known_tsv_header` 不改**（列集没变）；**SQL 不改**（`SELECT user,host,...` 已把真值取回来了）。
+3. **分析层加一条判据**（属分析层，登记在此仅作提醒）：来源限制统计必须把 `host IN ('%','')` 合并计入"任意主机可连"，并单独列出 `host=''` 的账号 —— 它们大概率是历史 `GRANT ... TO 'user'@''` 或迁移丢 host 留下的治理漏项。
+4. **不要把空值落盘成 `<empty>` 之类占位符**：那会改掉真值，违反"采集器只采事实"。
+
+**验收**：`awk -F'\t' 'NR>1 && $2==""' tables/accounts.tsv | wc -l` 与源端 `SELECT COUNT(*) FROM mysql.user WHERE host=''` 一致。
+
+---
+
+### 批 4 汇总
+
+| 编号 | 是什么 | 要不要改采集 |
+|---|---|---|
+| F-28 | `query_sample` 裸 CR 未清洗（与 `processlist` 不一致） | ✅ **已改**（2026-09-22，三层 `REPLACE`，脚本已落盘 + `bash -n` 通过） |
+| F-29 | 快照 `Com_*` 缺失，根因是 P_S 表按设计排除 | ❌ **不改采集**（已定 B：写死口径 —— 契约 §8.4 + 分析层注释） |
+| F-30 | `host=''` 是源端事实、语义等于 `%` | ❌ **不改采集**（✅ 已补契约 §8.4 + 分析层判据） |
+
+> **一条方法论**：本次三条里有两条第一版判断是错的（F-28 被当成"行结构被撑破"，F-30 被当成"采集丢字段"）。两处栽在同一个动作上 —— **没按字节/原值去读**，而是先用了会做换行归一化的读取方式，或"空即缺失"的直觉。复核采集包时先用 `open(p,'rb').read()` 看字节，再决定怎么解析。
+
+
+### 批 4 实施记录（2026-09-22）
+
+| 项 | 落地情况 |
+|---|---|
+| F-28 | ✅ **已改脚本**。`inspection/mysql_inspection_standard.sh` 的 `collect_mysql_performance` 内，`mysql.long_transactions` 的 `query_sample` 由 `LEFT(IFNULL(trx_query,''),500)` 改为**三层 REPLACE**（CR / LF / TAB 各清一次），与同函数的 processlist 项对齐。文件 129,663 → 129,720 字节（+57）；`bash -n` rc=0。列名未变 → `known_tsv_header` 不需要动 |
+| F-29 | ❌ **不改采集（选 B）**。契约 `docs/mysql-collector-interface.md` 新增 **§8.4** 写死口径；`inspection_core/models.py` 的 `global_status` 字段与 `plugins/mysql/package_adapter.py` 的赋值处各加注释，指明“该字段不含 `Com_*`、勿用于 TPS”。**分析层无分支可删** —— `ctx.global_status` 全仓只有赋值、无读取 |
+| F-30 | ❌ **不改采集**。契约 §8.4 写明 `accounts.tsv` 的 `host` 允许空串且语义等于 `%`（any host），禁止当“缺失 / 错位 / 未采集”处理 |
+
+**一处事实更正**：F-29 初版把影响写成“分析层派生 TPS = `nan`（既有报告实测如此）”，复核 `report_model.json` / `analysis.json` 后**确认是误判** —— 分析层本就取 `timeseries` 的 `Com_commit` / `Com_rollback` 逐点差分（`plugins/mysql/metrics.py` 的 `MYSQL_COUNTERS`），实测 `mysql_realtime.tps.average` 为 **51.87 / 17.66 / 5.07**（`.34` / `.125` / `.33`），完全正常。快照缺 `Com_*` 的后果因此从“下游算不出”降级为“**契约没写清、下游可能误用**”，处置随之从“改采集”改判为“写死口径”。
+
+### 批 5 回吐：F-31（2026-09-22，清单 C4 落地）
+
+| 项 | 落地情况 |
+|---|---|
+| F-31 | ✅ **已改脚本**。`generate_snapshot_json` L1531 的 `ntp_synchronized` 由 `awk '/System clock synchronized/'` 改为 `awk '/^(System clock\|NTP) synchronized:/'`，同时兼容 systemd 新旧两种字段名。实测三节点 `timedatectl.txt` 输出均为新版 `NTP synchronized:`，旧正则匹配不到 → `ntp_synchronized` 全为空；修后 `.33`=`yes`、`.34`=`yes`、`.125`=`no`。**字段结构与 status 取值未变**（只是值从空串变回真实 yes/no），故**不 bump `SNAPSHOT_SCHEMA_VERSION`、不改 `known_tsv_header`** |
+
+**配套说明**：分析层早已不依赖 `snapshot.json#ntp_synchronized` —— 批 C 的 `parse_timedatectl` / `ntp_verdict`
+直接从 `evidence/timedatectl.txt` 原文解析，所以此 bug 不影响分析层的三档时间判定（`.125` 偏移 131s 仍正确判 `risk`）。
+修它只为让 `snapshot.json` 与 `llm_input.json` 的该字段不再误导性为空，属“契约字段回填正确性”而非“功能缺失”。
+
 ## 改完之后仍然"缺"的（有意为之，别改）
 
 这四条是设计决策，不是遗漏：
@@ -1315,7 +1445,7 @@ mysql.error_log_summary: unsupported，performance_schema.error_log unavailable
 3. **新增采集项四件事一起做**：写代码 → 登记 `known_tsv_header` → 更新 `INTERFACE.md` §3 清单 → 更新 §4 目录树。
 4. **注释与代码同改**：脚本只有 18 行注释，正因为少，那 18 行会被当成"已经过核实的记录"来读，**注释撒谎比没注释更坏**。`INTERFACE.md` §7 规则 5 列了本轮会被打假的 4 处注释（GTID 续行补丁、写 `ok` 的口径、逐行过滤说明、`sql_text_included` 恒开），改对应条目时必须一起处理。
 
-本清单里 **F-01 / F-03 / F-06 / F-11 / F-16 / F-19 / F-20 / F-21 / F-22 / F-23 / F-25 会影响 Python**，逐条见下面联动表。
+本清单里 **F-01 / F-03 / F-06 / F-11 / F-16 / F-19 / F-20 / F-21 / F-22 / F-23 / F-25 会影响 Python**，逐条见下面联动表；批 4 的 F-28 / F-29 / F-30 见该表末尾三行。
 
 ## 与 Python 侧的联动清单
 
@@ -1330,6 +1460,9 @@ mysql.error_log_summary: unsupported，performance_schema.error_log unavailable
 | `tables/replica_status.tsv` | 新增 `Last_Error` / `Last_IO_Error` / `Last_SQL_Error`（明文全文，不截断） |
 | `tables/global_variables.tsv` | 少若干 `*_key` / `*_secret` / `wsrep_sst_*` 键；**`default_password_lifetime`、`password_history`、`password_reuse_interval`、`validate_password*` 等策略变量必须保留**（F-04 修正后） |
 | 所有 TSV | 自由文本值内的换行/制表符现在是 `\n` / `\t` 字面量，**读取时需 unescape** |
+| `tables/long_transactions.tsv` | `query_sample` 内的 CR 已被 REPLACE 清成空格（F-28，2026-09-22 落地）；**读取方仍不要启用通用换行归一化**，否则历史上产生的旧包会行数虚高 |
+| `tables/global_status.tsv` | **F-29 已定不改采集**：行数保持 317，`Com_*` 依然缺席。**派生 TPS / 读写比一律用 `timeseries/mysql_status.csv` 差分**（契约 §8.4）；分析层不要再用它算 TPS（`ctx.global_status` 无消费方） |
+| `tables/accounts.tsv` | `host` 列**允许空字符串**，语义等于 `%`（any host）；下游不得当"缺失 / 错位"处理（F-30） |
 | `evidence/mycnf_includes.txt`（新） | 实际展开的配置文件清单 |
 | `evidence/slow_log_tail.txt`（新，可选） | 慢日志末尾 |
 | `tables/backup_files.tsv`（新，可选） | 备份产物清单 |
@@ -1350,6 +1483,7 @@ mysql.error_log_summary: unsupported，performance_schema.error_log unavailable
 
 1. **结构**：`awk -F'\t' 'NF!=<期望列数>{print FILENAME": "NR}'` 遍历 `tables/*.tsv`，应无输出
 2. **转义**：`grep -c '\\n' tables/innodb_status.*` 应为 0（已挪到 `.txt`）；`replica_status.tsv` 行数应等于实例数 × 通道数
+   - **注意 CR 例外**：`long_transactions.tsv` 在 F-28 修掉之前，用通用换行读取会虚增行数。校验行数请用二进制模式或 `LC_ALL=C awk`（awk 默认只按 `\n` 分行，不受 `\r` 影响）。
 3. **my.cnf**：`awk -F'\t' 'NR>1{print $1}' tables/mycnf_allowlist.tsv | sort -u`，应包含 `/etc/my.cnf.d/` 下的文件
 4. **门禁**：故意落一份含 `password=abc123` 的文件，验证 `$?` = 30 且无 `.tar.gz`
 5. **退出码**：断网跑一次，验证 `$?` = 20

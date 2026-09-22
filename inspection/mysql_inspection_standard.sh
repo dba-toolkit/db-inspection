@@ -1227,7 +1227,7 @@ collect_mysql_capacity() {
 
 collect_mysql_performance() {
     mysql_query_tsv "mysql.long_transactions" "mysql.performance" "$TABLES_DIR/long_transactions.tsv" \
-      "SELECT trx_id,trx_state,TIMESTAMPDIFF(SECOND,trx_started,NOW()) AS duration_seconds,trx_rows_locked,trx_rows_modified,trx_tables_locked,trx_mysql_thread_id,LEFT(IFNULL(trx_query,''),500) AS query_sample FROM information_schema.innodb_trx ORDER BY trx_started LIMIT 200" || true
+      "SELECT trx_id,trx_state,TIMESTAMPDIFF(SECOND,trx_started,NOW()) AS duration_seconds,trx_rows_locked,trx_rows_modified,trx_tables_locked,trx_mysql_thread_id,LEFT(REPLACE(REPLACE(REPLACE(IFNULL(trx_query,''),'\\r',' '),'\\n',' '),'\\t',' '),500) AS query_sample FROM information_schema.innodb_trx ORDER BY trx_started LIMIT 200" || true
 
     if [ "$METADATA_LOCKS_AVAILABLE" -eq 1 ]; then
         mysql_query_tsv "mysql.metadata_locks" "mysql.performance" "$TABLES_DIR/metadata_locks_pending.tsv" \
@@ -1528,7 +1528,10 @@ generate_snapshot_json() {
     host_local_time=$(awk -F= '$1=="local_time"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
     host_utc_time=$(awk -F= '$1=="utc_time"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
     host_timezone=$(awk -F= '$1=="timezone"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
-    ntp_synchronized=$(awk -F: '/System clock synchronized/{gsub(/^[ \t]+|[ \t]+$/,"",$2);print $2}' "$EVIDENCE_DIR/timedatectl.txt" 2>/dev/null)
+    # timedatectl 的输出字段随 systemd 版本变化：旧版是 ``System clock synchronized``，
+    # 新版（systemd ≥239）改叫 ``NTP synchronized``。旧脚本只匹配旧字段名，导致新系统上
+    # ntp_synchronized 永远为空（F-31）。两种写法都匹配，并锚定行首 + 冒号避免误命中。
+    ntp_synchronized=$(awk -F: '/^(System clock|NTP) synchronized:/{gsub(/^[ \t]+|[ \t]+$/,"",$2);print $2}' "$EVIDENCE_DIR/timedatectl.txt" 2>/dev/null)
 
     {
       printf '{\n'

@@ -81,6 +81,10 @@ class PackageContext:
     integrity: dict[str, Any]
     tables: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     variables: dict[str, str] = field(default_factory=dict)
+    # F-29：单点快照，来源是 performance_schema.global_status —— 该表按设计
+    #       不含 Com_xxx（手册 10.14；Bug #87645 官方判 by design，引 WL#6629）。
+    #       所以这里永远取不到 Com_commit / Com_select 等；派生 TPS / 读写比
+    #       一律用 timeseries["mysql_status"] 的首末行差分，不要消费本字段。
     global_status: dict[str, str] = field(default_factory=dict)
     timeseries: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     history: dict[str, list[dict[str, str]]] = field(default_factory=dict)

@@ -89,6 +89,9 @@ class MySQLPackageAdapter:
             integrity=self.validate_manifest(root, manifest),
         )
         context.variables = key_value_tsv(root / "tables/global_variables.tsv")
+        # F-29：本文件的 Com_* 会被源表按设计过滤掉（只剩 Com_stmt_reprepare），
+        #       这是采集契约事实、不是白名单缺陷。派生 TPS 请走
+        #       timeseries["mysql_status"] 差分（见 metrics.MYSQL_COUNTERS）。
         context.global_status = key_value_tsv(root / "tables/global_status.tsv")
         for path in (root / "tables").glob("*.tsv"):
             context.tables[path.stem] = parse_delimited(path)

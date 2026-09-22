@@ -342,6 +342,16 @@ mysql_inspection_v1_<host>_<ip>_<port>_<YYYYmmdd_HHMMSS>/
 | 表头变更 | `mycnf_allowlist.tsv` 改为 4 列 `source_file` / `section` / `parameter` / `configured_value`（F-02，原来是 2 列） |
 | 语义变更 | `global_variables.tsv` 会**少几个键**（`wsrep_sst_auth`、`*_ssl_key`、`rsa_public_key*` 等）。Python 按变量名硬取这些键时要改成"取不到就跳过"。**策略类变量（`default_password_lifetime` / `password_history` / `validate_password*`）一定保留**，没有被删 |
 
+### 8.4 批 4 回吐（2026-09-22，三套 MySQL 8.0.30 生产包独立复核）
+
+来源：绕过分析层、直读三套生产采集包（一主两从）的原始字节做独立复核所得的 3 条结论。逐条结论见 `docs/mysql-collector-fix-plan.md` 的「批 4」节。
+
+| 项 | 内容 | 对 Python 的影响 |
+|---|---|---|
+| F-28 | `tables/long_transactions.tsv` 的 `query_sample` 曾把 SQL 文本里的**裸 CR(0x0D) 原样落盘**（`\n` / `\t` 已被客户端转义，`\r` 不在 batch 转义集合内）。**已修**：补 `REPLACE(...,'\r',' ')`，与 `processlist.SQL_TEXT` 对齐 | TSV 行结构本来就完好（一行 = 一条记录）；但**读取方不要启用通用换行归一化** —— Python 文本模式 / `csv` 模块会把裸 CR 当换行符，把一行拆成多行、行数虚高。修后此风险消失；校验行数仍建议用二进制读取或 `awk`（默认只按 `\n` 分行） |
+| F-29 | `tables/global_status.tsv` **按设计不含 `Com_xxx`**：主查询走 `performance_schema.global_status`，而 P_S 状态表明确排除 `Com_*`（手册 10.14；Bug #87645 官方判 by design，引 WL#6629）。**这不是白名单问题 —— 源表里就没有这些行**（三包均为 317 行，`Com_` 只有 `Com_stmt_reprepare`） | **决定不改采集（选 B）。** 派生 **TPS / 读写比一律用 `timeseries/mysql_status.csv` 首末行差分**，不要用 `global_status.tsv`。`ctx.global_status` 目前是"只读入、无消费方"的字段，**不要拿它算 TPS**（会静默拿到空值，报告端表现为缺项）。其余 `Innodb_*` 等变量齐全，redo 容量一类结论不受影响 |
+| F-30 | `tables/accounts.tsv` 的 `host` 列**允许空字符串**；按 MySQL 8.0 手册 8.2.6，**空串等价于 `%`（any host，排序在 `%` 之后）**，源端即如此（同包 `schema_privileges.tsv` 的 `GRANTEE` 渲染为 `'user'@''`） | 不得把空 `host` 当作"列缺失 / 错位 / 未采集"。分析层统计"任意主机可连"时应把 `host IN ('%','')` 合并计数，并单列 `host=''` 账号（更隐蔽）。**不要**把空值落盘成占位符 |
+
 ---
 
 ## 9. 注释规范（对应 `FIX-PLAN.md` 批 0 / F-27）
