@@ -23,9 +23,16 @@ class Finding:
     status: str = "evaluated"
     confidence: float = 1.0
     finding_id: str = ""
+    # 整改三要素，由规则包逐条声明（owner 写**角色**不写人名，跨客户才不会错）。
+    # 三者均为可选：基线 analysis.json 的 findings 里没有这三个键，to_dict() 走
+    # 条目级条件注入 —— 无条件写入会打穿 test_report_builder_matches_frozen_report_contract
+    # （它逐字典等值比对，且基线包已不在仓库、不可刷新）。
+    owner: str | None = None
+    apply_mode: str | None = None
+    verification: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "finding_id": self.finding_id,
             "rule_id": self.rule_id,
             "status": self.status,
@@ -41,6 +48,13 @@ class Finding:
             "confidence": self.confidence,
             "evidence_refs": self.evidence_refs,
         }
+        if self.owner:
+            payload["owner"] = self.owner
+        if self.apply_mode:
+            payload["apply_mode"] = self.apply_mode
+        if self.verification:
+            payload["verification"] = self.verification
+        return payload
 
 
 @dataclass

@@ -31,6 +31,32 @@ class RemediationAction:
             "recommendation": self.recommendation,
         }
 
+    def to_plan_dict(self) -> dict[str, Any]:
+        """分级整改计划条目的出参：legacy 三键 + **有值才带**的整改三要素。
+
+        为什么不直接把三要素塞进 ``to_legacy_dict``：它的契约被冻结为三键
+        （``test_management_models_preserve_legacy_and_extended_fields`` 明确断言
+        「传了 owner 也仍只输出三键」），是给只认旧格式的下游用的出口。
+        整改计划要喂渲染层的六个列头，所以另开出口，而不是改 legacy 的默认行为。
+
+        键名是 ``planned_window`` 而非数据类的 ``target_window``：渲染层
+        （``build_remediation_plan_professional``）读的就是前者。
+
+        空值不注入：旧基线 ``report_model.json`` 的 plan 条目只有三键，
+        条件注入才能让单实例冻结契约（逐字典等值比对）保持不变；
+        而缺项时补默认值等于替客户认定责任方，渲染层的「待指定 / 未登记」
+        才是正确呈现。
+        """
+
+        payload = self.to_legacy_dict()
+        if self.owner:
+            payload["owner"] = self.owner
+        if self.target_window:
+            payload["planned_window"] = self.target_window
+        if self.verification:
+            payload["verification"] = self.verification
+        return payload
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "finding_id": self.finding_id,

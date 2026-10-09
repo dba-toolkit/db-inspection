@@ -756,9 +756,14 @@ class WordReportEngine:
                 display_note = f"{display_note} {limit_note}".strip()
             self.data_table(rendered_rows, note=display_note)
         else:
-            empty_text = "本次采集无相关记录。"
-            if collection.get("status") not in {"empty", "not_applicable"}:
-                empty_text = "本项没有可展示的结构化记录。"
+            # 空行不等于"没检查"：采集成功但确认无数据（success_no_data）与采集失败
+            # 是完全不同的结论，所以这里允许 item 自带更准确的空数据文案（如"已检查
+            # 全部用户库，未产生缺失索引建议"）。没带时才退回通用措辞。
+            empty_text = str(display.get("empty_text") or "").strip()
+            if not empty_text:
+                empty_text = "本次采集无相关记录。"
+                if collection.get("status") not in {"empty", "not_applicable"}:
+                    empty_text = "本项没有可展示的结构化记录。"
             self.note_box("数据状态", empty_text, accent=COLOR_TEXT)
         if include_analysis:
             self.analysis_block(item.get("analysis") or {})
@@ -861,11 +866,18 @@ class WordReportEngine:
         )
         risk_number = 3 + len(sections)
         if self.layout == "professional":
+            # 尾部章节的编号必须与 build_xxx_professional 各自的算式逐一对应：
+            # 风险登记册 3+n、分级整改 4+n、待客户确认事项 5+n、综合结论 6+n、附录 7+n。
+            # 原先这里漏了「待客户确认事项」，于是目录从第 19 章起每一项都比正文少 1 ——
+            # 读者按目录翻 19，找到的是「待客户确认事项」而不是「综合结论与管理建议」。
+            # 「待客户确认事项」是恒渲染的（无事项时写明「本次没有」，模型未提供时声明
+            # 未产出清单），所以目录里也必须恒列它。
             contents.extend([
                 f"{risk_number}. 风险登记册",
                 f"{risk_number + 1}. 分级整改与闭环计划",
-                f"{risk_number + 2}. 综合结论与管理建议",
-                f"{risk_number + 3}. 附录",
+                f"{risk_number + 2}. 待客户确认事项",
+                f"{risk_number + 3}. 综合结论与管理建议",
+                f"{risk_number + 4}. 附录",
             ])
         else:
             contents.extend([f"{risk_number}. 风险清单与整改建议", f"{risk_number + 1}. 附录"])
@@ -887,7 +899,95 @@ class WordReportEngine:
         score = health.get("score")
         conclusions = self.model.get("comprehensive_conclusions") or []
         self.heading("1. 巡检总结", 1)
-        self.table(
+        # 人话总述：首页直接印「0 / 100」会让读者以为系统已经不可用，而实际是
+        # 扣分触底。三句话**全部由 model 字段拼出** —— 手写一句必错：此前一版
+        # 预览稿里手写的「5 条集中在 .125 的磁盘写压力」三处都不对（条数错、
+        # collation 不是 finding、当时根本没有"磁盘写压力"这个判据）。数字只允许
+        # 来自 health_assessment 与 collection_gaps。
+        policy = health.get("scoring_policy")
+        # 类型守卫：MySQL 的 scoring_policy 是 {"base":..,"penalty_per_finding":{..}}，
+        # 但 Oracle 插件给的是字符串描述 —— 直接 .get() 会在 Oracle 报告上抛
+        # AttributeError（公共层被三个插件共用，不能按单一插件的字段形态写）。
+        # 形态不符时整段跳过：不渲染总述，也好过渲染一段猜出来的话。
+        if not isinstance(policy, dict):
+            policy = {}
+        base = policy.get("base")
+        penalties = policy.get("penalty_per_finding")
+        if not isinstance(penalties, dict):
+            penalties = {}
+        if score is not None and base:
+            medium_n = counts.get("medium") or 0
+            low_n = counts.get("low") or 0
+            penalty_high = penalties.get("high")
+            penalty_medium = penalties.get("medium")
+            penalty_low = penalties.get("low")
+            penalty_critical = penalties.get("critical")
+            if penalty_critical is None:
+                # 老形态（MySQL）：它的 severity 体系里没有 critical，policy 也就没有这一档。
+                # 此时把 critical 并入 high 计算 —— 与改动前的算式逐字等价，MySQL 输出不变。
+                critical_n = 0
+                high_n = (counts.get("high") or 0) + (counts.get("critical") or 0)
+                tier_note = (
+                    f"按高风险 {number(high_n, 0)} 项、中风险 {number(medium_n, 0)} 项、"
+                    f"低风险 {number(low_n, 0)} 项分别扣 "
+                    f"{number(penalty_high, 0)}、{number(penalty_medium, 0)}、"
+                    f"{number(penalty_low, 0)} 分"
+                )
+                deduction = (
+                    high_n * (penalty_high or 0)
+                    + medium_n * (penalty_medium or 0)
+                    + low_n * (penalty_low or 0)
+                )
+            else:
+                # 有 critical 档（SQL Server / Oracle）时必须单独计：它们的 critical 权重大于
+                # high（SQL Server 是 18 对 10），合并进 high 会让首页印出的扣分算式
+                # 与评分函数实际用的权重对不上 —— 首页那段话的全部价值就在于数字可核对。
+                critical_n = counts.get("critical") or 0
+                high_n = counts.get("high") or 0
+                tier_note = (
+                    f"按严重 {number(critical_n, 0)} 项、高风险 {number(high_n, 0)} 项、"
+                    f"中风险 {number(medium_n, 0)} 项、低风险 {number(low_n, 0)} 项分别扣 "
+                    f"{number(penalty_critical, 0)}、{number(penalty_high, 0)}、"
+                    f"{number(penalty_medium, 0)}、{number(penalty_low, 0)} 分"
+                )
+                deduction = (
+                    critical_n * (penalty_critical or 0)
+                    + high_n * (penalty_high or 0)
+                    + medium_n * (penalty_medium or 0)
+                    + low_n * (penalty_low or 0)
+                )
+            minimum = policy.get("minimum") or 0
+            if score <= minimum and deduction > 0:
+                score_note = (
+                    "扣分已触及 0 分下限 —— 该分数表示风险项数量超出评分区间，"
+                    "不代表系统当前不可用"
+                )
+            else:
+                score_note = f"扣除后剩 {number(score, 0)} 分"
+            sentences = [
+                (
+                    f"总体健康分 {number(score, 0)}/100：以 {number(base, 0)} 分为基线，"
+                    f"{tier_note}，合计扣 {number(deduction, 0)} 分，{score_note}。"
+                )
+            ]
+            risky_nodes = [
+                f"{text(entry.get('node'))} {number(entry.get('high'), 0)} 项"
+                for entry in (health.get("nodes") or [])
+                if (entry.get("high") or 0) > 0
+            ]
+            if risky_nodes:
+                sentences.append(
+                    "高风险项分布：" + "、".join(risky_nodes)
+                    + "；集群可用性由最弱节点决定，逐条事实与建议见「风险清单与整改建议」章节。"
+                )
+            gaps = self.model.get("collection_gaps") or []
+            if gaps:
+                sentences.append(
+                    f"另有 {len(gaps)} 项证据缺口（采集不完整或需外部证据）："
+                    "按「未采集 ≠ 0」处理，既不计入评分，也不作通过结论，详见附录。"
+                )
+            self.note_box("结论速览", "".join(sentences))
+        counts_table = self.table(
             ["总体健康", "高风险", "中风险", "低风险"],
             [[
                 f"{number(score, 0)} / 100",
@@ -897,6 +997,23 @@ class WordReportEngine:
             ]],
             [3000, 2120, 2120, 2120],
         )
+        # 这四个数字原先清一色黑字，「高风险 5」和普通统计长得一模一样 —— 而它本该是
+        # 全页第一个被看到的。按档给字色：纯呈现，不参与任何判断，数字仍逐字来自
+        # health_assessment。总分格随「高风险」列同档：它是各档扣完的结果而不是独立
+        # 判断，用同一档色才能让「总分 + 高风险数」被读成一件事。
+        # 为 0 的档不着色 —— 「0 项」不该看起来像警报。
+        top_n = (counts.get("critical") or 0) + (counts.get("high") or 0)
+        tier_colors = {
+            0: COLOR_HIGH if top_n else COLOR_TEXT,
+            1: COLOR_HIGH if top_n else COLOR_TEXT,
+            2: COLOR_MEDIUM if (counts.get("medium") or 0) else COLOR_TEXT,
+            3: COLOR_LOW if (counts.get("low") or 0) else COLOR_TEXT,
+        }
+        for column, color in tier_colors.items():
+            if color == COLOR_TEXT:
+                continue
+            for run in counts_table.rows[1].cells[column].paragraphs[0].runs:
+                set_run_font(run, size=9.5, bold=True, color=color)
         # 多实例：把各节点独立评分单列一张表。首页只给主体节点的分数会让
         # 读者以为"集群健康 = 主体主机健康"，看不出是哪台在拉低整体。
         node_health = health.get("nodes") or []
@@ -922,8 +1039,8 @@ class WordReportEngine:
         if conclusions:
             has_node = any(item.get("node") for item in conclusions)
             # 摘要位只放「结论」不放「明细」：节点风险清单（scope=node_detail）在三节点
-            # 实测单条 1988 字，塞进摘要表格就是"全堆在一起"。明细落在第 12 章风险
-            # 登记册，摘要改用下面的「高风险项速览」给出最要紧的若干条。
+            # 实测单条 1988 字，塞进摘要表格就是"全堆在一起"。明细落在风险登记册，
+            # 摘要改用下面的「高风险项速览」给出最要紧的若干条。
             # 单实例的结论条目不带 scope 键，因此全部保留，外观不变。
             summary_items = [item for item in conclusions if item.get("scope") != "node_detail"]
             rows = []
@@ -950,43 +1067,74 @@ class WordReportEngine:
             for row, item in zip(table.rows[1:], summary_items):
                 status = str(item.get("status"))
                 color = COLOR_HIGH if status == "risk" else COLOR_MEDIUM if status == "attention" else COLOR_TEXT
-                for run in row.cells[1].paragraphs[0].runs:
+                status_cell = row.cells[1]  # 两种表头下（含/不含「节点」列）状态都固定在第 1 列
+                fill = self.SUMMARY_STATUS_FILLS.get(status)
+                if fill:
+                    set_cell_shading(status_cell, fill)
+                for run in status_cell.paragraphs[0].runs:
                     set_run_font(run, size=9.5, bold=True, color=color)
-        # 高风险项速览：只列 high，一行一条，让读者翻开第一页就知道最要紧的是什么。
-        # 取 risk_register 现成条目（不重算判断）；其 node 键只在多实例注入，
-        # 所以单实例报告不会多出这张表。
+        # 高风险项速览：一行一条，让读者翻开第一页就知道最要紧的是什么。
+        # 取 risk_register 现成条目（不重算判断），筛选口径与首页「高风险」列一致
+        # —— 含 critical：首页把 critical 算进高风险档，速览只挑 high 就会出现
+        # 「首页写 5 条、速览列 4 条」的自相矛盾。MySQL 的严重度体系里没有 critical
+        # 档，这条改动对那边等价于原逻辑，输出不变。
+        # 原先的条件里还带 `and finding.get("node")`：node 键只在多实例输入时注入，
+        # 于是单实例报告整节不渲染 —— 而这一节和节点数量无关，只和「最要紧的事情
+        # 有没有被放在第一页」有关。
         highlights = [
             finding
             for finding in (self.model.get("risk_register") or [])
-            if str(finding.get("severity")) == "high" and finding.get("node")
+            if str(finding.get("severity")) in {"critical", "high"}
         ]
         if highlights:
             self._summary_sub = 2
             self.heading("1.2 高风险项速览", 2)
 
             def brief_facts(values: Any) -> str:
+                # 事实字段各库形态不同：MySQL 是 facts 列表，SQL Server 是单条
+                # evidence 字符串。两种都要能读，否则表里会写满「未提供事实」——
+                # 那看起来像"这条风险没有依据"，而实际只是字段名不同。
+                if isinstance(values, str):
+                    values = [values]
                 parts = [str(value) for value in (values or [])[:2] if str(value).strip()]
                 joined = "；".join(parts)
                 return joined if len(joined) <= 90 else joined[:88] + "…"
 
+            def facts_of(finding: dict[str, Any]) -> str:
+                return brief_facts(finding.get("facts") or finding.get("evidence")) or "未提供事实"
+
+            critical_n = sum(1 for f_ in highlights if str(f_.get("severity")) == "critical")
+            scope = (
+                f"仅列风险登记册中的 {len(highlights)} 条最优先项"
+                f"（严重 {critical_n} 项、高风险 {len(highlights) - critical_n} 项）"
+                if critical_n else
+                f"仅列风险登记册中的 {len(highlights)} 条高风险项"
+            )
+            # 「见第 N 章」这样的硬编码章节号必然出错：各库章节结构不同（风险登记册
+            # 在 MySQL 是第 12 章、SQL Server 是第 17 章），库内增删章节也会让它漂移。
             self.note_box(
                 "速览口径",
-                f"仅列风险登记册中的 {len(highlights)} 条高风险项，"
-                "完整事实、建议与证据见第 12 章；中低风险不在本节重复。",
+                f"{scope}，完整事实、建议与证据见风险登记册章节；中低风险不在本节重复。",
                 accent=COLOR_HIGH,
             )
-            table = self.table(
-                ["节点", "风险项", "关键事实"],
-                [[
-                    text(finding.get("node")),
-                    text(finding.get("title")),
-                    brief_facts(finding.get("facts")) or "未提供事实",
-                ] for finding in highlights],
-                [1500, 2700, 5160],
-                compact=True,
-            )
-            for row in table.rows[1:]:
-                for run in row.cells[1].paragraphs[0].runs:
+            has_node = any(finding.get("node") for finding in highlights)
+            if has_node:
+                header, widths = ["节点", "风险项", "关键事实"], [1500, 2700, 5160]
+                body = [[text(f_.get("node")), text(f_.get("title")), facts_of(f_)] for f_ in highlights]
+                title_col = 1
+            else:
+                header, widths = ["风险项", "关键事实"], [3200, 6160]
+                body = [[text(f_.get("title")), facts_of(f_)] for f_ in highlights]
+                title_col = 0
+            table = self.table(header, body, widths, compact=True)
+            for row, finding in zip(table.rows[1:], highlights):
+                title_cell = row.cells[title_col]
+                # 底色按严重度分：严重 EFD2D2、高 F6DEDE，取的仍是风险矩阵那一套色值。
+                # 本节 5 条全会被染上底色，但深浅不同 —— 读者一眼能看出哪条更靠前。
+                fill = self.RISK_MATRIX_STYLES.get(str(finding.get("severity")), (None, COLOR_HIGH))[0]
+                if fill:
+                    set_cell_shading(title_cell, fill)
+                for run in title_cell.paragraphs[0].runs:
                     set_run_font(run, size=9, bold=True, color=COLOR_HIGH)
         self.note_box(
             "结论口径",
@@ -1128,7 +1276,7 @@ class WordReportEngine:
         self.page_break()
         # 小节号跟着 1 章实际渲染了几个小节走：有高风险速览时本节是 1.3，没有则 1.2。
         self.heading(f"1.{getattr(self, '_summary_sub', 1) + 1} 管理关注与处置节奏", 2)
-        self.table(
+        plan_table = self.table(
             ["管理视角", "当前结果", "处置说明"],
             [
                 ["数据质量", f"{number(quality.get('score'), 1, '%')} / {text(quality.get('grade'))}",
@@ -1142,6 +1290,21 @@ class WordReportEngine:
             ],
             [1700, 1800, 5860],
         )
+        # 「立即处理 5 项」原先是黑的，和上面那行「数据质量 100% / good」同色。处置紧迫度
+        # 是这一节唯一的分档信息，按 P1/P2/P3 给字色。条数为 0 时不着色 —— 「0 项」不该
+        # 看起来像警报。行序：rows[0] 是表头，数据行从 rows[1] 起。
+        for row_index, (count, color) in enumerate(
+            (
+                (len(plan.get("P1") or []), COLOR_HIGH),
+                (len(plan.get("P2") or []), COLOR_MEDIUM),
+                (len(plan.get("P3") or []), COLOR_LOW),
+            ),
+            start=2,
+        ):
+            if not count:
+                continue
+            for run in plan_table.rows[row_index].cells[1].paragraphs[0].runs:
+                set_run_font(run, size=9.5, bold=True, color=color)
 
     def build_overview_professional(self) -> None:
         self.build_overview_v31()
@@ -1223,6 +1386,15 @@ class WordReportEngine:
         "info": ("F2F2F2", COLOR_MUTED),
     }
     RISK_MATRIX_PEAK_FILL = "EDEDED"
+
+    # 摘要区（1.1 状态格、1.2 风险项名）的淡底纹。色值**派生**自上面那张表，不另写
+    # 十六进制 —— 同一个档位在整份报告里只允许有一个底色，两处各调一个红迟早会漂移。
+    # 只给「标签格」上底色，不动整行：底色是标签，不是背景板，整行染色会压低结论本身
+    # 的可读性。normal 不在表里 —— 正常项本来就不该被底色挑出来。
+    SUMMARY_STATUS_FILLS = {
+        "risk": RISK_MATRIX_STYLES["critical"][0],
+        "attention": RISK_MATRIX_STYLES["medium"][0],
+    }
 
     def _risk_matrix_table(self, matrix: dict[str, Any]) -> None:
         """风险分级 × 节点矩阵（《可沉淀清单》F2）。
