@@ -447,6 +447,82 @@ class MySQLMetricProvider:
                 if value is not None:
                     bucket[target].append(value)
 
+        # ---- SAR 历史：另四路（load / io / network / process）------------------
+        #
+        # package_adapter 用 glob("sar_*.csv") 加载全部 8 路，此前只有 cpu/disk/
+        # memory/swap 四路被消费，半数历史数据是哑的。补这四路时守三条红线 ——
+        # 这三处正是"外行会写错、内行一眼看出"的地方：
+        #
+        #   1) 负载**必须按 CPU 核数归一**。64 核上 load 30.26 是 0.47/核，属正常
+        #      水位；直接报 30.26 会被读成"负载爆炸"。内存判据 R001 的误报就是
+        #      同一种错（拿百分比当绝对值用）。
+        #   2) 网卡要排除 lo 与**全零虚拟网卡**。本环境 .33/.34 的 virbr0 长期全零，
+        #      不剔掉就会出现"3 个网卡 2 个永远是 0"的行，稀释真正的判断。
+        #   3) `blocked` / `runq-sz` 是**瞬时值**，只给峰值与非零点数、不给平均值
+        #      —— 均值会把偶发的调度拥塞抹平成看不出异常的中间值。
+        cpu_count = safe_float(ctx.snapshot.get("host_identity", {}).get("cpu_count"))
+        load_series: dict[str, list[float]] = {"1": [], "5": [], "15": []}
+        runq_sz: list[float] = []
+        blocked: list[float] = []
+        plist_sz: list[float] = []
+        for row in ctx.history.get("sar_load", []):
+            for key, target in (
+                ("ldavg-1", load_series["1"]),
+                ("ldavg-5", load_series["5"]),
+                ("ldavg-15", load_series["15"]),
+                ("runq-sz", runq_sz),
+                ("blocked", blocked),
+                ("plist-sz", plist_sz),
+            ):
+                value = safe_float(row.get(key))
+                if value is not None:
+                    target.append(value)
+        # 归一后的每核负载才可用于判断；cpu_count 缺失时留空，绝不拿原始值顶上。
+        per_core_load = {
+            window: ([round(value / cpu_count, 3) for value in series] if cpu_count else [])
+            for window, series in load_series.items()
+        }
+
+        sar_io_series: dict[str, list[float]] = {"tps": [], "rtps": [], "wtps": []}
+        for row in ctx.history.get("sar_io", []):
+            for key, target in (("tps", "tps"), ("rtps", "rtps"), ("wtps", "wtps")):
+                value = safe_float(row.get(key))
+                if value is not None:
+                    sar_io_series[target].append(value)
+
+        sar_net_by_interface: dict[str, dict[str, list[float]]] = {}
+        for row in ctx.history.get("sar_network", []):
+            interface = str(row.get("IFACE") or "").strip()
+            if not interface or interface == "lo":
+                continue
+            bucket = sar_net_by_interface.setdefault(
+                interface, {"rx_kib": [], "tx_kib": [], "rx_pck": [], "tx_pck": []}
+            )
+            for key, target in (
+                ("rxkB/s", "rx_kib"),
+                ("txkB/s", "tx_kib"),
+                ("rxpck/s", "rx_pck"),
+                ("txpck/s", "tx_pck"),
+            ):
+                value = safe_float(row.get(key))
+                if value is not None:
+                    bucket[target].append(value)
+        # 全零网卡（libvirt 的 virbr0 这类）剔除：它们只是"存在"，不承载数据库流量。
+        sar_net_by_interface = {
+            name: data
+            for name, data in sar_net_by_interface.items()
+            if any(any(value != 0 for value in values) for values in data.values())
+        }
+
+        sar_proc_series: dict[str, list[float]] = {"proc_per_s": [], "cswch_per_s": []}
+        for row in ctx.history.get("sar_process", []):
+            for key, target in (("proc/s", "proc_per_s"), ("cswch/s", "cswch_per_s")):
+                value = safe_float(row.get(key))
+                if value is not None:
+                    sar_proc_series[target].append(value)
+
+        blocked_nonzero = [value for value in blocked if value > 0]
+
         return {
             "system_realtime": {
                 "cpu_busy_percent": summarize(value for row in cpu_rows if (value := safe_float(row.get("busy_pct"))) is not None),
@@ -483,6 +559,42 @@ class MySQLMetricProvider:
                 "disk_devices": {
                     device: {key: summarize(values) for key, values in data.items()}
                     for device, data in sar_disk_by_device.items()
+                },
+                # 负载按核归一 —— 原始 load 值单独保留一份，供读者对数与复核。
+                "cpu_count": cpu_count,
+                "load": {
+                    "sample_points": len(load_series["1"]),
+                    "ldavg_1": summarize(load_series["1"]),
+                    "ldavg_5": summarize(load_series["5"]),
+                    "ldavg_15": summarize(load_series["15"]),
+                    "per_core_ldavg_1": summarize(per_core_load["1"]),
+                    "per_core_ldavg_15": summarize(per_core_load["15"]),
+                    # 瞬时值：只给峰值，不给均值。
+                    "runq_sz_max": summarize(runq_sz).get("max") if runq_sz else None,
+                    "blocked_max": max(blocked) if blocked else None,
+                    "blocked_nonzero_points": len(blocked_nonzero),
+                    "plist_sz": summarize(plist_sz),
+                },
+                "io_throughput": {
+                    "sample_points": len(sar_io_series["tps"]),
+                    "tps": summarize(sar_io_series["tps"]),
+                    "rtps": summarize(sar_io_series["rtps"]),
+                    "wtps": summarize(sar_io_series["wtps"]),
+                },
+                "network_interfaces": {
+                    interface: {
+                        "sample_points": len(data["rx_kib"]),
+                        "rx_kib_per_s": summarize(data["rx_kib"]),
+                        "tx_kib_per_s": summarize(data["tx_kib"]),
+                        "rx_pck_per_s": summarize(data["rx_pck"]),
+                        "tx_pck_per_s": summarize(data["tx_pck"]),
+                    }
+                    for interface, data in sar_net_by_interface.items()
+                },
+                "process_activity": {
+                    "sample_points": len(sar_proc_series["cswch_per_s"]),
+                    "proc_per_s": summarize(sar_proc_series["proc_per_s"]),
+                    "cswch_per_s": summarize(sar_proc_series["cswch_per_s"]),
                 },
             },
         }

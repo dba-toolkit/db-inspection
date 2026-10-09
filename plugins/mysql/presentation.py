@@ -98,6 +98,10 @@ CONFIG_GROUP_VARIABLES: dict[str, tuple[tuple[str, str], ...]] = {
         ("lower_case_table_names", "表名大小写策略"),
         ("sql_mode", "SQL Mode"),
         ("time_zone", "默认时区"),
+        # 实测 .33/.34=UTC 而 .125=SYSTEM：时区相同（都是东八）但**日志时间基准不同**，
+        # 跨节点比对错误日志/慢日志时会差 8 小时 —— 排障的人按 A 节点的时间去 B 节点
+        # 找，什么都找不到。它和 time_zone 是两个独立的坑，不能只留一个。
+        ("log_timestamps", "日志时间基准"),
     ),
 }
 
@@ -107,6 +111,18 @@ CONFIG_GROUP_TITLES: tuple[tuple[str, str], ...] = (
     ("mysql.config.durability", "日志、持久性与复制参数"),
     ("mysql.config.charset", "字符集与 SQL 模式"),
 )
+
+# 整改项的「计划窗口」文案，按规则包声明的 apply_mode 派生。
+#
+# 规则包只声明**不变的事实**（可在线生效 / 需停机窗口 / 需客户先拍板），窗口措辞
+# 在这里收口成单一来源 —— 否则 42 条规则各写一遍，改口径要改 42 处。
+#
+# 刻意不含具体日期：巡检报告不知道客户什么时候有维护窗口，写日期就是编。
+PLAN_WINDOW_BY_APPLY_MODE: dict[str, str] = {
+    "online": "可在线生效，建议 7 个工作日内完成",
+    "restart": "需停机窗口，建议随下次维护窗口执行",
+    "business_confirm": "需客户先确认口径，确认后按变更流程执行",
+}
 
 # 「待客户确认事项」的模板，按**已触发的规则**派生（rule_id → 主题 / 问题）。
 # 刻意不重复判定：规则引擎已经回答"这是不是风险"，本表只回答"这件事要客户确认什么"。
@@ -770,6 +786,149 @@ class MySQLPresentationBuilder:
                 if interface_metrics.get("tx_bps", {}).get("max") is not None else None,
             })
 
+        # ---- SAR 历史四路 ------------------------------------------------------
+        # 与上面三张现场表形成对照：现场表答「这一刻怎么样」，本表答「过去几十个
+        # 小时怎么样」。三处口径已在 metrics 层守住（负载按核归一、网卡剔全零、
+        # 瞬时量只给峰值），这里只负责呈现，不重算 —— 重算就会出现第二口径。
+        history_block = metrics.get("system_history") or {}
+        history_load = history_block.get("load") or {}
+        history_io = history_block.get("io_throughput") or {}
+        history_proc = history_block.get("process_activity") or {}
+        history_window = history_block.get("coverage") or {}
+        # requested_hours 只存在于 sampling_context.history（sar_history_quality 的产出），
+        # system_history.coverage 是 snapshot 里的原始声明、没有这一项 —— 取错来源
+        # 会在报告里印出「采集端请求 None 小时」。
+        history_quality = (metrics.get("sampling_context") or {}).get("history") or {}
+        history_cpu_count = history_block.get("cpu_count")
+        history_usable = bool(history_quality.get("usable_for_trend_rules"))
+
+        def history_cell(source: Any, key: str = "", digits: int = 2) -> str:
+            """dict 取 ``source[key]``，标量直接用；缺值一律「—」不补 0。"""
+            value = (source or {}).get(key) if isinstance(source, dict) else source
+            if value is None:
+                return "—"
+            return f"{float(value):.{digits}f}"
+
+        def history_load_note(window: str) -> str:
+            """每核说明必须带**本窗口**的原始值 —— 两行共用一句会把 1 分钟的值串到 15 分钟行上。"""
+            if not history_cpu_count:
+                return "未取得 CPU 核数，无法按核归一，本行不作负载结论"
+            original = history_cell(history_load.get(f"ldavg_{window}"), "average")
+            return f"按 {int(history_cpu_count)} 核归一；原始负载均值 {original}"
+
+        history_rows: list[dict[str, Any]] = []
+        if history_load.get("sample_points"):
+            history_rows.append({
+                "指标": "负载（1 分钟，每核）",
+                "历史均值": history_cell(history_load.get("per_core_ldavg_1"), "average"),
+                "历史峰值": history_cell(history_load.get("per_core_ldavg_1"), "max"),
+                "说明": history_load_note("1"),
+            })
+            history_rows.append({
+                "指标": "负载（15 分钟，每核）",
+                "历史均值": history_cell(history_load.get("per_core_ldavg_15"), "average"),
+                "历史峰值": history_cell(history_load.get("per_core_ldavg_15"), "max"),
+                "说明": history_load_note("15"),
+            })
+            history_rows.append({
+                "指标": "运行队列长度",
+                "历史均值": "—",
+                "历史峰值": history_cell(history_load.get("runq_sz_max")),
+                "说明": "瞬时值，仅取峰值，不给均值",
+            })
+            history_rows.append({
+                "指标": "调度阻塞进程数",
+                "历史均值": "—",
+                "历史峰值": history_cell(history_load.get("blocked_max")),
+                "说明": (
+                    f"{history_load.get('blocked_nonzero_points')} / "
+                    f"{history_load.get('sample_points')} 个采样点非零；瞬时值"
+                ),
+            })
+        if history_io.get("sample_points"):
+            history_rows.append({
+                "指标": "磁盘 I/O 次数（tps）",
+                "历史均值": history_cell(history_io.get("tps"), "average"),
+                "历史峰值": history_cell(history_io.get("tps"), "max"),
+                "说明": (
+                    f"均值含读 {history_cell(history_io.get('rtps'), 'average')} 与 "
+                    f"写 {history_cell(history_io.get('wtps'), 'average')} 次/秒"
+                ),
+            })
+        if history_proc.get("sample_points"):
+            history_rows.append({
+                "指标": "上下文切换（cswch/s）",
+                "历史均值": history_cell(history_proc.get("cswch_per_s"), "average", 0),
+                "历史峰值": history_cell(history_proc.get("cswch_per_s"), "max", 0),
+                "说明": (
+                    f"进程创建 {history_cell(history_proc.get('proc_per_s'), 'average')} 个/秒（均值）"
+                ),
+            })
+        for interface, interface_history in (history_block.get("network_interfaces") or {}).items():
+            history_rows.append({
+                "指标": f"网络 {interface} 接收 / 发送",
+                "历史均值": (
+                    f"{history_cell(interface_history.get('rx_kib_per_s'), 'average', 1)} / "
+                    f"{history_cell(interface_history.get('tx_kib_per_s'), 'average', 1)} kB/s"
+                ),
+                "历史峰值": (
+                    f"{history_cell(interface_history.get('rx_kib_per_s'), 'max', 1)} / "
+                    f"{history_cell(interface_history.get('tx_kib_per_s'), 'max', 1)} kB/s"
+                ),
+                "说明": f"{interface_history.get('sample_points')} 个采样点；已排除 lo 与全零虚拟网卡",
+            })
+
+        if history_rows:
+            history_points = history_load.get("sample_points") or history_io.get(
+                "sample_points"
+            )
+            # 四路里实际有几路有数据要如实说 —— 写死「4 路」而某路为空就是虚报消费面。
+            consumed_paths = sum([
+                bool(history_load.get("sample_points")),
+                bool(history_io.get("sample_points")),
+                bool(history_block.get("network_interfaces")),
+                bool(history_proc.get("sample_points")),
+            ])
+            history_status = "attention"
+            history_conclusion = (
+                f"已消费 SAR 历史 {consumed_paths} / 4 路（负载 / I/O / 网络 / 进程），"
+                f"共 {history_points} 个采样点；"
+                f"1 分钟负载按核归一后峰值 {history_cell(history_load.get('per_core_ldavg_1'), 'max')}，"
+                "运行队列与阻塞进程为瞬时值，仅作峰值参考。"
+            )
+            history_recommendation = (
+                "历史项用于判断趋势与高峰期水位；与现场短采样口径不同，两者不可交叉比较。"
+            )
+            requested_hours = history_quality.get("requested_hours") or history_window.get(
+                "requested_hours"
+            )
+            requested_text = f"{float(requested_hours):g} 小时" if requested_hours else "未声明"
+            history_evidence = [
+                (
+                    f"历史实际覆盖约 {history_window.get('coverage_hours')} 小时"
+                    f"（采集端请求 {requested_text}）"
+                ),
+                f"采样点 {history_points} 个",
+            ]
+            if not history_usable:
+                history_conclusion = (
+                    "SAR 历史未通过可用性校验（覆盖、新鲜度或点数不足），"
+                    "以下数字仅作参考，不构成趋势结论。" + history_conclusion
+                )
+                history_evidence.append(
+                    "；".join(history_window.get("reasons") or []) or "历史可用性校验未通过"
+                )
+        else:
+            history_status = "not_applicable"
+            history_conclusion = (
+                "未取得可用的 SAR 历史四路数据（负载 / I/O / 网络 / 进程），"
+                "本次不对历史负载与 I/O 趋势作结论。"
+            )
+            history_recommendation = "确认 sysstat 留存与 sa 数据文件可读后重新采集。"
+            history_evidence = [
+                f"历史状态：{history_window.get('status') or 'unusable'}"
+            ]
+
         basic_rows = [
             value_row("数据库类型", identity.get("database_type"), "数据库产品"),
             value_row("数据库版本", identity.get("version"), "服务端版本"),
@@ -1324,6 +1483,22 @@ class MySQLPresentationBuilder:
                         status="attention",
                         recommendation="如需网络质量结论，应补充重传、错误包、丢包及交换机侧监控。",
                         collection=collection("timeseries.realtime_sampling"),
+                    ),
+                    self._item(
+                        "system.performance.history",
+                        "历史负载与 I/O 概览（SAR）",
+                        "history/sar_load.csv; history/sar_io.csv; "
+                        "history/sar_network.csv; history/sar_process.csv",
+                        history_rows,
+                        history_conclusion,
+                        status=history_status,
+                        recommendation=history_recommendation,
+                        evidence=history_evidence,
+                        collection=collection("system.sar_history"),
+                        note=(
+                            "历史负载已按 CPU 核数归一；运行队列与阻塞进程为瞬时值，"
+                            "只取峰值。与上方现场短采样口径不同，不可交叉比较。"
+                        ) if history_rows else None,
                     ),
                 ],
             },
@@ -1965,6 +2140,20 @@ class MySQLPresentationBuilder:
             if values[0].upper() == "SYSTEM":
                 return "不达标", "取值为 SYSTEM，依赖操作系统时区；各节点系统时区不一致时日志时间线会错位"
             return "达标", ""
+        if name == "log_timestamps":
+            # 不沿用字符集的兜底文案「字符集解释可能不同」——那是给 character_set_server
+            # 写的，套在日志时间基准上完全不通。这里的真实后果是：两台写 UTC、一台写本地
+            # 时间，按 A 节点的时间去 B 节点捞错误日志会什么都找不到。
+            values = [str(record["values"].get(name) or "").strip() for record in records]
+            if any(value == "" for value in values):
+                return "不适用", "部分节点未采集 log_timestamps，未参与对比"
+            if len(set(values)) == 1:
+                return "达标", ""
+            groups = self._node_value_groups(records, name)
+            return "不达标", (
+                f"节点间不一致（{groups}）；错误日志与慢日志按不同时区基准写时间戳，"
+                "跨节点按同一时刻检索日志会错位"
+            )
         return self._drift_verdict(
             records, name,
             "节点间不一致（{values}），跨节点写入的字符集解释可能不同",
@@ -2777,12 +2966,23 @@ class MySQLPresentationBuilder:
         priorities = {"P1": [], "P2": [], "P3": []}
         for finding in findings:
             priority = "P1" if finding["severity"] == "high" else "P2" if finding["severity"] == "medium" else "P3"
+            # 整改三要素由规则包逐条声明、经 Finding 透传到计划条目。三者都可能缺失
+            # （旧 analysis.json 没有这些键），缺失时不补默认值：渲染层会显示
+            # 「待指定 / 未登记」，补默认值等于替客户认定责任方。
+            #
+            # apply_mode → planned_window 是**查表**，不是 if/elif：新增生效方式
+            # 只改 PLAN_WINDOW_BY_APPLY_MODE 一处；表里没有的值回退 None（渲染层
+            # 显示「未登记」），不会因为规则包多写一个取值而崩。
+            apply_mode = str(finding.get("apply_mode") or "")
             priorities[priority].append(RemediationAction(
                 finding_id=finding["finding_id"],
                 title=finding["title"],
                 recommendation=finding["recommendation"],
                 priority=priority,
-            ).to_legacy_dict())
+                owner=finding.get("owner"),
+                target_window=PLAN_WINDOW_BY_APPLY_MODE.get(apply_mode),
+                verification=finding.get("verification"),
+            ).to_plan_dict())
         collection_gaps: list[dict[str, Any]] = []
         quality = primary.get("collection_quality", {})
         for item in quality.get("non_ok_items", []):

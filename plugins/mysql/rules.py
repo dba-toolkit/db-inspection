@@ -47,6 +47,26 @@ from .metrics import (
 RULES_CONFIG = Path(__file__).resolve().parent / "inspection_rules.json"
 
 
+def remediation_kwargs(cfg: dict[str, Any]) -> dict[str, str]:
+    """规则包声明的整改三要素：责任人 / 生效方式 / 验证方式。
+
+    只返回**非空**的键，交给 ``Finding.to_dict()`` 做条目级条件注入。理由有二：
+
+    1. 基线 ``analysis.json`` 的 findings 里没有这三个键，无条件写入会打穿
+       ``test_report_builder_matches_frozen_report_contract``（逐字典等值比对，
+       且基线包已不在仓库、不可刷新）；
+    2. 缺项时补默认值等于替客户认定责任方 —— 宁可不写，由渲染层显示「待指定」。
+
+    ``owner`` 一律写**角色**而不是人名：这是跨客户复用的规则包，写人名必错。
+    """
+    meta: dict[str, str] = {}
+    for key in ("owner", "apply_mode", "verification"):
+        value = cfg.get(key)
+        if value:
+            meta[key] = str(value)
+    return meta
+
+
 def load_rules_config(path: Path | None = None) -> dict[str, Any]:
     target = path or RULES_CONFIG
     with target.open("r", encoding="utf-8") as f:
@@ -177,6 +197,7 @@ class RuleEngine:
                 summary=summary, facts=facts, recommendation=recommendation,
                 evidence_refs=evidence, requires_restart=requires_restart,
                 status="triggered", confidence=confidence, finding_id=finding_id,
+                **remediation_kwargs(cfg),
             ))
         self._evaluations.append(RuleEvaluation(
             rule_id=rule_id, category=category, status=status, reason=reason,
@@ -432,12 +453,27 @@ class RuleEngine:
         )
         exec_min = self._threshold(rule, "no_index_exec_min", 100)
         sec_min = self._threshold(rule, "no_index_seconds_min", 60)
+        facts: list[str] = []
+        if digest_rows:
+            facts = [
+                f"摘要累计执行次数：{no_index_exec}",
+                f"累计耗时：{no_index_seconds:.1f} 秒",
+            ]
+        # 「存在未走索引的语句」是现象，「配置让所有未走索引的语句都写进慢日志」
+        # 是放大器，两者是因果关系而非并列风险。实测仅 .125 开启该开关，同包慢查询
+        # 计数 996 万 —— 它解释的是"慢日志为什么爆"，所以落进本条的事实里，
+        # 不新开 rule_id：新开只会让客户在两个条目里看到同一件事。
+        slow_log_flag = runtime_variables(ctx).get("log_queries_not_using_indexes")
+        if str(slow_log_flag).strip().upper() in {"ON", "1", "TRUE"}:
+            facts.append(
+                "log_queries_not_using_indexes=ON：所有未走索引的语句都会写入慢日志，"
+                "慢日志量会被显著放大"
+            )
         self._evaluate(
             rule, True, bool(digest_rows),
             no_index_exec > exec_min and no_index_seconds >= sec_min,
             "Performance Schema 摘要中 SUM_NO_INDEX_USED 累计值；需结合启动时长",
-            [f"摘要累计执行次数：{no_index_exec}", f"累计耗时：{no_index_seconds:.1f} 秒"]
-            if digest_rows else [],
+            facts,
         )
 
     def _check_long_transactions(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
@@ -631,6 +667,36 @@ class RuleEngine:
                 break
         if waits:
             facts.append("错误日志出现 MY-013865（redo 写等待）：" + " / ".join(waits))
+        # 容量小是**静态**信号；"用得满不满"和"等没等过"是另两个信号，而且指向
+        # 不同的整改项（前者加容量、后者加 innodb_log_buffer_size）。实测 .33 物理
+        # 56.25MB / capacity 100MB、使用率 94.8%；.34 使用率仅 14.7% 却有 17556 次
+        # log_waits（log_buffer 未配置=默认 16M）—— 合成一句「redo 有压力」会把
+        # 两个不同的病说成一个，整改方向也就跟着错。
+        current_lsn = safe_float(ctx.global_status.get("Innodb_redo_log_current_lsn"))
+        checkpoint_lsn = safe_float(ctx.global_status.get("Innodb_redo_log_checkpoint_lsn"))
+        physical = safe_float(ctx.global_status.get("Innodb_redo_log_physical_size"))
+        usage = None
+        if None not in (current_lsn, checkpoint_lsn, physical) and physical > 0:
+            written = current_lsn - checkpoint_lsn
+            if written >= 0:
+                usage = written / physical
+        if usage is not None:
+            facts.append(
+                f"当前 redo 使用率 {usage * 100:.1f}%"
+                f"（未检查点 LSN 距离 / 物理文件 {format_bytes(physical)}）"
+            )
+        log_waits = safe_float(global_status_value(ctx, "Innodb_log_waits"))
+        if log_waits is not None and log_waits > 0:
+            log_buffer = safe_float(ctx.variables.get("innodb_log_buffer_size"))
+            buffer_text = (
+                f"，当前 innodb_log_buffer_size {format_bytes(log_buffer)}"
+                if log_buffer
+                else ""
+            )
+            facts.append(
+                f"Innodb_log_waits 累计 {log_waits:.0f} 次：等待 redo log buffer 空间"
+                f"{buffer_text}"
+            )
         threshold = float(self._threshold(rule, "redo_capacity_min_bytes", 1024 ** 3))
         self._evaluate(
             rule, True, True, actual < threshold,
@@ -888,7 +954,20 @@ class RuleEngine:
         uptime = mysql_uptime_seconds(ctx)
         rate = opened_tables / uptime if uptime and uptime > 0 else None
         ops_limit = float(self._threshold(rule, "table_cache_open_ops_per_sec", 20))
-        triggered = capped or (rate is not None and rate > ops_limit)
+        # 溢出次数比"是否顶格"更直接：顶格是**采集瞬间**的横截面，溢出是**启动以来**
+        # 的累计事实，不受采样时刻影响。实测 .125 溢出 2.4 亿次（其 table_open_cache
+        # 运行值仅 400）、.33 一千三百万次、.34 六千八百次 —— 三台差 4 个数量级，
+        # 只看"是否顶格"会把 .34 和 .125 说成同一档。仍需按 Uptime 归一，否则
+        # 长跑实例天然吃亏。
+        overflows = safe_float(global_status_value(ctx, "Table_open_cache_overflows"))
+        overflow_rate = (
+            overflows / uptime if overflows is not None and uptime and uptime > 0 else None
+        )
+        triggered = (
+            capped
+            or (rate is not None and rate > ops_limit)
+            or (overflow_rate is not None and overflow_rate > ops_limit)
+        )
         facts = [
             f"Open_tables {open_tables:.0f} / table_open_cache {cache:.0f}"
             + ("（已顶格）" if capped else ""),
@@ -898,9 +977,14 @@ class RuleEngine:
                 f"累计打开速率 {rate:.1f} 次/秒"
                 f"（Opened_tables {opened_tables:.0f} / Uptime {uptime:.0f}s）"
             )
+        if overflow_rate is not None:
+            facts.append(
+                f"表缓存溢出累计 {overflows:.0f} 次，折合 {overflow_rate:.1f} 次/秒"
+                f"（Table_open_cache_overflows / Uptime）"
+            )
         self._evaluate(
             rule, True, True, triggered,
-            f"顶格或打开速率阈值 {ops_limit:.0f} 次/秒",
+            f"顶格或打开/溢出一致性阈值 {ops_limit:.0f} 次/秒",
             facts,
         )
 
@@ -1120,6 +1204,7 @@ def evaluate_identity_conflicts(
             status="triggered",
             confidence=float(cfg.get("confidence", 1.0)),
             finding_id="",
+            **remediation_kwargs(cfg),
         )
         evaluation = RuleEvaluation(
             rule_id=rule,
@@ -1203,6 +1288,7 @@ def evaluate_replication_retention(
         status="triggered",
         confidence=float(cfg.get("confidence", 0.9)),
         finding_id="",
+        **remediation_kwargs(cfg),
     )
     evaluation = RuleEvaluation(
         rule_id=rule,
