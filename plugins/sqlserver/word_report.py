@@ -20,8 +20,16 @@ SQLSERVER_WORD_PROFILE = WordReportProfile(
     default_filename_suffix="SQLServer数据库巡检报告",
     identity_fallback="SQL Server",
     database_version_prefix="",
+    # 章节渲染顺序的唯一来源：本元组决定渲染顺序，下面的 append 顺序不影响它
+    # （引擎按本元组排序，见 word_engine._ordered_sections）。「实例关键配置」
+    # 紧随「实例与数据库概览」：概览讲实例是什么样（版本、库清单、容量），配置讲
+    # 它被怎么配的（内存上限、MAXDOP、开销阈值），两者合起来才是实例画像；而
+    # 内存 / 容量 / 性能基线 三章讨论的资源上限正是这一章的配置事实 —— 排在末尾会
+    # 让读者在不知道内存上限的前提下读完整章内存分析。MySQL profile 同样把配置
+    # 紧跟实例之后。
     section_order=(
         "instance",
+        "config",
         "backup",
         "memory",
         "capacity",
@@ -31,8 +39,9 @@ SQLSERVER_WORD_PROFILE = WordReportProfile(
         "sql_index",
         "db_objects",
         "security",
+        "ha",
         "ops",
-        "config",
+        "collection_detail",
     ),
     section_charts={
         "backup": SectionChartProfile(

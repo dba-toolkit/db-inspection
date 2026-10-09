@@ -38,11 +38,19 @@ def analyze_sqlserver(source: Path, output: Path, rules_config: Path) -> dict[st
     except ValueError:
         now = datetime.now().astimezone()
 
-    findings = SQLServerRuleProvider(config, now).evaluate(snapshot)
+    provider = SQLServerRuleProvider(config, now)
+    findings = provider.evaluate(snapshot)
+    # 四态求值结果必须随报告模型一起落盘：下游 generate_report.py 只读 report_model.json，
+    # 拿不到 snapshot，"某条规则有没有跑、为什么没跑"只有这一步知道。
+    evaluations = provider.evaluations
     charts = build_charts(snapshot, findings, output / "charts")
-    model = build_model(snapshot, findings, charts)
+    model = build_model(snapshot, findings, charts, evaluations)
 
-    write_json(output / "analysis.json", {"snapshot": snapshot, "findings": findings})
+    write_json(output / "analysis.json", {
+        "snapshot": snapshot,
+        "findings": findings,
+        "rule_evaluations": evaluations,
+    })
     write_json(output / "report_model.json", model)
     lines = [
         "SQL Server 巡检分析完成",

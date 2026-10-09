@@ -1,16 +1,545 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
+  "_comment": "rules 目录只声明「本规则包应当求值哪些规则」——判定逻辑、证据文案与建议措施仍然唯一存在于 plugins/sqlserver/rules.py。它存在的目的，是让附录的「规则执行状态」能算出「通过」数量：触发=引擎产出 finding，未判断/不适用=引擎显式登记，通过=目录里有而前两者都没有。规则包这里只提供分类与严重度元数据。",
+  "rules": {
+    "INSTANCE.MAX_MEMORY": {
+      "category": "实例配置",
+      "severity": "high",
+      "title": "SQL Server 最大内存配置过高",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.MAXDOP": {
+      "category": "实例配置",
+      "severity": "medium",
+      "title": "MAXDOP 高于通用建议值",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.COST_THRESHOLD": {
+      "category": "实例配置",
+      "severity": "medium",
+      "title": "并行开销阈值偏低",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.SERVICE_STARTUP": {
+      "category": "实例配置",
+      "severity": "critical",
+      "title": "SQL Server 服务未处于运行状态",
+      "required_modules": [
+        "SQL Server 服务与启动参数"
+      ]
+    },
+    "INSTANCE.ADHOC_WORKLOADS": {
+      "category": "实例配置",
+      "severity": "medium",
+      "title": "未启用即席工作负载优化",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.BLOCKED_PROC_THRESHOLD": {
+      "category": "实例配置",
+      "severity": "low",
+      "title": "未配置阻塞进程阈值报告",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.BACKUP_COMPRESSION": {
+      "category": "实例配置",
+      "severity": "low",
+      "title": "默认未启用备份压缩",
+      "required_modules": [
+        "实例配置"
+      ]
+    },
+    "INSTANCE.VERSION_SUPPORT": {
+      "category": "实例配置",
+      "severity": "high",
+      "title": "SQL Server 版本已过扩展支持",
+      "required_modules": [
+        "实例基础信息"
+      ]
+    },
+    "SESSION.RESOURCE_HOG": {
+      "category": "性能与会话",
+      "severity": "low",
+      "title": "单一登录名占用绝大部分会话资源",
+      "required_modules": [
+        "会话资源占用"
+      ]
+    },
+    "DB.STATE": {
+      "category": "数据库",
+      "severity": "critical",
+      "title": "数据库未处于 ONLINE",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.AUTO_OPTIONS": {
+      "category": "数据库",
+      "severity": "medium",
+      "title": "生产不推荐的自动选项已启用",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.TRUSTWORTHY": {
+      "category": "数据库安全",
+      "severity": "high",
+      "title": "数据库 TRUSTWORTHY 已启用",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.CHAINING": {
+      "category": "数据库安全",
+      "severity": "medium",
+      "title": "跨数据库所有权链已启用",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.QUERY_STORE": {
+      "category": "性能治理",
+      "severity": "low",
+      "title": "用户数据库未启用 Query Store",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.PAGE_VERIFY": {
+      "category": "数据库",
+      "severity": "high",
+      "title": "页校验未使用 CHECKSUM",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "DB.CHECKDB": {
+      "category": "完整性",
+      "severity": "high",
+      "title": "数据库完整性检查不满足周期",
+      "required_modules": [
+        "数据库清单与完整性"
+      ]
+    },
+    "BACKUP.FULL": {
+      "category": "备份恢复",
+      "severity": "critical",
+      "title": "完整备份超期或缺失",
+      "required_modules": [
+        "备份状态"
+      ]
+    },
+    "BACKUP.LOG": {
+      "category": "备份恢复",
+      "severity": "high",
+      "title": "日志备份超期或缺失",
+      "required_modules": [
+        "备份状态"
+      ]
+    },
+    "BACKUP.CHECKSUM": {
+      "category": "备份恢复",
+      "severity": "medium",
+      "title": "最近完整备份未记录 CHECKSUM",
+      "required_modules": [
+        "备份状态"
+      ]
+    },
+    "BACKUP.ENCRYPTION": {
+      "category": "备份恢复",
+      "severity": "medium",
+      "title": "最近完整备份未加密",
+      "required_modules": [
+        "备份状态"
+      ]
+    },
+    "FILE.IO_LATENCY": {
+      "category": "存储与文件",
+      "severity": "high",
+      "title": "数据库文件 I/O 延迟偏高",
+      "required_modules": [
+        "数据库文件与IO"
+      ]
+    },
+    "FILE.PERCENT_GROWTH": {
+      "category": "存储与文件",
+      "severity": "medium",
+      "title": "数据库文件使用百分比自动增长",
+      "required_modules": [
+        "数据库文件与IO"
+      ]
+    },
+    "STORAGE.FREE_SPACE": {
+      "category": "存储与容量",
+      "severity": "high",
+      "title": "数据库所在卷剩余空间不足",
+      "required_modules": [
+        "存储卷容量"
+      ]
+    },
+    "LOG.SPACE": {
+      "category": "事务日志",
+      "severity": "high",
+      "title": "事务日志使用率偏高",
+      "required_modules": [
+        "事务日志空间"
+      ]
+    },
+    "LOG.VLF": {
+      "category": "事务日志",
+      "severity": "high",
+      "title": "VLF 数量过多",
+      "required_modules": [
+        "VLF摘要"
+      ]
+    },
+    "DB.SUSPECT_PAGES": {
+      "category": "完整性",
+      "severity": "critical",
+      "title": "msdb 记录了可疑或损坏页面",
+      "required_modules": [
+        "可疑页面"
+      ]
+    },
+    "PERF.BLOCKING": {
+      "category": "性能与会话",
+      "severity": "high",
+      "title": "存在持续阻塞",
+      "required_modules": [
+        "阻塞链"
+      ]
+    },
+    "PERF.LONG_REQUEST": {
+      "category": "性能与会话",
+      "severity": "medium",
+      "title": "存在长时间运行请求",
+      "required_modules": [
+        "活动请求"
+      ]
+    },
+    "PERF.CONNECTION_FLOOD": {
+      "category": "性能与会话",
+      "severity": "medium",
+      "title": "单一来源连接数偏高",
+      "required_modules": [
+        "连接数统计"
+      ]
+    },
+    "PERF.PLE": {
+      "category": "性能与内存",
+      "severity": "medium",
+      "title": "Page Life Expectancy 偏低",
+      "required_modules": [
+        "性能采样"
+      ]
+    },
+    "PERF.MEMORY_GRANTS": {
+      "category": "性能与内存",
+      "severity": "high",
+      "title": "存在等待内存授权的查询",
+      "required_modules": [
+        "性能采样"
+      ]
+    },
+    "TEMPDB.USAGE": {
+      "category": "TempDB",
+      "severity": "high",
+      "title": "TempDB 使用率偏高",
+      "required_modules": [
+        "TempDB"
+      ]
+    },
+    "TEMPDB.FILE_BALANCE": {
+      "category": "TempDB",
+      "severity": "medium",
+      "title": "TempDB 数据文件大小或增长不一致",
+      "required_modules": [
+        "TempDB"
+      ]
+    },
+    "SEC.SYSADMIN_COUNT": {
+      "category": "安全",
+      "severity": "medium",
+      "title": "sysadmin 有效成员较多",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.SA_ENABLED": {
+      "category": "安全",
+      "severity": "medium",
+      "title": "sa 登录名处于启用状态",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.LINKED_SERVER": {
+      "category": "安全",
+      "severity": "low",
+      "title": "链接服务器启用了远程访问能力",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "BACKUP.NO_BACKUP": {
+      "category": "备份恢复",
+      "severity": "critical",
+      "title": "数据库从未进行过完整备份",
+      "required_modules": [
+        "无备份数据库"
+      ]
+    },
+    "MEM.SIGNALING": {
+      "category": "性能与内存",
+      "severity": "high",
+      "title": "SQL Server 内存利用率极高",
+      "required_modules": [
+        "进程内存状态"
+      ]
+    },
+    "MEM.PRESSURE": {
+      "category": "性能与内存",
+      "severity": "critical",
+      "title": "SQL Server 报告内存资源不足信号",
+      "required_modules": [
+        "进程内存状态"
+      ]
+    },
+    "MEM.CACHE_IMBALANCE": {
+      "category": "性能与内存",
+      "severity": "medium",
+      "title": "单一数据库占用缓冲池比例过高",
+      "required_modules": [
+        "缓冲池使用分布"
+      ]
+    },
+    "OBJ.NO_PK": {
+      "category": "数据库对象",
+      "severity": "medium",
+      "title": "数据库存在无主键表",
+      "required_modules": [
+        "无主键表"
+      ]
+    },
+    "OBJ.LARGE_TABLE": {
+      "category": "数据库对象",
+      "severity": "low",
+      "title": "大表超过容量告警阈值",
+      "required_modules": [
+        "大表统计"
+      ]
+    },
+    "DB.RCSI": {
+      "category": "数据库",
+      "severity": "medium",
+      "title": "数据库未启用 RCSI (Read Committed Snapshot)",
+      "required_modules": [
+        "数据库RCSI状态"
+      ]
+    },
+    "HA.REPLICATION": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "复制发布处于非活跃状态",
+      "required_modules": [
+        "复制拓扑"
+      ]
+    },
+    "HA.REPLICATION_CONFIG": {
+      "category": "高可用",
+      "severity": "info",
+      "title": "复制存在订阅配置",
+      "required_modules": [
+        "复制拓扑"
+      ]
+    },
+    "HA.REPLICATION_ERROR": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "分发库存在复制错误记录",
+      "required_modules": [
+        "复制拓扑"
+      ]
+    },
+    "PERF.STALE_STATS": {
+      "category": "性能治理",
+      "severity": "medium",
+      "title": "统计信息陈旧且数据变化较大",
+      "required_modules": [
+        "陈旧统计信息（深度）"
+      ]
+    },
+    "PERF.INDEX_FRAGMENTATION": {
+      "category": "性能治理",
+      "severity": "low",
+      "title": "大型索引碎片较高",
+      "required_modules": [
+        "索引碎片（深度）"
+      ]
+    },
+    "SEC.ORPHANED_USER": {
+      "category": "安全",
+      "severity": "medium",
+      "title": "数据库存在孤立用户",
+      "required_modules": [
+        "孤立用户（深度）"
+      ]
+    },
+    "AGENT.JOB_FAILED": {
+      "category": "SQL Agent",
+      "severity": "high",
+      "title": "SQL Agent 作业最近失败",
+      "required_modules": [
+        "SQL Agent失败作业"
+      ]
+    },
+    "AGENT.JOB_DISABLED": {
+      "category": "SQL Agent",
+      "severity": "low",
+      "title": "SQL Agent 作业处于禁用状态",
+      "required_modules": [
+        "SQL Agent作业清单"
+      ]
+    },
+    "AGENT.JOB_OVERDUE": {
+      "category": "SQL Agent",
+      "severity": "medium",
+      "title": "作业已过计划时间未运行",
+      "required_modules": [
+        "SQL Agent作业清单"
+      ]
+    },
+    "HA.AG_CONNECT_ERROR": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "Always On 副本存在连接错误",
+      "required_modules": [
+        "Always On"
+      ]
+    },
+    "HA.AG_SYNC_MODE": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "同步提交副本未能追平主副本",
+      "required_modules": [
+        "Always On"
+      ]
+    },
+    "HA.AG_HEALTH": {
+      "category": "高可用",
+      "severity": "critical",
+      "title": "Always On 副本同步异常",
+      "required_modules": [
+        "Always On"
+      ]
+    },
+    "HA.AG_LAG": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "Always On 副本延迟超过阈值",
+      "required_modules": [
+        "Always On"
+      ]
+    },
+    "HA.AG_QUEUE": {
+      "category": "高可用",
+      "severity": "medium",
+      "title": "Always On 日志发送或重做队列偏大",
+      "required_modules": [
+        "Always On"
+      ]
+    },
+    "HA.MIRRORING": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "数据库镜像状态异常",
+      "required_modules": [
+        "数据库镜像"
+      ]
+    },
+    "HA.LOG_SHIPPING": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "日志传送延迟或状态不可确认",
+      "required_modules": [
+        "日志传送"
+      ]
+    },
+    "ERRORLOG.SEVERE": {
+      "category": "错误日志",
+      "severity": "high",
+      "title": "错误日志存在严重级别事件",
+      "required_modules": [
+        "错误日志摘要"
+      ]
+    },
+    "SEC.EMPTY_PASSWORD_LOGINS": {
+      "category": "安全",
+      "severity": "critical",
+      "title": "存在空密码登录",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.SA_ACCOUNT_DISABLED": {
+      "category": "安全",
+      "severity": "high",
+      "title": "sa 账号未禁用",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.XP_CMDSHELL_ENABLED": {
+      "category": "安全",
+      "severity": "high",
+      "title": "xp_cmdshell 已启用",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.OLE_AUTOMATION_ENABLED": {
+      "category": "安全",
+      "severity": "medium",
+      "title": "Ole Automation 已启用",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "SEC.AUTHENTICATION_MODE": {
+      "category": "安全",
+      "severity": "info",
+      "title": "认证模式提示",
+      "required_modules": [
+        "安全与权限"
+      ]
+    },
+    "HA.REPLICATION_AGENT": {
+      "category": "高可用",
+      "severity": "high",
+      "title": "复制代理执行失败",
+      "required_modules": [
+        "复制拓扑"
+      ]
+    }
+  },
   "thresholds": {
     "backup_full_max_age_hours": 168,
     "backup_log_max_age_minutes": 60,
     "checkdb_max_age_days": 14,
     "file_io_warning_ms": 20,
     "file_io_critical_ms": 50,
-    "file_free_warning_pct": 15,
     "blocking_warning_seconds": 60,
     "long_request_seconds": 300,
     "tempdb_used_warning_pct": 80,
-    "failed_job_lookback_hours": 24,
     "max_sysadmin_logins": 5,
     "max_memory_of_physical_pct": 90,
     "min_cost_threshold_parallelism": 25,
@@ -19,6 +548,8 @@
     "memory_grants_pending_warning": 0,
     "ag_queue_warning_mb": 512,
     "ag_sync_health_required": "HEALTHY",
+    "ag_replica_lag_warning_seconds": 30,
+    "require_service_autostart": true,
     "volume_free_warning_pct": 20,
     "volume_free_critical_pct": 10,
     "log_used_warning_pct": 80,
@@ -29,7 +560,6 @@
     "stale_stats_modification_pct": 20,
     "index_fragmentation_warning_pct": 30,
     "index_min_page_count": 1000,
-    "job_failure_lookback_hours": 24,
     "job_overdue_hours": 36,
     "log_shipping_warning_minutes": 60,
     "memory_utilization_warning_pct": 95,
@@ -39,17 +569,75 @@
     "single_source_connection_warning": 50,
     "require_backup_checksum": true,
     "require_backup_encryption": false,
-    "require_query_store_for_user_db": true
+    "require_query_store_for_user_db": true,
+    "require_adhoc_workloads_optimization": true,
+    "blocked_process_threshold_min_seconds": 30,
+    "require_backup_compression": false,
+    "sqlserver_eol_warning_days": 180,
+    "session_cpu_share_warning_pct": 80,
+    "session_cpu_min_total_ms": 600000,
+    "session_min_session_count": 10,
+    "sqlserver_extended_support_end": {
+      "9": "2016-04-12",
+      "10": "2019-07-09",
+      "10.50": "2019-07-09",
+      "11": "2022-07-12",
+      "12": "2024-07-09",
+      "13": "2026-07-14",
+      "14": "2027-10-12",
+      "15": "2030-01-08",
+      "16": "2033-01-11"
+    },
+    "flag_unlimited_maxdop_on_many_cores": true
   },
-  "excluded_databases": ["tempdb"],
+  "system_database_guard": {
+    "_comment": "系统库维度的问题按 severity_cap 封顶：master/model/msdb 的备份、完整性检查、文件增长与所有权链属于「建议项」，用与业务库同级的 critical 会把真正的业务风险稀释掉（实测一例：9 个 critical 里 6 个来自系统库，真正的业务库风险被埋没）。tempdb 已在 excluded_databases 里整条不评价。这里只声明「哪些规则、哪些库、封到哪一级」，判定逻辑仍在 rules.py。",
+    "databases": [
+      "master",
+      "model",
+      "msdb"
+    ],
+    "severity_cap": "low",
+    "applies_to": [
+      "BACKUP.FULL",
+      "BACKUP.NO_BACKUP",
+      "BACKUP.LOG",
+      "DB.CHECKDB",
+      "DB.CHAINING",
+      "FILE.PERCENT_GROWTH",
+      "DB.TRUSTWORTHY"
+    ]
+  },
+  "excluded_databases": [
+    "tempdb"
+  ],
   "ignored_wait_types": [
-    "BROKER_EVENTHANDLER", "BROKER_RECEIVE_WAITFOR", "BROKER_TASK_STOP",
-    "BROKER_TO_FLUSH", "CHECKPOINT_QUEUE", "CLR_AUTO_EVENT", "CLR_MANUAL_EVENT",
-    "DBMIRROR_EVENTS_QUEUE", "DIRTY_PAGE_POLL", "DISPATCHER_QUEUE_SEMAPHORE",
-    "FT_IFTS_SCHEDULER_IDLE_WAIT", "HADR_FILESTREAM_IOMGR_IOCOMPLETION",
-    "HADR_TIMER_TASK", "HADR_WORK_QUEUE", "KSOURCE_WAKEUP", "LAZYWRITER_SLEEP",
-    "LOGMGR_QUEUE", "ONDEMAND_TASK_QUEUE", "QDS_PERSIST_TASK_MAIN_LOOP_SLEEP",
-    "REQUEST_FOR_DEADLOCK_SEARCH", "RESOURCE_QUEUE", "SLEEP_TASK", "SLEEP_SYSTEMTASK",
-    "SQLTRACE_BUFFER_FLUSH", "WAITFOR", "XE_DISPATCHER_WAIT", "XE_TIMER_EVENT"
+    "BROKER_EVENTHANDLER",
+    "BROKER_RECEIVE_WAITFOR",
+    "BROKER_TASK_STOP",
+    "BROKER_TO_FLUSH",
+    "CHECKPOINT_QUEUE",
+    "CLR_AUTO_EVENT",
+    "CLR_MANUAL_EVENT",
+    "DBMIRROR_EVENTS_QUEUE",
+    "DIRTY_PAGE_POLL",
+    "DISPATCHER_QUEUE_SEMAPHORE",
+    "FT_IFTS_SCHEDULER_IDLE_WAIT",
+    "HADR_FILESTREAM_IOMGR_IOCOMPLETION",
+    "HADR_TIMER_TASK",
+    "HADR_WORK_QUEUE",
+    "KSOURCE_WAKEUP",
+    "LAZYWRITER_SLEEP",
+    "LOGMGR_QUEUE",
+    "ONDEMAND_TASK_QUEUE",
+    "QDS_PERSIST_TASK_MAIN_LOOP_SLEEP",
+    "REQUEST_FOR_DEADLOCK_SEARCH",
+    "RESOURCE_QUEUE",
+    "SLEEP_TASK",
+    "SLEEP_SYSTEMTASK",
+    "SQLTRACE_BUFFER_FLUSH",
+    "WAITFOR",
+    "XE_DISPATCHER_WAIT",
+    "XE_TIMER_EVENT"
   ]
 }

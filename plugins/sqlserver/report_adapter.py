@@ -23,6 +23,9 @@ NO_RECORD_CONCLUSION = "未采集到结构化记录，本项不作通过结论�
 
 _COLLECTION_STATUS_MAP = {
     "success": "ok",
+    # 采集端区分「有数据」与「SQL 跑通但结果为空」；标准模型里两者都算拿到了结论，
+    # 区别保留在原始 snapshot 的 module_status（运维看得见，报告不必区分）。
+    "success_no_data": "ok",
     "ok": "ok",
     "empty": "empty",
     "error": "error",
@@ -206,29 +209,60 @@ def _build_appendix(source: dict[str, Any], findings: list[dict[str, Any]]) -> d
     window_seconds = _seconds_between(
         overview.get("collection_started_at"), overview.get("collection_finished_at")
     )
+    # 采样点数取采集包里的真实值，不能写死 1：附录的「SQL Server 采样点」正是判断
+    # 采集窗口够不够支撑趋势结论的依据 —— 实采 6 点却写 1，会被读成"只采到一个点"。
+    perf = source.get("sqlserver_performance") or {}
+    sample_points = (perf.get("summary") or {}).get("sample_count")
+    if sample_points is None:
+        sample_points = len(perf.get("samples") or [])
 
+    # 规则求值优先取分析层产出的**四态结果**（触发 / 通过 / 未判断 / 不适用）。
+    # 旧报告模型（analyze 这一步没产出 rule_evaluations 的历史产物）才回退到"由 findings 反推"：
+    # 那条路只知道触发了什么，分不清"没触发是因为查过没问题"还是"因为根本没采到"，
+    # 所以它**不能**冒充通过，只能如实给出触发项 —— 这正是以前那张表三行恒 0 的根源。
     evaluations: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for finding in findings:
-        rule_id = str(finding.get("rule_id") or "")
-        if not rule_id or rule_id in seen:
-            continue
-        seen.add(rule_id)
-        evaluations.append({
-            "rule_id": rule_id,
-            "category": finding.get("category"),
-            "status": "triggered",
-            "severity_if_triggered": finding.get("severity"),
-            "finding_id": finding.get("risk_id"),
-            "evidence_refs": [finding["object_name"]] if finding.get("object_name") else [],
-            "confidence": 1.0,
-        })
+    source_evaluations = source.get("rule_evaluations") or []
+    if source_evaluations:
+        finding_by_rule: dict[str, Any] = {}
+        for finding in findings:
+            finding_by_rule.setdefault(str(finding.get("rule_id") or ""), finding.get("risk_id"))
+        for item in source_evaluations:
+            rule_id = str(item.get("rule_id") or "")
+            if not rule_id:
+                continue
+            evaluations.append({
+                "rule_id": rule_id,
+                "category": item.get("category"),
+                "status": item.get("status") or "not_evaluated",
+                "reason": item.get("reason") or "",
+                "severity_if_triggered": item.get("severity_if_triggered"),
+                "finding_id": item.get("finding_id") or finding_by_rule.get(rule_id),
+                "evidence_refs": list(item.get("evidence_refs") or []),
+                "confidence": item.get("confidence", 1.0),
+            })
+    else:
+        seen: set[str] = set()
+        for finding in findings:
+            rule_id = str(finding.get("rule_id") or "")
+            if not rule_id or rule_id in seen:
+                continue
+            seen.add(rule_id)
+            evaluations.append({
+                "rule_id": rule_id,
+                "category": finding.get("category"),
+                "status": "triggered",
+                "reason": "",
+                "severity_if_triggered": finding.get("severity"),
+                "finding_id": finding.get("risk_id"),
+                "evidence_refs": [finding["object_name"]] if finding.get("object_name") else [],
+                "confidence": 1.0,
+            })
 
     limitations = [str(item) for item in quality.get("limitations") or []]
     return {
         "collection_window": {
             "realtime_window_seconds": window_seconds,
-            "sqlserver_sample_points": 1,
+            "sqlserver_sample_points": sample_points,
             "short_window": True,
             "history": {
                 "status": "not_applicable",
@@ -353,8 +387,16 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
                 "low": counts.get("low", 0),
             },
             "risk_count": health.get("risk_count"),
+            # 扣分口径必须透传：共享引擎靠它在首页复述「以 100 分为基线，各档扣多少」。
+            # 适配器这里重建了 health_assessment，漏掉本键会让首页的「结论速览」整段消失
+            # —— 而读者正是靠那段话才知道 0 分是扣分触底、不是系统不可用。
+            "scoring_policy": health.get("scoring_policy"),
         },
         "sqlserver_analysis": {"charts": _normalize_charts(source.get("charts") or [])},
+        # 待客户确认事项：由分析层按已触发规则派生（文案模板在 analysis_text）。
+        # 必须原样透传 —— 缺了这个键，引擎只能声明「未产出清单」，而实际是有清单的；
+        # 传了空列表才是「本次确实没有待确认事项」，两者不能混。
+        "pending_confirmations": source.get("pending_confirmations"),
         "risk_register": findings,
         "optimization_plan": _build_plan(findings),
         "comprehensive_conclusions": _build_conclusions(

@@ -41,12 +41,24 @@ TARGETS: dict[str, tuple[str, str]] = {
         "plugins/postgresql/inspection_rules.json",
         "plugins/postgresql/rules.py",
     ),
+    # SQL Server 直到 2026-09-24 才纳入本审计 —— 一纳入就查出 4 个死键
+    # （failed_job_lookback_hours / job_failure_lookback_hours / job_overdue_hours /
+    # file_free_warning_pct）：运维照着规则包调它们，代码根本不看，改完没有任何效果。
+    "sqlserver": (
+        "plugins/sqlserver/inspection_rules.json",
+        "plugins/sqlserver/rules.py",
+    ),
 }
 
 # 阈值请求调用：``_threshold(...)`` / ``threshold(...)``
 # 前面只挡标识符字符，不能连点号一起挡 —— MySQL/Oracle 的写法是
 # ``self._threshold(...)``，点号正是调用的前缀。
 _CALL = re.compile(r"(?<![\w])_?threshold\(([^)]*)\)")
+# SQL Server 的写法是 ``self.t.get("key", default)``：thresholds 直接挂在引擎上，
+# 没有 _threshold() 包装。漏掉这一种，SQL Server 的整套阈值键都会变成"隐性死键"。
+# 必须锚定到 self.t —— tempdb() 里有个同名的局部变量 t（tempdb 字典），
+# 只写 \bt\.get 会把 t.get("used_pct") 这种字段读取误当成阈值请求。
+_T_GET = re.compile(r"""self\s*\.\s*t\s*\.get\(\s*["']([a-z][a-z0-9_]*)["']""")
 # 调用参数里的小写键名（规则 id 是大写，默认值不是字符串）
 _KEY_IN_CALL = re.compile(r"""["']([a-z][a-z0-9_]*)["']""")
 # 直接读 globals
@@ -104,13 +116,18 @@ def requested_keys(database: str) -> set[str]:
     """代码真正会去规则包取的那些键。"""
     text = source_text(database)
     found: set[str] = set(_GLOBALS_GET.findall(text))
+    found.update(_T_GET.findall(text))
     for arguments in _CALL.findall(text):
         found.update(_KEY_IN_CALL.findall(arguments))
     return found
 
 
 def declared_globals(pack: dict) -> set[str]:
-    return set(pack.get("globals", {}))
+    # "全局阈值"的容器名各库不同：MySQL/Oracle/PG 用 globals，SQL Server 用扁平的 thresholds。
+    # 两种都认；只认 globals 会把 SQL Server 判成"一个键都没声明"。
+    if "globals" in pack:
+        return set(pack.get("globals") or {})
+    return set(pack.get("thresholds") or {})
 
 
 def declared_per_rule(pack: dict) -> dict[str, set[str]]:
@@ -229,6 +246,11 @@ class RulePackConfigAuditTests(unittest.TestCase):
         # 不是字面量，专门守住「不按参数位置、按调用里的小写字面量抽」这条规则。
         self.assertIn("library_cache_hit_critical", oracle)
         self.assertIn("redo_member_min", oracle)
+        # SQL Server 的形态是 self.t.get("key", default)，与上面三种都不同；
+        # 不单独断言的话，抽取式一漏就会让 SQL Server 的整套阈值键变成"恒无死键"。
+        sqlserver = requested_keys("sqlserver")
+        self.assertIn("blocked_process_threshold_min_seconds", sqlserver)
+        self.assertIn("max_recommended_maxdop", sqlserver)
 
 
 if __name__ == "__main__":
