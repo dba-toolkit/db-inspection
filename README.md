@@ -20,7 +20,7 @@ python -c "import docx, matplotlib, PIL, yaml; from zoneinfo import ZoneInfo; Zo
 
 最后一截专门验时区库：Linux 靠系统 tzdata，Windows 靠 `requirements.txt` 里的 `tzdata` 包。缺了它图轴时区会静默降级成 `UTC+08:00`（数值没错，但报告里的时区名没了），只有真的构造一次 `ZoneInfo` 才会报出来。
 
-如果不想建虚拟环境，也可以直接用本机已装好依赖的 `D:\python\python.exe`（本项目开发时所用）。`tools/run.ps1` 会优先使用 `.venv`，其次 `D:\python\python.exe`，最后系统 `python`。
+如果不想建虚拟环境，也可以直接用本机已装好依赖的 `python`。`tools/run.ps1` 会优先使用 `.venv`，其次是 `$env:PYTHON_HOME` 指向的解释器，最后是系统 `python`。
 
 报告品牌信息（公司、编制人、复核人、logo）统一在 `config/report_config.json` 中配置；生成报告时的命令行参数会覆盖该默认值。
 
@@ -185,3 +185,8 @@ bash tests/selftest/mysql_collector_batch2.sh
 | `import rules` | `from plugins.mysql import rules` |
 
 生成 Word 的入口本来就是 `generate_report.py`，命令未变，仅 `--logo` 默认值改为 `assets/logo.png`（相对路径现在按项目根解析，不再依赖当前工作目录）。
+
+
+python  .\analyze.py .\mysql_inspection_v1_db02_192.168.1.11_3306_20260921_103716.tar.gz .\mysql_inspection_v1_db01_192.168.1.12_3306_20260921_103408.tar.gz .\mysql_inspection_v1_db02_192.168.1.13_3306_20260921_103741.tar.gz
+
+python   .\generate_report.py  .\analysis_output\  --customer='示例医院'  --target='192.168.1.11-EMR MYSQL数据库巡检报告'

@@ -120,10 +120,10 @@ collector、规则配置、Word 生成器、增强器和图表样式仍保持阶
 |---|---|---:|---|
 | Oracle 采集包 | `D:\AI\ORACLE\GPT\1.0\oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-08-10_20-45-41.tar.gz` | 44,351 | `9EDE9635A440908FEF77F919B46134ACAE515F245430415788A453C72E68A82C` |
 | PostgreSQL 采集包 | `D:\AI\PG\GPT\pg_inspection_v2_db01_192.168.100.80_6000_20260810_140043.tar.gz` | 35,083 | `99FD8CACC7956121A583FEE18D9E570DA992C3CC43366B8B5430B4744B8E5DE3` |
-| SQL Server 采集包 | `D:\AI\SQLserver\GPT\sqlserver_inspection_v1_WIN-OAR8MD5G54N_20260728_000158.zip` | 35,349 | `F7EB3FC1F0CC735E4EB180836EBE7C1CBA93AE7E2657BA827800D86A8E2D6DBA` |
-| SQL Server analysis | `D:\AI\SQLserver\GPT\test_final\analysis.json` | 201,470 | `B2EDF9E49B6016CD53577609F585F5ED8CCBBF8C62E3ED790293E98BA2BD9061` |
-| SQL Server report model | `D:\AI\SQLserver\GPT\test_final\report_model.json` | 434,546 | `C7B98A1D51BA4DCE077655B2CB9776C72ABC75CD9546AFA3245D587C1E1DBDE9` |
-| SQL Server Word | `D:\AI\SQLserver\GPT\test_final\WIN-OAR8MD5G54N.docx` | 214,437 | `E5A75149A6EA70775B0B1513ABD230704C127309AA3AB1D5B98F4A3AC7D9D96F` |
+| SQL Server 采集包 | `D:\inspection\sqlserver_inspection_v1_db-sql-01_20260728_000158.zip` | 35,349 | `F7EB3FC1F0CC735E4EB180836EBE7C1CBA93AE7E2657BA827800D86A8E2D6DBA` |
+| SQL Server analysis | `D:\inspection\test_final\analysis.json` | 201,470 | `B2EDF9E49B6016CD53577609F585F5ED8CCBBF8C62E3ED790293E98BA2BD9061` |
+| SQL Server report model | `D:\inspection\test_final\report_model.json` | 434,546 | `C7B98A1D51BA4DCE077655B2CB9776C72ABC75CD9546AFA3245D587C1E1DBDE9` |
+| SQL Server Word | `D:\inspection\test_final\db-sql-01.docx` | 214,437 | `E5A75149A6EA70775B0B1513ABD230704C127309AA3AB1D5B98F4A3AC7D9D96F` |
 | 专业报告参考 PDF | `D:\AI\2026年第二季度_广州塔_官网售票系统_数据库巡检报告.pdf` | 1,815,473 | `084002BFF4CEB53562DEAFF8EBEFA0DDD1E39C17F7902D1CBAD70F5B9E5D8A57` |
 
 ## 4. MySQL 基线验收清单
@@ -173,10 +173,34 @@ collector、规则配置、Word 生成器、增强器和图表样式仍保持阶
 
 ## 7. SQL Server 阶段 11 冻结与接入基线
 
-- 原始包：`D:\AI\SQLserver\GPT\sqlserver_inspection_v1_WIN-OAR8MD5G54N_20260728_000158.zip`
+- 原始包：`D:\inspection\sqlserver_inspection_v1_db-sql-01_20260728_000158.zip`
 - 大小：35,349 字节；SHA256：`F7EB3FC1F0CC735E4EB180836EBE7C1CBA93AE7E2657BA827800D86A8E2D6DBA`
 - 外部分析器/规则指纹见 `tests/baselines/sqlserver/current/baseline.json`。
 - 契约适配器与 Word 基线：`tests/baselines/sqlserver/current/`
-- 结果：1 个实例、完整度 100%、健康分 0、14 条规则全部触发、12 章节、27 项、24 条风险（8 critical/9 high/6 medium/1 low）、9 张图。
+- 结果：1 个实例、完整度 100%、健康分 0、14 条规则全部触发、12 章节、27 项、24 条风险、9 张图（外部分析器出 9 张，经适配去掉重复的 `04_risk_distribution` 后为 8 张）。严重度分布以**当前仓库代码复跑值**为准：**8 critical / 5 high / 10 medium / 1 low**（v1.3.0 起；外部产物仍写 8/9/6/1，见 §7.1）。
 - Word：公共 4.2.0 专业引擎生成 SQL Server 专业版报告（含 8 张技术图表）；逐页 PNG 视觉验收待具备 LibreOffice 的环境补做。
 - `report_model.json` 保留外部事实来源；`report_model_standard.json` 为 `plugins/sqlserver/report_adapter.py` 适配后的标准报告模型；`sqlserver_legacy_report.docx` 保留旧版 Word。
+
+### 7.1 刷新状态（2026-09-24，v1.3.0 复核，**更正 §22.30 的错误结论**）
+
+§22.30 期间此处写过"原始包已不在本机 → 刷新路径走不通、本基线无法刷新"。**该结论错误，已作废。**
+复核证据：
+
+- 原始包**在本机**：`\`D://inspection//sqlserver_inspection_v1_db-sql-01_20260728_000158.zip//``（35,349 字节），
+  实测 sha256 = `F7EB3FC1F0CC735E4EB180836EBE7C1CBA93AE7E2657BA827800D86A8E2D6DBA`，与 §7 登记值**逐字节一致**；
+  `baseline.json.source_implementation` 的四个 sha256（collector / analyzer / rules / rules_config）实测**全部匹配**。
+- `tests/test_sqlserver_analyzer.py` **真的在跑**（用它读 `source_package.path`、实跑 `analyze_sqlserver()`），不是 skip；全量 pytest 通过。
+
+`current/` 下的 `analysis.json` / `report_model.json` / `*.docx` 是**外部实现**
+（`\`D://inspection//analyze_inspection.py//``）的产物，本批没有重新生成它们 ——
+重新生成只能再跑那个外部工具，与本批改动的 `plugins/sqlserver/*` 无关；
+本批真正要守的契约是 `baseline.json.expected_summary`，由仓库代码实跑对照，**始终保持一致**。
+
+v1.3.0 修正了 `expected_summary.severity_counts`（`8/9/6/1` → `8/5/10/1`）：`plugins/sqlserver/rules.py`
+的 `_dt()` 曾是不可达代码、恒返回 `None`，导致"距今多久"类判据退化为"时间未知"，
+`DB.CHECKDB` 按"时间为空"取高档而恒为 high；修好后 4 条降为 medium，证据文案随之变化。
+`health_score` / `risk_register` / `collection_quality` / `sections` / `items` / `charts` 六项**未变**。
+
+旧登记项处置：**F-20 撤回** —— `is_query_store_on` 有版本门控的覆盖路径（2016+ 二次查询覆盖占位列），
+基线实际取值是 `false`，原判断有误；**F-21 已修** —— `-OutputDir` 默认改为 `%TEMP%\sqlserver_inspection`，
+不再依赖脚本自身位置。改动后的代码指纹与完整证据见 `tests/baselines/sqlserver/current/README.md`。

@@ -42,6 +42,29 @@ class ReportingModelTests(unittest.TestCase):
         )
         self.assertEqual(action.to_dict()["owner"], "DBA")
         self.assertEqual(action.to_dict()["verification"], "re-run check")
+        # 整改计划第三个出口：legacy 三键 + 有值才带的整改三要素。
+        # 修的是「渲染位留好了、数据层没喂」—— 整改计划表的六个列头一直在，
+        # 但 plan 条目只有三键，责任人/计划窗口/验证方式三列此前永远显示同一句默认值。
+        self.assertEqual(
+            action.to_plan_dict(),
+            {
+                "finding_id": "R001",
+                "title": "test",
+                "recommendation": "fix",
+                "owner": "DBA",
+                "planned_window": "7d",
+                "verification": "re-run check",
+            },
+        )
+        # 空值不注入：旧基线 report_model.json 的 plan 条目只有三键，
+        # 无条件写入会打穿冻结契约；渲染层的「待指定 / 未登记」才是正确呈现。
+        blank = RemediationAction(
+            finding_id="R002", title="t", recommendation="r", priority="P2",
+        )
+        self.assertEqual(
+            blank.to_plan_dict(),
+            {"finding_id": "R002", "title": "t", "recommendation": "r"},
+        )
 
         disclosure = EvidenceDisclosure(
             check_id="oracle.awr",
@@ -65,8 +88,9 @@ class ReportingModelTests(unittest.TestCase):
         items = [item for section in sections for item in section["items"]]
         item_ids = [item["item_id"] for item in items]
         self.assertEqual(len(sections), 9)
-        # 36 = 35 + mysql.capacity.risk_details（对象候选项明细，2026-09 新增）
-        self.assertEqual(len(items), 36)
+        # 37 = 35 + mysql.capacity.risk_details（对象候选项明细，2026-09 新增）
+        #        + system.performance.history（SAR 历史四路，2026-09 新增）
+        self.assertEqual(len(items), 37)
         self.assertEqual(len(item_ids), len(set(item_ids)))
         self.assertTrue(conclusions)
         for item in items:
@@ -94,20 +118,20 @@ class ReportingModelTests(unittest.TestCase):
                 {"TABLE_SCHEMA": "preresearch", "TABLE_NAME": "s_num", "TABLE_ROWS": "178387", "total_mb": "1077.95"},
             ],
             "non_innodb_tables": [
-                {"TABLE_SCHEMA": "eureka_cpoe", "TABLE_NAME": "test_patlist", "ENGINE": "MEMORY", "TABLE_ROWS": "0"},
+                {"TABLE_SCHEMA": "app_cpoe", "TABLE_NAME": "test_patlist", "ENGINE": "MEMORY", "TABLE_ROWS": "0"},
             ],
             "fragmentation_top": [
-                {"table_schema": "eureka_public", "table_name": "lab_result", "fragmentation_pct": "99.91", "data_free_mb": "18.00"},
+                {"table_schema": "app_public", "table_name": "lab_result", "fragmentation_pct": "99.91", "data_free_mb": "18.00"},
             ],
             "redundant_indexes": [
-                {"table_schema": "eureka_cpoe", "table_name": "admission",
+                {"table_schema": "app_cpoe", "table_name": "admission",
                  "redundant_index_name": "IX_Admission_cureno", "dominant_index_name": "PRIMARY"},
             ],
             "unused_indexes": [
-                {"object_schema": "eureka_cpoe", "object_name": "admission_fls", "index_name": "IX_ADMISSION_INDEX1"},
+                {"object_schema": "app_cpoe", "object_name": "admission_fls", "index_name": "IX_ADMISSION_INDEX1"},
             ],
             "auto_increment_usage": [
-                {"TABLE_SCHEMA": "eureka_log", "TABLE_NAME": "cpoe_nurselog", "COLUMN_TYPE": "bigint", "used_pct": "22.78613"},
+                {"TABLE_SCHEMA": "app_log", "TABLE_NAME": "cpoe_nurselog", "COLUMN_TYPE": "bigint", "used_pct": "22.78613"},
             ],
         })
         items = MySQLPresentationBuilder()._object_detail_item(context)
@@ -116,12 +140,12 @@ class ReportingModelTests(unittest.TestCase):
         self.assertEqual(item["item_id"], "mysql.capacity.risk_details")
         rows = item["display"]["rows"]
         self.assertIn({"类型": "无主键表", "对象": "preresearch.s_num", "关键信息": "行数 178387，共 1077.95 MB"}, rows)
-        self.assertIn({"类型": "非 InnoDB 表", "对象": "eureka_cpoe.test_patlist", "关键信息": "引擎 MEMORY，行数 0"}, rows)
-        self.assertIn({"类型": "冗余索引", "对象": "eureka_cpoe.admission（IX_Admission_cureno）",
+        self.assertIn({"类型": "非 InnoDB 表", "对象": "app_cpoe.test_patlist", "关键信息": "引擎 MEMORY，行数 0"}, rows)
+        self.assertIn({"类型": "冗余索引", "对象": "app_cpoe.admission（IX_Admission_cureno）",
                        "关键信息": "被 PRIMARY 覆盖，可用 sql_drop_index 删除"}, rows)
-        self.assertIn({"类型": "未使用索引", "对象": "eureka_cpoe.admission_fls（IX_ADMISSION_INDEX1）",
+        self.assertIn({"类型": "未使用索引", "对象": "app_cpoe.admission_fls（IX_ADMISSION_INDEX1）",
                        "关键信息": "实例启动以来未见使用"}, rows)
-        self.assertIn({"类型": "自增容量", "对象": "eureka_log.cpoe_nurselog", "关键信息": "已用 22.79%（bigint）"}, rows)
+        self.assertIn({"类型": "自增容量", "对象": "app_log.cpoe_nurselog", "关键信息": "已用 22.79%（bigint）"}, rows)
         self.assertEqual(item["analysis"]["status"], "attention")
         self.assertIn("不构成任何删除或重建判定", item["display"]["note"])
         self.assertNotIn("建议删除", item["analysis"]["conclusion"])

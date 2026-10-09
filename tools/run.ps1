@@ -24,7 +24,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $python = "python"
 $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
 if (Test-Path $venvPython) { $python = $venvPython }
-elseif (Test-Path "D:\python\python.exe") { $python = "D:\python\python.exe" }
+elseif ($env:PYTHON_HOME -and (Test-Path "$env:PYTHON_HOME\python.exe")) { $python = "$env:PYTHON_HOME\python.exe" }
 
 if (-not $OutputDir) {
     $name = [System.IO.Path]::GetFileNameWithoutExtension($Package)

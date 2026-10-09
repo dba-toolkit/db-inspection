@@ -645,7 +645,7 @@ MySQL 的 26 处差异（`analysis.json`）全部可解释，没有意外项：
 
 | 检查项 | 修前 | 修后 |
 | --- | --- | --- |
-| Schema 与默认字符集 | `not_applicable` /“仅发现系统 Schema” | `normal` /“共 18 个 Schema，其中业务 Schema 14 个（cis_report、eureka_cis_sys…）” |
+| Schema 与默认字符集 | `not_applicable` /“仅发现系统 Schema” | `normal` /“共 18 个 Schema，其中业务 Schema 14 个（biz_report、app_cis_sys…）” |
 | 可用存储引擎 | “…不适用” | `normal` /“…业务表引擎合规性见「容量与对象检查」” |
 | 对象结构与容量候选项 | `not_applicable` /“未发现业务 Schema” | `attention` /“业务 Schema 14 个；候选项合计 760 项（无主键表 94、非 InnoDB 表 1、自增容量候选 100、碎片候选表 100、冗余索引候选 156、未使用索引候选 309）” |
 | SQL 摘要 Top | `attention` /“存在未使用索引计数” | `normal` /“已采集脱敏 SQL 摘要 89 条；本次窗口内未出现未用索引的执行记录” |
@@ -796,8 +796,8 @@ TYPE 恒紧随其后，于是 TYPE 之后第一个 token 是 SIZE、之后首个
 `build_report_model` 只搬运 `analysis.inspection_sections`，**基线无需刷新**。
 
 实测（同一组三包）：`system.host` 出现「磁盘介质 = 机械磁盘（HDD）」（datadir `/data/mysql-data` → `sdb1`，ROTA=1）；
-8.4 节「对象候选项明细」26 行，含 `eureka_cpoe.test_patlist | 引擎 MEMORY，行数 0`、
-`eureka_cpoe.admission（IX_Admission_cureno） | 被 PRIMARY 覆盖，可用 sql_drop_index 删除`。
+8.4 节「对象候选项明细」26 行，含 `app_cpoe.test_patlist | 引擎 MEMORY，行数 0`、
+`app_cpoe.admission（IX_Admission_cureno） | 被 PRIMARY 覆盖，可用 sql_drop_index 删除`。
 
 **未采纳**：外部报告的「软件发行版（Community/Enterprise）」一项本次未做（用户选定范围只含前两项）；
 `product_comment` 已在 `snapshot.json#instance_identity` 里，将来要显示随时可取。
@@ -1423,3 +1423,752 @@ evidence 类 **真读取 3 → 8、仅声明 4 → 0**，总账 `采集 83 / 真
 `tools/coverage_audit.py`、`tests/test_mysql_summary_digest.py`。
 
 
+
+### 22.29 批 A/C/★2/N：整改三要素、SAR 历史回填、结论速览、计数器判据补强（2026-09-22 第九轮）
+
+**触发**：用户拍板落地顺序「A（零风险、客户第一眼就看到）→ C（含金量最高的分析缺口）→ ★2（一句话
+解决 0 分误解）」，并附加批 N（上一轮扫缺口实测出的 N1–N4 四条补强）；明确砍掉 N5（OS EOL 与
+mysqld 启动方式不一致 —— 属**新维度**，不混进本批）。
+
+#### 批 A：整改三要素从「渲染位空着」到「逐条有值」
+
+问题（§22.28 已定位）：`build_remediation_plan_professional` 整改计划表有 6 列，而 `optimization_plan`
+条目只有 `finding_id`/`title`/`recommendation` 三键 → 责任人 / 计划窗口 / 验证方式 / 状态**永远渲染成空登记**。
+
+| 层 | 文件 | 改动 |
+|---|---|---|
+| 模型 | `inspection_core/models.py:30-32` | `Finding` 加 `owner` / `apply_mode` / `verification` 三个可选字段；`to_dict()`（:51-56）**条件注入**（仅非空才写键） |
+| 公共 | `inspection_core/reporting.py:34` | 新增 `RemediationAction.to_plan_dict()`；`to_legacy_dict()`（:25）**契约不动**（仍三键） |
+| 规则 | `plugins/mysql/rules.py:50` | 新增 `remediation_kwargs(cfg)`：由规则包 `apply_mode` 映射计划窗口；3 处 `Finding(...)` 构造展开（:200 / :1207 / :1291） |
+| 呈现 | `plugins/mysql/presentation.py:121` | `PLAN_WINDOW_BY_APPLY_MODE`（online→「无需重启，业务低峰执行」等，**不含具体日期**）；`priorities` 循环改 `.to_plan_dict()`（:2985） |
+| 规则包 | `plugins/mysql/inspection_rules.json` | 42 条规则各加 `owner`（写**角色**不写人名，跨客户才不错）/ `apply_mode` / `verification`，126 行新增、0 行删除 |
+
+**为什么另开 `to_plan_dict()` 而不是直接改 `to_legacy_dict()`**：后者的契约被冻结
+（`test_management_models_preserve_legacy_and_extended_fields` 断言「传了 owner 仍只输出三键」）。
+第一版把三要素塞进 legacy 出口 → 立刻多 1 个 FAIL；改成独立出口后回归回基线。
+**冻结契约面前，扩展只能靠新出口，不能改老出口。**
+
+#### 批 C：SAR 历史四路回填（分析层最大的数据缺口）
+
+`package_adapter.py` 的 `glob("sar_*.csv")` 早就把全部 8 路 CSV 加载进 `ctx.history`，
+但 `build_base()` 只消费 cpu/disk/memory/swap 四路 → **io / network / load / process 四路进了内存没人读**。
+
+`plugins/mysql/metrics.py::build_base()`（:468-582）扩展 `system_history`：
+
+| 路 | 取用 | 三条红线 |
+|---|---|---|
+| `sar_load` | 1 分钟 / 15 分钟**每核**负载 + 运行队列峰值 | 负载**必须按 CPU 核数归一**（64 核 → 0.47/核，不是 30.26）；`runq-sz` 是瞬时值 → **只给峰值不给均值** |
+| `sar_io` | tps / rtps / wtps | — |
+| `sar_network` | 按网卡收发（kB/s） | **剔除 lo 与全零虚拟网卡**（virbr0） |
+| `sar_process` | proc/s、cswch/s | — |
+
+呈现层 `plugins/mysql/presentation.py:1488` 新增 `system.performance.history` item 与 `history_rows`；
+`history_load_note(window)`（:812）**按窗口分别给说明**。
+
+**踩坑（两处内容错误，均为端到端自测抓出，不是靠读代码）**：
+
+1. 「采集端请求 None 小时」—— `requested_hours` 取错了源：`system_history.coverage` 根本没有这个键，
+   真实来源是 `sampling_context.history`（即 `history/coverage.tsv` 的 `requested_hours`）。
+2. 15 分钟负载行复用了 1 分钟行的原始均值说明 → **两行串数**；改成按 `window` 出文案。
+
+#### ★2：结论速览（一句话解决「0 分误解」）
+
+健康分 0/100 会被客户误读成「系统不可用」。`inspection_core/word_engine.py::build_summary_v31`
+（:884）开头加 `note_box("结论速览", …)`（:949），三句话全部从
+`health_assessment.scoring_policy` / `counts` / `collection_gaps` 拼出，**数字 100% 来自 model，禁止手写**：
+
+> 总体健康分 0/100：以 100 分为基线，按高风险 5 项、中风险 12 项、低风险 7 项分别扣 15、7、2 分，
+> 合计扣 173 分，扣分已触及 0 分下限 —— 该分数表示风险项数量超出评分区间，**不代表系统当前不可用**。
+
+顺带修掉一个**公共层崩溃**：`scoring_policy` 在 Oracle model 里是字符串 → `.get()` 抛 `AttributeError`；
+加 `isinstance(dict)` 守卫（:896）。**公共层四库共用，取字典前必须守类型。**
+
+#### 批 N：四条判据的事实补强（只补事实，不新建 rule_id）
+
+策略：**只给已有规则补事实**，不动风险计数结构 —— 本批风险计数 14 high / 28 medium / 17 low
+= **59 项，前后不变**。
+
+| # | 规则 | 补的事实 | 依据 |
+|---|---|---|---|
+| N1 | `MYSQL.INNODB.REDO_CAPACITY` | redo **使用率**（未检查点 LSN 距离 / 物理文件大小）+ `Innodb_log_waits` 次数与 `innodb_log_buffer_size` | `rules.py:675-699`。**容量小 / 用得满 / 等过 buffer 是三个不同的病**：`.33` 使用率 94.8%、`.34` 仅 14.7% 却有 17556 次 log_waits（`innodb_log_buffer_size` 未配置=默认 16M）→ 合成一句「redo 有压力」会把整改方向指错（该加容量还是该加 buffer） |
+| N2 | `MYSQL.INNODB.TABLE_CACHE` | `Table_open_cache_overflows` 溢出次数与**溢出率**（/Uptime） | `rules.py:962-983`。`.125` 溢出 2.4 亿次、运行值 `table_open_cache` 仅 400 |
+| N3 | `MYSQL.SQL.NO_INDEX_DIGEST` | `.125` 慢日志暴涨的**根因候选**：`log_queries_not_using_indexes=ON` | `rules.py:466-469` |
+| N4 | 配置对比组 `mysql.config.charset` | 加 `log_timestamps`（日志时间基准），并给**专属判定分支** | 见下 |
+
+**N4 两个要点**：
+
+- `plugins/mysql/presentation.py:104` 进 `CONFIG_GROUP_VARIABLES["mysql.config.charset"]`：
+  三节点实测 `log_timestamps` = UTC / SYSTEM / UTC → 两个节点按 UTC 写日志、一个按本地时，
+  **跨节点按同一时刻检索日志会错位 8 小时**。
+- `_charset_config_verdict()`（:2143）**必须给专属分支**：第一版进了配置表但沿用字符集兜底句
+  「跨节点写入的字符集解释可能不同」—— 对日志时间基准根本不成立。未采集时落「不适用」（:2149），
+  不得落「不达标」。
+
+#### 守契约的三个设计决策
+
+1. **入口条件注入，不动老出口**：三要素只在非空时写进 `Finding.to_dict()`；`to_legacy_dict()` 三键冻结；
+   `node` 键仍只在 N≥2 注入 → 单实例报告逐字节不变（冻结契约实测 PASS）。
+2. **只补事实，不加规则**：批 N 全部落在既有规则的 `facts` 列表里，风险计数结构不变（59 项）。
+3. **文案分层到数据层**：计划窗口由 `PLAN_WINDOW_BY_APPLY_MODE` 一处映射，规则包只声明 `apply_mode`；
+   表里没有的值回退 `None`（渲染层显示空，而不是猜一个）。
+
+#### 实测（三包端到端）
+
+- **批 A**：整改计划 **59/59 条**责任人 / 计划窗口 / 验证方式三列有值，**0 行空登记**
+  （此前 59 行共用同一句）；覆盖 4 种角色、3 种窗口、28 种验证方式。
+- **批 C**：SAR 历史表（表 22，7 行）三节点正确 —— 负载每核峰值 0.12 / 0.47、运行队列 — / 38、
+  磁盘 I/O tps 1310.92 / 5064.14、网络 ens192 519.9 / 14812.9 kB/s。
+- **★2**：结论速览段全字段来自 model（0 分下限说明、高风险分布 `.33` 5 项 / `.34` 5 项 / `.125` 4 项、
+  证据缺口 1 项）。
+- **批 N**：四规则事实全部新增，风险计数 **59 项不变**。
+- `pytest tests/` → **195 passed / 5 failed / 31 subtests**，5 项仍是缺
+  `mysql_inspection_v1_db01_192.168.100.80_3306_20260811_160102.tar.gz` 夹具的预存在失败，
+  **零新增回归**。
+
+**docx 内容哈希冻结值刷新**：`tests/test_word_engine.py` 的 `PRE_SPLIT_NORMALIZED_DOCUMENT_XML`
+因新增「结论速览」段而变化。用**控制变量法自证**（`_work/_verify_hash.py`：把同一份 model 的
+`scoring_policy` 删掉后重渲染，哈希精确回到旧冻结值 `F7B0D245…`）→ 证明差异**仅**来自新增段、
+不是别处被改坏，再刷新为 `A9F7C279…`。
+
+**作用域**：`inspection_core/models.py`、`inspection_core/reporting.py`、`inspection_core/word_engine.py`、
+`plugins/mysql/rules.py`、`plugins/mysql/metrics.py`、`plugins/mysql/presentation.py`、
+`plugins/mysql/inspection_rules.json`、`tests/test_mysql_presentation.py`、`tests/test_word_engine.py`。
+
+**下一批候选**：N5（OS EOL 与 mysqld 启动方式不一致 —— 用户明确标为新维度，另立项）、
+`tables/inodes.tsv`（inode 用尽）、`table_io_top` 与 `replication_channels`（表级 IO 热点 / 并行复制）、
+`schema_privileges`（库级最小授权）、chronyc 时间源质量、MGR·Galera 形态分支。
+
+### 22.30 SQL Server 采集器 v1.1.0 → v1.2.0：对齐现场人工巡检报告（阶段 21，用户提供报告 + 脚本）
+
+**触发**：用户拿一份现场人工巡检报告（Windows Server 2019 + SQL Server 2019 RTM 15.0.2000.5 +
+AlwaysOn 双副本）和对应的 `sqlserver_inspection.ps1` 问「这个巡检脚本，对这个巡检报告，有什么缺漏的吗」。
+先出覆盖度清单 `docs/sqlserver-collector-gap-plan.md`（F-01…F-19，A 硬缺口 10 / B 口径不一致 9 /
+C 报告自身矛盾 4），用户回「做吧」→ 本批把清单落地，并把清单升格为「设计与验收文档」
+（§8 落地状态逐条对照、§9 登记新发现）。
+
+#### 三层一起动，缺一层都不算修完
+
+| 层 | 文件 | 主要改动 |
+|---|---|---|
+| 采集 | `inspection/sqlserver_inspection.ps1` | 37 处结构化补丁 + 2 处收尾：新增 3 个模块（`server_services` / `memory_clerks` / `system_memory`）+ `ha_status` + `os_metrics`；`replication` 改从**分发库**取（旧版查 `msdb.dbo.MSpublications` 恒空）；`error_log_summary` 中英双语筛选 + `error_number` 聚合键 + 轮转遍历；`volumes` 三层合并（补上备份盘）；状态补到五态；退出码 `exit 2` |
+| 分析 | `plugins/sqlserver/rules.py` + `inspection_rules.json` | 新增 4 条判据：`INSTANCE.SERVICE_STARTUP` / `HA.AG_SYNC_MODE` / `HA.AG_LAG` / `HA.AG_CONNECT_ERROR`；新增阈值键 `ag_replica_lag_warning_seconds` / `require_service_autostart` |
+| 报告 | `plugins/sqlserver/{presentation,word_report,report_adapter}.py` | 新增 6 个报告条目（服务与启动参数 / 副本同步与延迟 / 副本连接与状态 / OS 采样 / 磁盘繁忙率 / 网络吞吐）；`ha` 补进 `section_order`；9 处既有条目补列 |
+
+#### 本轮抓到的四个缺陷（三个会写错结论，一个是"测试给了假保证"）
+
+1. **子串陷阱把异步副本判成同步提交。** `HA.AG_SYNC_MODE` 首版写 `"SYNCHRONOUS" in mode`，
+   而 `'ASYNCHRONOUS_COMMIT'` **含子串 `'SYNCHRONOUS'`** → 异步副本（`SYNCHRONIZING` 本就是常态）
+   被判成「同步提交副本未能追平主副本」。改 `mode.startswith("SYNCHRONOUS")` 并在代码里写明原因。
+   **枚举值判断一律不能用手感子串。**
+
+2. **判据顺序把关卡设死。** 官方定义里 `synchronization_health_desc` 已把提交模式揉进去了
+   （sync 提交副本 `SYNCHRONIZING` 记 `PARTIALLY_HEALTHY`，async 提交副本 `SYNCHRONIZING` 记 `HEALTHY`），
+   所以"健康度不等于 HEALTHY"这一分支会先把"同步提交 + SYNCHRONIZING"全部截走 ——
+   按 `availability_mode_desc` 区分的分支就成了**永远走不到的死代码**（首版正是这么写的）。
+   重排为「模式 → 健康度 → 延迟 → 队列」并把这个因果写进 docstring。
+   **elif 链的顺序是判据的一部分，不是排版。**
+
+3. **守门测试用"相等"给了假保证。** `test_word_profile_covers_all_sections` 断言
+   「适配器输出的章节集合 == `section_order`」，而适配器会**跳过无条目的章节**、基线包恰好没有
+   AlwaysOn / 复制数据 → `ha` 在基线里是空章节 → **"ha 没登记"反而成了通过条件**。
+   改成子集断言 + 新增双向校验用例（用"每个章节能触发的最小快照"验，不再依赖基线包）。
+   **契约测试的断言方向选错，比没有测试更坏。**
+
+4. **`_coll()` 找不到模块名时静默回退成 `ok`。** 改名不同步会让报告安安静静地显示"正常"。
+   回退值本身没改（动它会波及历史包语义，需单独成批），但补了静态守门
+   `tests/test_sqlserver_module_names.py`：每个 `_coll(主名)` 必须能在采集脚本里解析到，
+   别名必须是登记过的旧名。
+
+#### 消费面闭环：8 个「采了没人读」逐一定性
+
+AGENTS.md 要求「采集了却没人读的字段要么补进分析、要么从采集端移除」。用
+「采集端注册名 × 呈现端 `_coll` 名」两张表交叉比对（**注意注册有四种写法**：位置式
+`Invoke-CollectionModule '名' '键'`、命名式 `-Name`、`Add-ModuleStatus -Name`、
+以及内联 `$moduleStatus.Add([ordered]@{name='X'})` —— 只认前三种会误报），结论：
+
+- **补消费 7 项**：`server_services`、`availability_replicas` 的模式/延迟/重做/连接错误、
+  `backup_history` 的耗时/压缩/加密/类型标记、`top_queries` 的 `total_spills`/`query_hash`、
+  `error_log_summary.error_number`、`os_metrics.samples`（F-02 的消费侧）、`identity` 的页面文件与物理处理器；
+- **移除 1 项**：`backupmediafamily.device_type` —— 裸数字枚举、下游零消费者，
+  而 `physical_device_name` 在采集端**内部**被消费（解析盘符合并进 `volumes`），保留。
+
+另外发现 `query_hash` / `query_plan_hash` 是 `binary(8)`，ADO.NET 读出来是 `byte[]`，
+`ConvertTo-Json` 会写成 `[0,0,...]` 数字数组 → **在 SQL 侧统一转 `CONVERT(varchar(18), col, 1)` 十六进制**。
+
+#### 基线策略：刻意避开会改基线的改动
+
+SQL Server 的源采集包已不在仓库（`tests/baselines/sqlserver/current/` 只剩产物），**基线无法刷新**。
+因此本批所有改动都只影响"基线里不存在的键"：新增的 4 条判据依赖 `server_services` /
+`availability_replicas`（基线里都是空数组）、新增章节 `ha` 在基线里是空章节（适配器跳过）→
+**基线仍是可复现的**。据此把两条会改基线的缺陷**留作下一批**（清单 §9 F-20 / F-21），
+其中 F-20（`is_query_store_on` 写死 `CAST(NULL AS bit)` → `DB.QUERY_STORE` 判据永不触发、
+`require_query_store_for_user_db` 成死旋钮）是 P0，但必须先解决"基线能否重采"再动。
+
+#### 实测证据
+
+- PowerShell 5.1 解析器：`PARSE_OK`；文件保持 **UTF-8 带 BOM + 纯 LF**（1632 LF / 0 CRLF）。
+- OS 指标模块在本机实测两态：`-Server .` → `success` 且采到 CPU/磁盘/SSD 介质；
+  `-Server 192.168.1.37` → `skipped` + limitation 写明"OS 计数器属于执行机"。
+- 合成 v1.2 快照端到端（`_work/_verify_sqlserver_plugin_v12b.py`）：4 条新判据全部按预期触发，
+  且**四条 AG 分支各自可达**（同步提交未追平 / 异步断连 / 异步高延迟 / 主副本正常不报），
+  10 个新列全部渲染到目标条目，采集完整度把 `skipped` / `not_applicable` 正确排除出分母。
+  **为什么必须单独验**：基线包是旧采集器产的，pytest 里的适配器测试根本走不到这些分支。
+- `pytest tests/` → **5 failed / 199 passed / 31 subtests**；5 项与改动前**逐条一致**
+  （仍是缺 `mysql_inspection_v1_db01_192.168.100.80_3306_20260811_160102.tar.gz` 夹具的预存在失败），
+  通过数 195 → 199 全部来自本批新增测试，**零新增回归**。
+
+**作用域**：`inspection/sqlserver_inspection.ps1`、`plugins/sqlserver/rules.py`、
+`plugins/sqlserver/inspection_rules.json`、`plugins/sqlserver/presentation.py`、
+`plugins/sqlserver/word_report.py`、`plugins/sqlserver/report_adapter.py`、
+`tests/test_sqlserver_plugin.py`、`tests/test_sqlserver_module_names.py`（新增）、
+`docs/sqlserver-collector-interface.md`（升到 v1.2）、`docs/sqlserver-collector-gap-plan.md`。
+
+**下一批候选**：F-20（判据永不触发，P0，需先能重采基线）、F-21（`-OutputDir` 默认取脚本目录，
+违反"采集脚本不得依赖自身所在目录"）、`_coll` 回退值改成"未采集"语义、
+两个 `top_queries_*` 模块接成报告条目或从采集端移除、注释密度 3.9% → 20%。
+
+### 22.31 SQL Server 采集器 v1.2.0 → v1.3.0：吸收第二份现场报告（阶段 22，用户提供报告）
+
+**触发**：用户再给一份现场人工巡检报告（HISDB-NODE1 / Windows Server 2012 R2 Datacenter /
+**SQL Server 2014 SP2** 12.0.x / 64 逻辑核 / 256 GB / AlwaysOn 已启用 / 排序规则 `Chinese_PRC_BIN`，
+含 1.1 实例信息、1.2 启动参数、1.5 数据库基本情况、1.8 bufferpool、1.9 活跃用户进程、1.10 Job、
+1.11 缺失索引、1.12 表大小、3 总结），指令「一样，看有什么确认的，采集，吸收下」。
+
+**方法论：把第二份样本当「交集判据」，不当「需求清单」照抄。** 第一份是 2019 + AlwaysOn，
+这份是 2014 SP2 单实例形态；只有**两份都出现**的缺口才算通用缺口，单份独有的先记录不动手。
+这一步直接筛掉了「1.12 表大小」「1.11 缺失索引」等已覆盖项，也把上一批靠单包得出的两条结论翻掉了（见下）。
+
+#### 三层一起动
+
+| 层 | 文件 | 主要改动 |
+|---|---|---|
+| 采集 | `inspection/sqlserver_inspection.ps1`（→ **v1.3.0**，1676 行 / 44 处 `Invoke-CollectionModule`） | ① `Convert-DbValue` 的 DBNull 判空 **P0 修复**；② 新增 `session_activity` 模块（按 login_name × status 聚合会话资源）；③ `configurations` 白名单补 `blocked process threshold (s)`（16 → 17 项）；④ `-OutputDir` 默认值改为与脚本位置无关；⑤ 头部补 `bit 列语义（v1.3.0 起）` 契约段 |
+| 分析 | `plugins/sqlserver/rules.py` + `inspection_rules.json` | `_dt()` 不可达代码 **P0 修复**；新增 `INSTANCE.ADHOC_WORKLOADS` / `INSTANCE.BLOCKED_PROC_THRESHOLD` / `INSTANCE.BACKUP_COMPRESSION` / `INSTANCE.VERSION_SUPPORT` / `SESSION.RESOURCE_HOG` / `AGENT.JOB_OVERDUE` 六条判据 + MAXDOP=0 分支；规则包**删 3 个死键**、**补 9 个键**（含 `sqlserver_extended_support_end` 版本生命周期映射） |
+| 报告 | `plugins/sqlserver/presentation.py` | 实例信息补「物理CPU / 每插槽核数」「NUMA 节点数」；作业清单补「最近耗时」（HHMMSS → `20m53s`）；TempDB 补累计读/写次数与平均延迟；等待章节补「会话资源占用」条目 |
+
+#### 抓到的四个缺陷（两个静默 P0，两个是上一批我自己写错的结论）
+
+1. **`Convert-DbValue` 的 `$Value -eq [DBNull]::Value` 让所有「为真」的 bit 列序列化成 `null`**【P0，静默假阴性】
+   PowerShell 的 `-eq` 会按**左操作数**类型强制转换右操作数：`$true -eq [DBNull]::Value` 结果是 **`$true`**，
+   于是「非空且为真」的 bit 列被当成空值返回 `null`。脚本不报错、包照常产出，只有下游判据集体失效。
+   实测坐实：把基线包里 3 行 `is_db_chaining_on` 的 `null` 还原成 `true` 后，`DB.CHAINING` 立刻多触发 3 条
+   （findings 24 → 27）→ 这是**静默漏报**，不是「缺少该列」。改为 `$Value -is [System.DBNull]`。
+   **连带语义**：bit 列在系统视图里是 `bit NOT NULL`，所以 `null` 只可能来自序列化缺陷、不可能来自数据库 →
+   `collector_version < 1.3.0` 的历史包里的 `null` 只能当「未知（可能为真）」，**与 `false` 不等价**。
+
+2. **`rules.py` 的 `_dt()` 是不可达代码，恒返回 `None`**【P0，静默降级】
+   解析代码被 `_elapsed_seconds` 的 `return` 隔在后面，函数体只剩 `if not value: return None` 便走到末尾 →
+   所有「距今多久」的判据退化成「时间未知」，`DB.CHECKDB` 因按「时间为空」取高档而**恒为 high**。
+   修复后 4 条 `DB.CHECKDB` 由 high 降为 medium、证据文案从「未取得成功 CHECKDB 时间」变成「距上次成功 CHECKDB N 天」。
+   影响面实测：health / findings 数 / sections / items / charts **六项全不变**，故 `expected_summary` 主体仍与冻结值一致，
+   只需同步 `severity_counts`（`8/9/6/1` → `8/5/10/1`）。
+
+3. **上一批的 F-20 判断有误，撤回。** 当时登记「`is_query_store_on` 写死 `CAST(NULL AS bit)` → `DB.QUERY_STORE` 判据永不触发、
+   `require_query_store_for_user_db` 是死旋钮」。逐行复读后发现：主查询里确有该占位列，但**紧随其后有一条按 `$productMajor`
+   版本门控的二次查询会覆盖它**；基线快照里 `is_query_store_on` 的实际取值是 `false`（不是 `null`）→ 覆盖路径真实生效，
+   阈值键有真实消费方。此条撤回，并把这个排查习惯写进 `docs/sqlserver-collector-interface.md` §10-③：
+   **看到 `CAST(NULL AS ...)` 先往下读几行再下结论。**
+
+4. **「基线源包不在本机、无法刷新」也是错的，已更正。** `tests/baselines/sqlserver/current/README.md` 与
+   `docs/baseline-inventory.md` §7.1 都写着「源包已不在本机 → 刷新路径走不通」。实测：源包**在本机**
+   （`D:\inspection\sqlserver_inspection_v1_db-sql-01_20260728_000158.zip`，35,349 字节），
+   sha256 = `F7EB3FC1…D6DBA` 与 `baseline.json.source_package.sha256` **逐字节一致**；
+   `source_implementation` 的四个 sha256（collector / analyzer / rules / rules_config）实测**全部匹配**；
+   `tests/test_sqlserver_analyzer.py` **真的在跑**（读 `source_package.path` 实跑 `analyze_sqlserver()`），不是 skip。
+   准确表述是：`current/` 下的 `analysis.json` / `report_model.json` / `*.docx` 是**外部实现**的产物，
+   本批没有重新生成它们（重新生成只能再跑外部工具，与本批改动无关）；本批守的契约是 `expected_summary`，由仓库代码实跑对照。
+
+#### 守门测试（防三条回归复活）
+
+- `tests/test_sqlserver_module_names.py`：新增 `test_collector_does_not_compare_dbnull_by_value`
+  （断言无非注释的 `-eq [DBNull]::Value`、且存在 `-is [System.DBNull]`）+ 新类 `SQLServerRuleHelperTests`
+  （`_dt` 能解析 ISO 时间戳、`_elapsed_seconds` 归一化时区、作业耗时按 HHMMSS 渲染而不是当秒数）。
+- `tests/test_rule_pack_config.py`：**把 `sqlserver` 加进 `TARGETS`**，让它也受「规则包每个阈值键都必须有代码请求」约束；
+  取键正则锚到 `self.t`（`self\s*\.\s*t\s*\.get`），否则会被 `tempdb()` 里的局部变量 `t` 打出假阳性。
+  （SQL Server 的请求形态是 `self.t.get("key", default)`，与 MySQL/Oracle 的 `self._threshold(...)`、PG 的内层 `threshold(...)` 都不同。）
+
+#### 实测证据
+
+- PowerShell 解析 `PARSE_OK`；文件保持 **UTF-8 带 BOM + 纯 LF**（1676 LF / 0 CRLF）；44 处 `Invoke-CollectionModule`；
+  注释 79 行 / 密度 4.7%（上一版 63 行 / 3.9%）。
+- 合成 v1.3 快照端到端（`_work/_verify_sqlserver_v13.py`）：六条新判据按预期触发，`INSTANCE.MAX_MEMORY` 按报告原文取值应为「不报」（220000/262144 = 83.9% < 90% 阈值），测试期望已按实测校正。
+- 定向 pytest（`test_sqlserver_module_names.py` + `test_sqlserver_plugin.py` + `test_rule_pack_config.py` +
+  `test_sqlserver_analyzer.py` + `test_severity_tiers.py`）：**34 passed / 17 subtests passed**。
+- `pytest tests/` → **5 failed / 203 passed / 34 subtests passed**；5 项与改动前**逐条一致**
+  （仍是缺 `mysql_inspection_v1_db01_192.168.100.80_3306_20260811_160102.tar.gz` 夹具的预存在失败），**零新增回归**。
+- 文档同步：`docs/sqlserver-collector-interface.md` 升到 **v1.3.0**（阶段行号重测、§3 键数 46→47、§4 清单 46→47 项并插入 `会话资源占用`、
+  §9 撤回 F-20 / 标记 F-21 已修、§10 新增第 8 条 bit 序列化规则）；`tests/baselines/sqlserver/current/baseline.json` 同步 `severity_counts` 并追加 `refresh_notes`。
+
+**作用域**：`inspection/sqlserver_inspection.ps1`、`plugins/sqlserver/{rules.py,inspection_rules.json,presentation.py}`、
+`tests/{test_sqlserver_module_names.py,test_rule_pack_config.py}`、`tests/baselines/sqlserver/current/{baseline.json,README.md}`、
+`docs/{sqlserver-collector-interface.md,sqlserver-collector-gap-plan.md,baseline-inventory.md,PROJECT_MAP.md}`。
+
+**下一批候选**：`_coll()` 回退值改成「未采集」语义；两个 `top_queries_*` 模块接成报告条目或从采集端移除；
+注释密度 4.7% → 20%；`output_sha256.report_model_standard.json` 长期对不上且无人校验（登记项）。
+
+
+### 22.32 批 A：把已采到的数据接通到报告（SQL Server v1.3.0 → v1.3.1，2026-09-24）
+
+
+**背景**：第二份现场报告（HISDB-NODE1 / SQL Server 2014 SP2 / Win 2012 R2）与 MySQL 采集器的横向对比（§22.30 / §22.31，
+
+见 `docs/sqlserver-collector-gap-plan.md` §10–§14）累计出 14 类可提升项。用户选定**只做批 A 四项**，目标是
+
+「让已经采到的数据走到客户眼前」，不再补采集 —— 采集面已经够（47 个顶层键 / 0 个孤儿键），断点在渲染侧。
+
+
+#### 落地的四项
+
+
+1. **补 2 个 TOP SQL 报告条目**：采集端按 CPU / 逻辑读 / 执行次数 / 物理读四个维度各取 TOP30，报告此前只渲染前两个。
+
+   补「高执行次数SQL」「高物理读SQL」到 `sql_index` 章节 —— 物理读那条是判断「缓冲池不足还是索引缺失」的直接证据。
+
+2. **补 4 张对象明细表**：陈旧统计信息 / 索引碎片 → `db_objects`；孤立用户 → `security`；可疑页面 → `backup`
+
+   （页级损坏直接影响可恢复性，不塞进「数据库对象」）。同时给 `PERF.STALE_STATS` / `PERF.INDEX_FRAGMENTATION` /
+
+   `SEC.ORPHANED_USER` / `DB.SUSPECT_PAGES` 补 `_inject_analysis` 映射。
+
+3. **3 处写死 `collection.status`**（性能采样 / SQL登录 / sysadmin成员）改为读真实 `module_status`；
+
+   `_coll` 兜底从 `{"status": "ok"}` 改为 `{"status": "not_evaluated"}`。
+
+4. **新增第 14 章 `collection_detail`（采集执行明细）**：逐模块 状态 / 行数 / 耗时ms / 错误，**按耗时降序**；
+
+   采集端实例基础信息 / TempDB / 安全与权限 / 性能采样四个专用块各自计时，`Add-ModuleStatus` 新增 `-Begin`。
+
+
+**顺带修（不在四项内，可单独否决）**：`appendix.collection_window.sqlserver_sample_points` 原写死 `1`、实采 **6**；
+
+`word_report.py` 的 `section_order` **13 → 14**；`collector_version` **1.3.0 → 1.3.1**
+
+（`elapsed_ms` 取值语义由「恒 0」变为「真值 / null」，属可观测的输出变化，下游需要能按版本判断）。
+
+
+#### 关键实现约束（都是踩过才写下来的）
+
+
+- **`_coll` 的第二个参数只能是已登记的真实旧名**（`LEGACY_ALIASES`），不是「备选名」。深度三项的采集端注册名
+
+  **至今带「（深度）」后缀**（它们确实默认不采），所以只能传单参数 —— 给它们编一个「去后缀名」是篡改历史，
+
+  会被 `test_alias_arguments_are_known_legacy_names` 拦下。
+
+- **安全块两条共用一个 `_cst("安全与权限")`**：安全块是一个 try 包住 `sql_logins` / `sysadmin_members` 等多类查询，
+
+  `module_status` 只有一条 —— **状态可以共用，行数不能共用**（否则 sysadmin 条目会显示登录名的行数）。
+
+- **未计时落 `null`，不落 `0`**：把「没计时」写成 0 毫秒，会让这四个最可能慢的块在明细表里显示成最快。
+
+- 新章节**无条件登记**到 `sections`（适配器会按有无条目跳过空章节，但 `section_order` 双向契约测试看的是
+
+  呈现层能产出的全部章节），故 `_full_snapshot` 不需改。
+
+
+#### 实测证据
+
+
+| 项 | 实测 |
+
+|---|---|
+
+| ps1 语法 / 规模 | `PARSE_OK`（6625 tokens）；**1691 行 / 81 行注释 / 4.8% / 纯 LF + UTF-8 BOM** |
+
+| `presentation.py` | **892 行 / 43 行注释 / 4.8% / 纯 CRLF**（该文件既有约定） |
+
+| 定向 pytest | **34 passed / 17 subtests passed** |
+
+| 全量 pytest | **5 failed / 203 passed / 34 subtests passed**；5 项与改动前**逐条同名一致**（MySQL 夹具缺失的预存在失败）→ **零新增回归** |
+
+| 实跑基线包 | `sections` **12 → 13**、`items` **27 → 30**；`health_score=0` / `findings=24` / `charts=8` / `severity_counts=8/5/10/1` **五项未变** |
+
+| 合成快照验证 | 6 个新条目全部渲染、状态跟随 `failed`、耗时降序、未计时显示 `-` → **ALL_PASS** |
+
+
+**过程中两次自伤（已记入项目记忆）**：
+
+（1）改 CRLF 文件时用了 `open(p, 'w', newline='')` —— 读取时的 universal newlines 已把 `\r\n` 折成 `\n`，
+
+写入再不转换就丢了 CR，`presentation.py` 的 790 行 CRLF 一度变成纯 LF（已恢复并逐字节校验 892/892）。
+
+**改这类文件一律按 bytes 读写 + 显式 `\n → \r\n`**。
+
+（2）把 `_coll("陈旧统计信息（深度）", "陈旧统计信息")` 的第二个参数当成「备选名」，被契约测试拦下。
+
+
+**作用域**：`inspection/sqlserver_inspection.ps1`、`plugins/sqlserver/{presentation.py,report_adapter.py,word_report.py}`、
+
+`tests/{test_sqlserver_plugin.py}`、`tests/baselines/sqlserver/current/baseline.json`、
+
+`docs/{sqlserver-collector-interface.md,sqlserver-collector-gap-plan.md,PROJECT_MAP.md}`。
+
+
+**下一批候选**：批 B 采集端工程面（异常分型 `Exception.Number` / `target_key` 落盘 / 单调时钟 `Stopwatch` / `trap` 中断处理）；
+
+破坏性项需先定口径（manifest 逐文件 sha256 + size、`privacy` 段、打包前敏感扫描）；
+
+§14.5 的三个中转字段按决策**保留**（`sqlserver_performance` 装着两个 TOP SQL 的键，删掉等于关掉本批①的数据来源）。
+
+### 22.33 批 C：SQL Server 采集口径修正 + 四项现场证据（v1.3.1 → v1.3.2）
+
+对照两份老巡检脚本（`D:\inspection\老脚本`，实为 2 份：两份 mssqlcheck 相似度 0.991）
+后定的批 C（gap-plan §16.7），四项全部落地：
+
+- **C-1 语句归属库口径**：`DB_NAME(sys.dm_exec_sql_text.dbid)` 对 **ad-hoc 计划恒为 NULL** ——
+  `cpu_by_database` 因此整表 0 行（还自带 `IS NOT NULL` 过滤把 ad-hoc 全丢），
+  四个 TOP SQL 的「数据库」列 30/30 全空。**一处口径错，两个模块出问题**。
+  改取 `sys.dm_exec_plan_attributes(plan_handle)` 的 `attribute=N'dbid'`；
+  TOP SQL 用 `OUTER APPLY`（缺属性不能丢行），`cpu_by_database` 用 `CROSS APPLY` + 排除 32767=ResourceDB。
+- **C-2 `dm_os_schedulers` 进采样循环**：每个采样点加 `runnable_tasks_count` / `runnable_tasks_max` /
+  `work_queue_count` / `pending_disk_io_count` / `current_tasks_count`（`scheduler_id<255`）——
+  此前整份报告**没有任何 CPU 时间序列**。报告新增「CPU 调度压力采样」表。
+- **C-3 `restore_history`**（`msdb.dbo.restorehistory` 按库聚合）→ 备份章节「还原验证历史」。
+  **"备份文件存在" ≠ "备份可还原"**，这是备份章节唯一缺的一环。
+- **C-4 `job_steps`**（`msdb.dbo.sysjobsteps` TOP300，最近失败优先）→ 作业章节「步骤明细」，
+  补上"失败在哪一步"。
+
+采集器 **v1.3.2 / 1762 行 / 44 个采集模块 / 49 个顶层采集键 / 注释 101 行（5.7%）**；
+`schema_version` 保持 1.1（只增键，无破坏性变更）。
+
+三条纪律（写在这里，下次加采集项还会用到）：
+
+1. **改了采集 SQL ≠ 老包里有数据**：C-1 是纯 SQL 修正，既有基线包不受影响
+   （`cpu_by_database` 仍是 `[]`）→ **拿老包跑"没生效"不代表改错了**，必须重新采集才验证得了。
+2. **老包缺的字段，报告要"不加行"而不是"补 0"**：`perf_summary` 的 4 个新峰值在无数据时返回 `None`，
+   `_build_sections` 只在非 None 时 append —— 「可运行任务 0」与「没采到」是两件事。
+3. **新增含敏感文本的采集项，同步改 `-ExcludeSqlText`**：`job_steps.command_preview`
+   （作业步骤命令常含明文口令/连接串）已并入抹除名单，循环从"6 个键写死 `sql_text`"改成
+   `键 -> 字段名` 的映射表。
+   另：`_inject_analysis` 按**子串**匹配标题，往已有章节加条目前先确认新标题不会被旧规则误命中
+   （本轮把 `('ops','作业')` 收紧成 `('ops','作业清单')`，否则新表「步骤明细」会被挂上作业级判据）。
+
+证据：PowerShell `PARSE_OK tokens=6752`；`test_sqlserver_module_names.py` 7 passed；
+`test_sqlserver_analyzer.py` passed（**老包 expected_summary 未变 → 无需刷新基线**）；
+`_work/_verify_pres_c.py` 12 项 ALL_PASS（新包三表都出 / 老包三表都不出）；
+全量 pytest **5 failed / 203 passed / 34 subtests passed**，5 项与改前逐条同名（MySQL 夹具缺失的预存在失败）。
+
+未做：批 D 六项（锁对象级 / DB 级角色成员 G-19 / 计划缓存 / AG 监听器 / FCI 节点 / 集群仲裁）、
+B-10~B-16 只记录；§15.5 ①（附录「规则执行状态」三行恒 0）仍未修。
+详见 `docs/sqlserver-collector-gap-plan.md` §17、`docs/sqlserver-collector-interface.md` §9-⑮。
+
+### 22.34 附录「规则执行状态」四态收口（SQL Server 分析层，2026-10-08）
+
+修 gap-plan §15.5 ①：附录那张表结构上只可能填出「触发 N / 通过 0 / 未判断 0 / 不适用 0」。
+根因**不在 Word，也不在 adapter 的计数写法**：SQL Server 的 `evaluations` 只由 findings 反推
+（`report_adapter.py` L219–234 每条写死 `status="triggered"`），而 `RuleEngine` 全文只有
+`self.add(...)`（命中才产出）→ **"通过"没有分母、"不适用"没有出口**。
+MySQL / Oracle / PG 走声明式引擎（`inspection_core/declarative_rules.py`）天然四态 → SQL Server 是唯一例外。
+
+三层同改（缺一层都不成立）：
+
+1. **规则包补 `rules` 目录（分母）**：`plugins/sqlserver/inspection_rules.json` 新增 `rules` 段 **66 条**
+   （60 静态 + 5 条 `SEC.*` 动态 + 1 条 `HA.REPLICATION_AGENT`），每条含
+   `category` / `severity` / `title` / `required_modules`；`schema_version` 1.0 → 1.1；47 条 `thresholds` 一条未丢。
+2. **新建 `plugins/sqlserver/module_catalog.py`**：快照键 / 规则 → 采集模块的**唯一真值来源**
+   （`LEGACY_MODULE_ALIASES` + `MODULE_BY_SNAPSHOT_KEY` 49 项 + 三组状态集合 + 四个函数），规则层与测试共用。
+3. **`RuleEngine` 产出四态**：新增 `gap()` / `na()` 登记出口，补 **13 处登记点**；
+   `rule_evaluations()` 按「已登记 → 模块 `unavailable`→未判断 → 模块 `not_applicable`→不适用 → 通过」定态。
+
+接线：`rule_provider.evaluations` → `analyzer`（写 `analysis.json` 顶层 `rule_evaluations`）→
+`presentation.build_model(..., evaluations=...)`（**新参数带默认值，向后兼容**）→
+`report_adapter._build_appendix` **优先读 `source["rule_evaluations"]`**，旧模型无此键时回退原行为。
+
+三条纪律（下次给别的库补四态还会用到）：
+
+1. **判"输入在不在"只能看 `collection.module_status`，不能看快照里有没有这个键** ——
+   `normalize_snapshot` 对 30+ 个键 `setdefault(key, [])`，"没采"与"采到空"形状完全相同。
+2. **"通过"的分母必须来自规则包目录**，不能由 findings 反推（那只得到"触发几条"，
+   正是原来恒 0 的原因）；模块整版不存在时是"未判断"而非"通过"。
+3. **旧名回退必须有**（`无主键表（深度）` / `大表统计（深度）` / `复制配置` → 新名），
+   否则老包"能判的"会被误判成"未判断"；adapter 与 `build_model` 都要留向后兼容分支。
+
+证据：`inspection_rules.json` 17564 字节 / `rules` 66 / `thresholds` 47 / `schema_version` 1.1；
+`tests/test_sqlserver_rule_catalog.py` **12 passed / 66 subtests passed**（含"空快照不得判出通过"）；
+`pytest -k sqlserver` **16 passed**；实跑基线包四态 **触发 14 / 通过 33 / 未判断 6 / 不适用 13 = 66**，
+Word 附录表已按四态渲染；`baseline.json` 的 `expected_summary` 四态入册、其余六项未动；
+全量 pytest **5 failed / 215 passed / 100 subtests passed**，5 项与改前逐条同名 → 零新增回归。
+
+未做：批 D 六项（锁对象级 / DB 级角色成员 G-19 / 计划缓存 / AG 监听器 / FCI 节点 / 集群仲裁）、
+`buffer_pool.cache_pct > 100%` 的呈现口径（等有真实负载的新包定）。
+详见 `docs/sqlserver-collector-gap-plan.md` §18。
+### 22.35 真机首跑崩溃修复（SQL Server 采集器 v1.3.2 → v1.3.3，2026-10-08）
+
+用户真机首跑采集器，脚本 **100% 崩溃、零产出**，控制台只有两行：
+
+```
+[2026-09-10 03:45:33][INFO] Collector 1.3.2 started for .
+... : 在此对象上找不到属性"connection_ip"。请确认该属性存在。
+FullyQualifiedErrorId : PropertyNotFoundStrict,sqlserver_inspection.ps1
+```
+
+**P0 根因链（三步，"错误信息不含变量名"是主要排查阻力）**：
+① 阶段 ③ 实例查询写了 `w.windows_version` / `w.language` / `w.os_language` 三个列，
+而 `sys.dm_os_windows_info` **一个都没有**（官方自 2008 R2 SP1 起至今恒为
+`windows_release` / `windows_service_pack_level` / `windows_sku` / `os_language_version`）→ 整条 SQL `Invalid column name`；
+② 异常被 catch 吞，**而那个 catch 当时连日志都不写**（只写 `limitations` / `module_status`，两者都要等包产出才看得见）→ 控制台无痕；
+③ `$snapshot.instance` 落成空 `[ordered]@{}` → `$snapshot.instance.connection_ip`
+在 `Set-StrictMode -Version Latest` 下抛 `PropertyNotFoundStrict` → 脚本终止。
+
+**本批最重要的结论（放大器效应）**：一个模块失败能升级成"整脚本崩溃"，
+是因为**"静默吞异常" + "裸点取属性"同时存在** —— 前者藏住原因，后者把后果放大到全局。
+两者单独看都只是坏味道，合在一起就是 P0。
+
+**P1（由本批新建的等价冒烟抓出，且是改造自己引入的回归）**：
+`Get-ObjProp` 不能用来取数组型字段。实测（PS 5.1）两个行为相乘 ——
+`return $value` 走管道会**把单元素数组拆包成标量**（1 元素 → `isArray=False`），
+而 StrictMode 下**对 PSCustomObject 取 `.Count` 会抛 `PropertyNotFoundStrict`**。
+后果：**机器上恰好只有 1 块盘 / 1 张网卡就崩，2 块盘反而正常**。
+（裸点取 `$last.disks` 走属性访问、不拆包；换成语义更严的 `Get-ObjProp` 反而丢了数组性。）
+
+**修法**：R1 列名改回官方三列 + 6 行「改这里先核文档」注释；R2 catch 补
+`Write-CollectorLog "实例基础信息 failed: ..." 'ERROR'`；R3/R4 连接 IP·端口 / 目录命名 / 本机判定
+全改走 `Get-ObjProp` / `Set-ObjProp`；R5 新增两个严格模式安全访问器；**R6 新增第三个访问器
+`Get-ObjArray`（恒返回数组）**，`$lastDisks` / `$lastNet` / `$osDisks` 三处改用。
+版本 `1.3.2 → 1.3.3`；**`schema_version` 保持 `1.1`**（§3 键类型表不枚举 `instance` 子键，删掉的是从未进入契约的列）。
+
+**三条纪律（写进 interface §10-10/11）**：
+1. StrictMode 下取属性只有三种合法写法：标量走 `Get-ObjProp`、写回走 `Set-ObjProp`、
+   **数组型字段走 `Get-ObjArray`**（`.Count` 只对数组安全）；三个访问器必须"先定义后调用"。
+2. **`catch` 必须留痕**（`Write-CollectorLog ... 'ERROR'/'WARN'`），不许只写 `limitations` / `module_status`。
+3. **冒烟要抽"真实代码段"而不是手抄等价逻辑** —— P1 正是抽真实代码段才抓到的；
+   手抄会把引入回归的那次改写一并"抄对"，从而漏掉。
+
+证据：StrictMode 三行为探针 + 数组拆包/`.Count` 探针（`_work/count_probe.txt`）；
+等价冒烟 `_work/_smoke_strict.ps1` → `smoke_strict.txt` **7 用例全绿**
+（A 空 instance＝**当初的崩溃输入** / B 正常实例 / C 采样点缺全部条件键 / **D 恰 1 盘 1 网卡** /
+E OS 模块失败兜底 / F 真实 SQL 行的 instance / G 多盘多网卡）；
+**反向验证两轮**（改回旧写法 → 冒烟恰在用例 D 抛 `Count`、用例 G 照常通过，两条静态守门同时失败）；
+全脚本 SQL 标识符审计（53 个 `sys.*` + 12 个 `msdb.dbo.*` + 7 个 DMV 函数，除已修三列外无其他拼写缺陷，
+`os_language` / `os_locale_language` **全仓零消费**）；AST `PARSE_ERRORS=0` / `TOKENS=7139` / BOM + 纯 LF（1856 行 / 109465 B）；
+`tests/test_sqlserver_collector_strict_safety.py` **9 passed**；
+全量 pytest **5 failed / 224 passed / 100 subtests passed**（5 项与改前逐条同名）→ 零新增回归。
+
+未做：批 D 六项（锁对象级 / DB 级角色成员 G-19 / 计划缓存 / AG 监听器 / FCI 节点 / 集群仲裁）、
+`buffer_pool.cache_pct > 100%` 呈现口径（等新包）、C-1 采集 SQL 现场验证。
+详见 `docs/sqlserver-collector-gap-plan.md` §19、`docs/sqlserver-collector-interface.md` §9-⑯⑰。
+### 22.36 真机首跑暴露的另外三个 SQL 缺陷（SQL Server 采集器 v1.3.3 → v1.3.4，2026-10-08）
+
+v1.3.3 修掉"整脚本崩溃"之后包能产出来了（53 个顶层键 / 46 个模块 / Markdown 简报正常），
+但 `collection.module_status` 里 **3 个模块 `failed`** —— 都是 SQL 写错，被模块级 catch 吞成一行 `limitations`：
+
+| 模块 | 报错 | 根因（官方文档已核） |
+|---|---|---|
+| 会话资源占用 | 列名 `'physical_reads'` 无效 | `sys.dm_exec_sessions` 没有这一列；**`reads` 本身就是物理读**（官方描述：*physical reads performed, by requests in this session*）。原 SQL 把同一个量写了两遍，其中一遍名字是错的 |
+| SQL Server 服务与启动参数 | 列名 `'servicetype'` 无效 | `sys.dm_server_services` 没有这一列；**同一条 SELECT 里还跟着一个同样不存在的 `version`** —— SQL Server 只报第一个无效列名，修一个冒一个 |
+| 复制拓扑 | 关键字 `'table'` 附近有语法错误 | `DECLARE @dist sysname, @blocks table(...)`：**T-SQL 不允许表变量与标量变量合并声明**。该模块里 `table` 只出现三处，报错位置唯一 |
+
+**为什么上一轮"列名审计"没抓到**：那轮审计的是 **DMV 对象名**（如 `MSpublications` 在分发库不在 msdb），没有逐列比对；
+而第三条是**语法级**错误，任何"列名对照"式审计都看不见。结论：**列名与语法都要变成可执行的守门。**
+
+**修法**：S1 `session_activity` 改 `SUM(es.reads) total_physical_reads`（**输出列名不变**，下游 2 个消费点继续可用）；
+S2 `server_services` 删 `servicetype` + `version`；S3 `presentation.py` 服务表同步 7 → 6 列（采集端删了列、呈现端不同步就会永远输出一个空列）；
+S4 `replication` 拆成两条 `DECLARE`；S5 新增两条静态守门（DMV 陷阱列名黑名单，**别名感知**以免误伤 `qs.total_physical_reads`；
+`DECLARE` 混合声明检测），两条都先剥 SQL 的 `--` 行注释（脚本刻意用注释记录了"曾经写错什么"）。`schema_version` 不 bump。
+
+**附带结论（用户直接问的"OS 指标为什么这么久"）**：真机包 `elapsed_ms` 合计 73,532ms，其中
+**OS 指标 44,625 + 性能采样 25,125 = 69.8s，占 95%**；而 44 个真·采集模块合计只有约 3.8 秒。
+44.6s 里 **25s 是纯 `Start-Sleep`**（5 × 5s）、约 10s 是**一次性 WMI provider 冷启动**
+（实测 `PerfOS_Processor` 首查 8.6s vs 热态 1.4s；`Get-PhysicalDisk` 首查 2.5s vs 40ms）。
+**实测否定了两个"看起来该优化"的写法**：`-Filter` 服务端过滤（1396ms / 5 次）与复用 `CimSession`（1409ms / 5 次）
+相比现状的客户端 `Where-Object` 过滤（1432ms / 5 次）**无差别**，不值得改；冷启动每次进程只付一次，减采样点也省不掉。
+要快只能调参数（`-SampleCount 3 -SampleIntervalSeconds 2` → 采样段从 50s 降到约 4s）；
+**`-SampleCount 1` 不可用**（格式化 perf 类首点失真，真机首点 `cpu_pct=0` 而 `cpu_idle_pct=98`；性能采样差分也需要 ≥2 点）。
+
+**证据（可复跑）**：`_work/_revcheck2.py break` 退回修复 → 两条守门精确命中 4 处（含隐藏的 `version`），`restore` 后全绿；
+守门 11 passed；全量 pytest **5 failed / 226 passed**（5 项与改前逐条同名）→ 零新增回归；
+`_work/_verify_svc_render.py` 用真机包 + 官方列名注入，四张表 headers/rows 长度全部自洽（服务表 6 列）；
+AST `PARSE_ERRORS=0` / `TOKENS=7139` / UTF-8 BOM + 纯 LF / **1859 行 / 143 行注释（7.7%）**。
+
+未做：`os_metrics.samples[0]` 首点失真（呈现层仍渲染全部采样点，未标注首点）；批 D 六项；C-1 现场验证。
+详见 `docs/sqlserver-collector-gap-plan.md` §20、`docs/sqlserver-collector-interface.md` §9-⑱ / §10-12 / §2。
+### 22.37 产物路径回显（SQL Server 采集器 v1.3.4 → v1.3.5，2026-10-08）
+
+用户跑出 v1.3.3 的包后问"为什么包不在脚本同目录"。排查确认**这不是缺陷，是 v1.3.0 刻意修的 P2（gap-plan §9 · F-21）**：
+v1.2.0 的写法就是 `[string]$OutputDir = $PSScriptRoot`，修的依据是 AGENTS.md「采集脚本不得依赖自身所在目录」，
+而立法理由写在同一句的括号里 —— **「这是"脚本可以在仓库里任意摆放"的前提」**。
+也就是说：这条规矩防的是**开发机上产物落进仓库**；现场场景是"脚本离机部署到目标机"，那时脚本根本不在仓库里，
+规矩要保护的对象不存在，代价（RDP 会话下多一层 `\2\`、要进 `AppData\Local\Temp\2\` 里翻）却照付。
+
+**决定：维持 `%TEMP%`（用户选），只把路径回显做显眼。** 三个候选（改回 `$PSScriptRoot` / 改成当前目录 / 维持 `%TEMP%`）
+的正反推演见 gap-plan §21.4 —— 其中关键一条：**若要改默认位置，必须先治理"每次留目录 + zip 两份"**
+（`Compress-Archive` 之后不清理），否则桌面会逐次变脏；而这条在 `%TEMP%` 下无害。
+
+改动四处（`inspection/sqlserver_inspection.ps1`）：① `-Help` 的 `-OutputDir` 说明 1 行扩成 3 行（点出 RDP 的 `\2\` 段）；
+② `-Help` 示例补 `-OutputDir "$env:USERPROFILE\Desktop"`；③ 跑完在 `OUTPUT_DIR=` / `OUTPUT_PACKAGE=` **之后**加 5 行人类提示框
+（那两行是机器可读的，相对位置与格式不得动）；④ `-Help` 的 here-string 由双引号改**单引号** ——
+本批自己踩的坑：双引号会在**运行脚本那台机器上**展开 `$env:USERPROFILE`，帮助里打出 `C:\Users\wangjs\Desktop`
+（开发机的用户名）。已固化为 interface §10-13。
+
+**默认输出目录不变、`schema_version` 不变**（`-Help` 文案与 stdout 提示都不进 `snapshot.json`）。
+
+证据（可复跑）：`_work/_mk_probes.py` 从主脚本**按标记抽取**生成两个探针（不手抄）——
+`_help_sandbox.ps1`（主脚本副本，**只**把 `-Help` 的 `exit 0` 换成 `return`；因为 `& script.ps1` 的 `exit` 会终止整个 runspace，
+stdout 无法被同会话的 `Out-File` 捕获）、`_echo_probe.ps1`（抽取结尾回显块的**真实代码行**，StrictMode Latest 下跑
+两个 `-NoPackage` 用例）。结果：`_help_out.txt` 文案完整且不折行；`_echo_probe.txt` 两用例全绿（`$false` → zip / `$true` → 目录）；
+AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行注释（7.8%）**；
+全量 pytest **5 failed / 226 passed**（5 项与改前逐条同名）→ 零新增回归。
+
+未做：默认输出目录不动；`Compress-Archive` 成功后不清理未压缩目录（只有改位置时才需处理）。
+详见 `docs/sqlserver-collector-gap-plan.md` §21、`docs/sqlserver-collector-interface.md` §10-13 / §5 / §2。
+
+### 22.38 分析层 P0 批：判据误报三条（rules.py + 规则包，2026-10-08）
+
+真机包（采集器 v1.3.5，46 模块）跑完整链路后 `health = 0`、`critical = 9`。逐条回溯 findings 后确认：
+**9 个 critical 只有 1 个是真的**（业务库 `huangjinjing` FULL 恢复模式、从未完整备份、日志亦无备份），
+其余 8 条来自两类系统性缺陷 —— 把"代理服务停止"当成"实例停机"，以及同一件事被两条备份规则各报一次
+并叠加系统库噪音。本批只修判据语义，**不动采集端、不动 Word 引擎、不动图表**。
+
+- **P0-1 服务角色**：`_services()` 原来对**任何**服务 `status != Running` 一律报 critical
+  「SQL Server 服务未处于运行状态」。实测引擎 `Running`，只有 `SQL Server 代理` 是 `Manual + Stopped`
+  （Manual 正是微软出厂默认），却被报成实例不可用；同一循环还把全文服务的 Manual 报成"启动类型非自动"。
+  现新增 `_is_engine_service()`：**首选 `filename` 是否含 `sqlservr.exe`**（引擎 / SQLAGENT.EXE /
+  fdlauncher.exe / sqlbrowser.exe 互斥且唯一），`filename` 未采到时按服务名回退；**只有引擎停止才 critical**，
+  代理停止且 `agent_jobs` 非空时才降为 medium（无作业则不报）。
+- **P0-2 备份去重**：`BACKUP.FULL`（`hours is None or > limit`）与 `BACKUP.NO_BACKUP`（整表遍历）
+  都覆盖"从未备份"。实测 `backups` 与 `no_backup_databases` 两表的库名完全相同（4 个库），
+  于是同一件事报出 8 条 critical。现 `BACKUP.FULL` 只管"有记录但超期"；若某库不在无备份清单里仍**兜底报**
+  （不拿"去重"换"漏报"）；`no_backup_databases()` 在模块未采到时 `gap()` 登记未判断。
+- **P0-3 系统库降级**：整份 `rules.py` 唯一的系统库排除只在 `DB.QUERY_STORE` 一处硬编码，
+  其余同类规则都没有 → 19 条 finding 落在 master/model/msdb 上，其中 6 条是 critical。
+  规则包新增 `system_database_guard`（`databases=[master,model,msdb]`、`severity_cap=low`、
+  `applies_to` 7 条规则），由 **`RuleEngine.add()` 统一施加** —— 它是 finding 的唯一出口，
+  故不存在"某个规则漏改"；**只降不升、且只对 `applies_to` 生效**（`MEM.CACHE_IMBALANCE` 的 msdb
+  反映业务库缓冲不足，是真实问题，不降）；`tempdb` 仍由 `excluded_databases` **整条不评价**（语义不同）。
+  顺带把 `DB.QUERY_STORE` 的硬编码列表改为 `system_database_guard ∪ excluded_databases`（行为等价）。
+
+**效果（真机包 46 模块）**：findings 35 → 30，**critical 9 → 1**，high 6 → 4，medium 18 → 9，low 2 → 16；
+改后唯一的 critical 是业务库未备份 —— 正是本该突出、却被 8 条噪音淹没的那条。
+
+**证据**：守门 `tests/test_sqlserver_rule_semantics.py`（**19 条**，纯构造快照、不依赖真机包）；
+反向验证（逐一破坏三处修复）分别触发 **4 / 2 / 1** 条失败，恢复后**逐字节一致**且 19 全绿；
+全量 pytest **5 failed / 245 passed**（5 项与改前逐条同名，均为 MySQL 侧预存在）→ **零新增回归**；
+基线 `baselines/sqlserver/current/baseline.json` 的 `expected_summary` 刷新为
+`health_score 0 → 6`、`risk_register 24 → 20`、`severity_counts 8/5/10/1 → 1/4/7/8`、
+`triggered 14 → 13`、`passed 33 → 34`，`collection_quality / sections / items / charts` **四项未变**
+（该基线包是外部实现 collector 1.1.0，无「SQL Server 服务与启动参数」模块，故 P0-1 对它无影响）。
+
+未做：健康分线性无下界（真机包改后扣分 110 仍是 0 分，修复效果在报告首页看不出来）、
+图表共享层/剔首采样点/OS 采样补图、`04_risk_distribution` 死代码清理。
+详见 `docs/sqlserver-collector-gap-plan.md` §22、`docs/sqlserver-analysis-review.md`。
+
+### 22.39 报告详细度批：检查项结论 / 口径说明 / 扣分口径 / 待确认事项（分析层，2026-10-08）
+
+- **触因**：用户对照 MySQL 现场报告指出「SQL Server 报告没有 MySQL 详细」。对照后确认**不是采集缺口、也不是 Word 引擎问题** —— 同一个共享引擎、同一个 `professional` 布局；差距全在呈现层没给检查项写结论与口径，外加适配器把新字段静默丢掉。详见 `docs/sqlserver-report-detail-gap.md`。
+- **P0-1/P0-2**：新增 `plugins/sqlserver/analysis_text.py`（LF，1866 行）——60 条 `(section_id, title) → 分析结论` 注册项，每条含实测数字与口径边界，并同时产出 `display.note`（含「正文展示前 N 条，共 M 条」自动截断提示）。由 `presentation.py` 的 `_build_sections` 末尾 `decorate_sections()` 统一施加（presentation.py 只加 2 行接线）。
+- **P0-3**：`metrics.SEVERITY_WEIGHTS` 提为**单一来源**（score() 与报告模型共用）；`presentation` 的 `health_assessment` 补 `counts`（引擎读的是这个名字，不是 `severity_counts`）+ `scoring_policy`。
+- **P1-2**：`CONFIRMATION_TEMPLATES`（30 条规则）+ `pending_confirmations()` —— 按已触发规则派生「待客户确认事项」，只收「必须客户拍板/提供外部证据」的项，容量/参数/对象治理类技术性整改项一律不进表。
+- ★ **共享层唯一改动**：`word_engine.build_summary_v31` 原先恒把 `critical` 并入 `high` 参与扣分算式。MySQL 没有 critical 档所以一直无碍，但 **SQL Server 的 critical=18、high=10**，合并会让首页算式与实际分数对不上。改为「policy 里有 `critical` 键就单独一档，没有则退回合并」→ **MySQL 输出逐字不变**（`test_word_engine.py` 的 hash 校验通过即为证）。
+- ★ **新根因：链路断在适配器（第二次）**：`report_adapter.adapt_report_model()` 是**重建**模型而非透传，它自拼 `health_assessment` 只取 `severity_counts` → 丢掉 `scoring_policy`（首页「结论速览」不出现）与 `pending_confirmations`（第 19 章仍为空章）。与 §22.38 的「附录规则执行状态三行恒 0」同类：**适配器不认识的键会被静默丢弃**。已补两个透传 + 「缺字段必须保持 None」。
+- **实测**：正文文字量 3,070 → **7,848**（+156%，已超 MySQL 的 5,090）；总文本 26,724 → **38,223**（+43%）。总文本仍低于 MySQL 是**结构性**的（MySQL 是三节点集群，风险册/整改计划/证据索引按节点数放大；单节点折算约 22,390 字，低于 SQL Server 单实例的 38,223 字）。
+- **验证**：新增 `tests/test_sqlserver_report_text.py`（20 项/30 subtests，四类断言：AST 静态结构对账 / 运行时覆盖 / 口径一致 / 待确认清单）；**反向验证 13 处破坏全部被抓住**（其中「适配器不透传」初次未被抓住 → 暴露盲区 → 据此补 `AdapterPassthroughTests`）；全量 pytest **5 failed / 265 passed**，5 项与改前逐条同名 → **零新增回归**。
+- **未做**：P1-1 单实例「高风险项速览」（引擎要求 finding 带 `node`，共享层改动影响四库）；图表统一到 `inspection_core.charts`。
+
+### 22.40 报告及格线三条：速览缺节 / 空数据项消失 / 参数结论丢主语（分析层 + 共享引擎，2026-10-09）
+
+- **触因**：用户对照外部参考报告《某三甲医院 SQL Server 巡检报告》问三件事——参数建议缺不缺、IO 采没采/展示没展示、
+  为什么 MySQL 有「综合结论 + 高风险项速览」而 SQL Server 没有。核查后确认**三项里两项是及格线缺陷**：
+  数据采到了、判据也判了，坏在呈现层。详见 `docs/sqlserver-report-detail-gap.md`。
+- **P1 单实例无「高风险项速览」**：★**共享引擎的既有盲区** —— `word_engine.py` 的 `highlights` 筛选条件带
+  `and finding.get("node")`，而 `node` 键**只在多实例输入时注入** → 单实例报告整节不渲染。四个库通用。
+  修法：删掉 `node` 条件（本节与节点数无关），筛选口径改 `severity in {"critical","high"}` 与首页一致
+  （MySQL 无 critical 档 → 对那边等价于原逻辑）。另修掉口径里硬编码的「见第 12 章」——风险登记册在
+  MySQL 是第 12 章、**SQL Server 是第 17 章**。表头「节点」列改为按需出现。
+- **P2 空数据检查项整项消失**：`presentation.py` 里 6 项用 `if rows:` 包住 `append(...)` → 空数据即整项不见，
+  读者无法区分「查了没有」与「没查」。改为**无条件 append + `display.empty_text`**，并新增模块级
+  `_blank_note(collection, confirmed)` 按 `collection.status` 分叉：`success_no_data` 才说「已检查…未发现」，
+  其余说「**本项未完成评价（未采集或采集不完整），不能据此判定为没有问题**」。涉及 `缺失索引候选`、
+  `未使用索引`、`陈旧统计信息`、`索引碎片`、`可疑页面`、`孤立用户`。★初版把 6 项文案全写成「已检查…未发现」，
+  其中三项实际是 `not_evaluated`（深度检查未启用）→ 会变成客户会当真的假话，已按状态分叉修正。
+- **P2 参数结论丢主语**：`_inject_analysis` 中一个检查项命中多条规则时，各条依据/建议拼进同一格且不带主语，
+  实测串成「…物理内存=4095 MB；当前值=5；」——那个「当前值=5」是 `cost threshold for parallelism` 的。
+  新增 `_label()`：**仅多条时**加 `object_name：` 前缀，值已以该名开头则不重复加。
+- **共享层改动两处**：`word_engine.py` 的 `highlights` 筛选 + `render_inspection_item` 支持 `display.empty_text`。
+- **实测（9/24 真机包，同一套工具，改前 → 改后）**：Heading 2 **76 → 83**（+1 速览节 +6 空数据项）；
+  `sections` 14 不变、`items` **42 → 48**；正文文字量 8,844 → 9,518、总文本量 39,219 → **41,460**；
+  段落/表格数 3,139/76 → 3,219/77。首页「高风险 5」与速览 5 行（严重 1 + 高风险 4）口径一致。
+- ★**控制变量自证**：改 P1 使 MySQL 报告冻结 hash 变（`A9F7C279…` → `E64A9473…`）。证明差异只来自新增速览节的方法
+  是「**改代码、不改 model**」—— 把筛选条件临时改回带 `node` 的旧形态、`report_model` 一字不动重渲染，
+  hash 精确回到旧值（`_work/_ctrl_hash2.py`，`finally` 逐字节复原断言）。用「改 severity」做控制变量是不干净的：
+  那列同时也进风险登记册，hash 必然变。
+- **守门**：`tests/test_sqlserver_report_text.py` 新增 3 类 / 10 项（全文件 30 项 / 47 subtests）——
+  `SingleInstanceSummaryTests`（速览行数 == `{critical,high}` 条数、表头无「节点」列、口径不含「第 12 章」）、
+  `EmptyItemRenderingTests`（**AST 静态**找出写在 `if` 体内的 `append`，与 6 项白名单求交为空）、
+  `MultiRuleEvidenceLabelTests`（两条加主语、单条不加）。
+- **回归**：全量 pytest **5 failed / 275 passed / 147 subtests**，5 项与改前逐条同名（MySQL 源包缺失，预存在）
+  → **零新增回归**；排除新增测试文件后 245 / 100，加其 30 / 47 正好回到 275 / 147。
+- **未做**：参数建议值列、IO 次数展示与延迟口径、跨项因果串联、逐域综合结论重写；
+  「近 7 天备份历史 / 还原验证历史 / 活动阻塞 / 失败作业 / 错误日志 / 7 项 HA 明细」属同类但**各有明确设计意图**，
+  已登记进基线 `refresh_notes`，未动。
+
+### 22.41 第 1 章着色补强：首页计数 / 1.1 状态格 / 1.2 风险项名 / 1.3 处置列（共享引擎，2026-10-09）
+
+- **触因**：用户问「风险 为什么我的文章中没标红」。逐 run 读交付 docx 的字色后，结论是
+  **「风险」本来就是红的** —— 缺口在别处（详见 `docs/sqlserver-report-detail-gap.md`）。
+- **实测现状（着色前）**：首页计数表「高风险 5」与 1.3「立即处理 5 项」均为 `#111111` 常规、**无着色分支**；
+  1.1 状态列与 1.2 风险项名有字色（`9B1C1C` / `B26A00`）、**无底纹**；底纹机制 `RISK_MATRIX_STYLES`
+  只被 MySQL 多节点报告的「风险分级×节点矩阵」用上，SQL Server 单实例不生成那张表 → 全篇零底纹。
+  着色代码本批之前就在（HEAD 里是上下文行），`_prev_report.docx` 同样是红的 → **不是本批改坏的**。
+- **五处改动（全在 `inspection_core/word_engine.py`）**：① 首页计数表四格按档给字色（高 `9B1C1C` /
+  中 `B26A00` / 低 `6B5A00`，加粗；总分格随「高风险」列同档）；② 1.1 状态格按 `status` 加底纹
+  （risk→`EFD2D2`、attention→`FBF0DC`、normal 不着色）；③ 1.2 风险项名按 `severity` 加底纹
+  （critical→`EFD2D2`、high→`F6DEDE`）；④ 1.3 处置列按 P1/P2/P3 给字色，为 0 不着色；
+  ⑤ 新增 `SUMMARY_STATUS_FILLS`，**派生**自 `RISK_MATRIX_STYLES`（同档位只允许有一个色值）。
+- **三条设计约束**：为 0 的档不着色（「0 项」不该像警报）；只给「标签格」上底色、不动整行
+  （底色是标签不是背景板）；总分格与「高风险」列同档（它是各档扣完的结果，不是独立判断）。
+- ★ **控制变量自证**：着色使 MySQL 冻结 hash 变（`E64A9473…` → `D34B7A1B…`）。把这 5 处逐字改回旧形态、
+  `report_model` 一字不动重渲染，hash 精确回到 `E64A9473…`（`_work/_ctrl_hash3.py`，finally 逐字节复原 +
+  复原后重渲染一致性双断言）。
+- ★ **新增守门 `SummaryColoringTests`（5 项，`tests/test_word_engine.py` 12 项）**。理由：**着色是纯呈现层，
+  丢了不会有任何功能性失败**，全量测试照样绿，静态 AST 对账也看不出来 —— 只能读渲染结果的 run 字色与
+  `w:shd` 底纹。该类当场抓出一条不精确断言：`正常` 行落在隔行斑马纹上，底纹是 `FAFAFA` 而非"无底纹"，
+  断言应写成「不属于档位底纹集合」而不是 `assertIsNone`。
+- **实测（9/24 真机包）**：首页四格 `9B1C1C`/`9B1C1C`/`B26A00`/`6B5A00`；1.1「风险」格 `9B1C1C`+`EFD2D2`；
+  1.2 critical 行 `EFD2D2`、high 行 `F6DEDE`；1.3「立即处理 5 项」`9B1C1C`。结构零变化
+  （`sections` 14 / `items` 48 / `risk_register` 30 / 篇幅文字量三项全同），文件字节 321,261 → 321,335。
+- **回归**：全量 pytest **5 failed / 280 passed / 147 subtests**，5 项与改前逐条同名（MySQL 源包缺失）
+  → **零新增回归**（passed 275→280 正是新增的 5 项着色守门）。
+- **待办（用户选"先不动，记进清单"）**：`plugins/mysql/presentation.py` **2881 / 2918 行**仍写死
+  「见**第 12 章**风险登记册」（2879 / 2909 为注释）。共享层那处已改，MySQL 侧未跟上 →
+  重出 MySQL 报告后口径将不一致。下次 MySQL 批次一并收口。
+
+### 22.42 章节顺序与目录对齐：config 上移 / 目录漏排一章 / 3.4 标题名不副实（共享引擎 + SQL Server 插件，2026-10-09）
+
+**触发**：用户审阅 20 章目录，问「3. 实例与数据库概览 和 15. 实例关键配置 是不是应该在一起」。
+核对后确认**顺序确实不对，并顺带挖出一个更严重的既存缺陷**。
+
+- **① 「实例关键配置」上移**（`plugins/sqlserver/word_report.py`）。渲染顺序的**唯一来源**是 profile 的
+  `section_order` 元组 —— `presentation.py` 里 14 个 `sections.append` 的顺序**不影响渲染**
+  （引擎按元组排序，见 `word_engine._ordered_sections`）。把 `config` 从第 13 位提到 `instance` 之后
+  （渲染为第 4 章）。理由：概览讲实例是什么样（版本 / 库清单 / 容量）、配置讲它被怎么配的
+  （内存上限 / MAXDOP / 开销阈值），合起来才是实例画像；而 `内存 / 容量 / 性能基线` 三章讨论的
+  资源上限正是这一章的配置事实 —— 原先要读到第 15 章才知道 `max server memory` 配成了多少。
+  MySQL profile 与外部参考报告都是「实例 → 配置」紧邻，只有 SQL Server 侧排在倒数第二。
+- **② 目录漏排「待客户确认事项」（P0，四库通用）**（`inspection_core/word_engine.py` 目录生成）。
+  professional 布局正文有 **5 个尾部章节**（风险登记册 `3+n` / 分级整改 `4+n` / 待客户确认事项 `5+n` /
+  综合结论 `6+n` / 附录 `7+n`），而目录只列了 **4 个** —— 「待客户确认事项」在正文是第 19 章，
+  目录第 19 项却写成「综合结论与管理建议」，**其后每一项都比正文少 1**。目录与正文各自都「读得通」，
+  只有对账渲染结果才看得出来。legacy 布局无此问题（尾部只有 2 章且已对齐）。
+- **③ 3.4「服务与启动参数」改名「服务运行状态」**。该项来源 `sys.dm_server_services`，渲染的是
+  服务 / 账号 / 启动类型 / 状态 / 程序路径 / 上次启动 —— **一个启动参数都没有**。读者会在这里找
+  `max server memory`，找到的却是 `Automatic`。改 `presentation.py` 的 item title +
+  `analysis_text.py` 的 `@_spec("instance", ...)`（装饰器按 `(section_id, title)` 匹配，漏改会静默退回
+  默认文案）。**采集端模块名「SQL Server 服务与启动参数」不动** —— 那是 collector 契约
+  （`inspection_rules.json` / `module_catalog.py`），与报告显示名无关。
+- **④ `presentation.py` 14 处序号注释改为 section_id 形式**。`# 1.` ~ `# 14.` 是按 `append` 顺序写的，
+  config 上移后 `# 13. Configuration` 会实际渲染成第 4 章 —— 注释当场变错。这是「硬编码章节号」的
+  同类问题，只是藏在注释里。
+- **⑤ 守门 `TableOfContentsAlignmentTests`（2 项，`tests/test_word_engine.py`）**。新增模块级
+  `outline_and_contents()`，取「目录页条目序列」与「正文 H1 序列」逐项比对（legacy + professional 双覆盖）。
+- ★ **原测试给错误背书**：`test_word_engine.py` 原用 `assertIn("14. 综合结论与管理建议", 全文)` 断言 ——
+  `assertIn` 是全文包含检查，而**目录页里恰好写着这两行错编号**，于是断言命中的是目录、不是正文。
+  这类失效模式和 AST 对账盲区同源：**断言形式与被测对象不匹配，绿色不代表正确**。
+- **影响面实测**：改顺序只需动一处元组；章号由程序按顺序算（`enumerate(sections, 3)`），目录与正文
+  自动一致；SQL Server 侧已无硬编码「第 N 章」（上批清的），全篇正则扫描零命中；MySQL 冻结 hash 用
+  `legacy` 布局、本次只改 `professional` 分支的目录 → **hash 未变**；基线 `expected_summary.sections`
+  是计数（13）不是列表 → 不受影响；Oracle / PG 测试用集合断言 → 不受影响。
+- **实测（9/24 真机包，重跑 `analyze` → `generate_report`）**：目录与正文均 **21 章**、逐项一致
+  （改前 21 / 20，从第 19 章起错位）；第 4 章为「实例关键配置」（4.1 关键配置项 / 4.2 本章分析结论）；
+  第 3.4 为「服务运行状态」，3.6 结论表项名同步跟随。
+- **回归**：全量 pytest **5 failed / 282 passed / 147 subtests**，5 项与改前逐条同名（MySQL 源包缺失）
+  → **零新增回归**（passed 280→282 正是新增的 2 项目录对账测试）。
