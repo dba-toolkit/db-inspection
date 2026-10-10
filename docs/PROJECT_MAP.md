@@ -2172,3 +2172,634 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   第 3.4 为「服务运行状态」，3.6 结论表项名同步跟随。
 - **回归**：全量 pytest **5 failed / 282 passed / 147 subtests**，5 项与改前逐条同名（MySQL 源包缺失）
   → **零新增回归**（passed 280→282 正是新增的 2 项目录对账测试）。
+### 22.43 SQL Server 采集⇄分析层对账（只读审计，未改代码）
+
+- 新增 `docs/sqlserver-collector-analysis-alignment.md`：机器化双向差集 + 真机产物核对。
+- **对得上的**：49 个快照键 ⇄ `module_catalog.MODULE_BY_SNAPSHOT_KEY` 49 键逐键一致；规则包 66 条 ⇄
+  `rules.py` 实际请求 66 条（无死规则 / 无幽灵规则）；`thresholds` 47 键零死键；`required_modules` 零非法名。
+  **契约层不需要动。**（规则包里 5 条 `SEC.*` 静态看着像死规则，实为 `f"SEC.{name.upper()}"` 动态拼出，属正则假阳性。）
+- **采了却完全没出口的模块 = 0**：49 键全部至少进了报告表格。
+- ★ **P1① 结论被注错检查项**：`_inject_analysis` 的映射键 `('memory', '内存')` 是 **title 子串匹配**，
+  命中同一章节三项 → 「内存组件分布」「系统内存状态」被注入 `MEM.SIGNALING`/`MEM.PRESSURE`。
+  真机产物三项结论**逐字相同**（`SQL Server 内存利用率极高（SQL Server Process）`）。收窄匹配即可，
+  回落文案 `analysis_text.py` L459 / L479 已存在，无需新写。
+- ★ **P1② 状态与结论自相矛盾**：「数据库清单」status=`normal`，结论列却是三条风险陈述。根因是**两个算式不同源** ——
+  三条 finding 全被 `system_database_guard`（`severity_cap: low`）降级或本身 low → status 算式只剩 low 判 `normal`，
+  而结论列照抄 finding title。凡"命中的全是 low 档"的检查项都会出现。推荐 status 补一档（全 low → attention）。
+- **P2 字段级漏展示**：`instance` 的三个默认路径（data/log/backup）/ `is_integrated_security_only` /
+  `product_update_level` / `version_banner` / `os_service_pack_level` / `os_sku` / `engine_edition`；
+  `volumes.source`（表缺列，而 `analysis_text` 已在用它写结论）；`job_steps.command_preview`
+  （**零消费且属隐私敏感字段**，要么脱敏后展示、要么从采集端移除）。
+- **P2 契约/文档**：`package_adapter.normalize_snapshot` 的 `setdefault` 漏 8 键
+  （`session_activity`/`server_services`/`memory_clerks`/`system_memory`/`ha_status`/`os_metrics`/`job_steps`/`restore_history`，
+  有 `.get(k, [])` 兜底故不崩，但契约声明的键集名不副实）；`docs/sqlserver-collector-interface.md` §5 写
+  manifest = `files[] + sha256`，**采集脚本实际只写文件名列表**（`$manifest.files=@(...)`）—— 文档与实现不符。
+- **少分析（采了但无阈值判据）16 个模块**，其中只有 `wait_stats` 建议补判据（参照 MySQL 有 `LOCK.WAITING` 等），
+  其余按诊断型数据保留展示即可；16 项**都有 `analysis_text` 定制文案**，属"有分析、无判据"。
+- 核对脚本（只读，`_work/`）：`_crosscheck.py`（契约对账）/`_field_diff.py`（字段差集）/`_dump2.py`（产物逐项）。
+- 未改任何代码；P1 三条待用户拍板。
+
+### 22.44 SQL Server 对账 P1/P2 处置（改代码 + 补判据 + 文档更正）
+
+- **P1①「内存章三项结论逐字相同」已修**：`presentation._inject_analysis` 的 `_map` 把
+  `('memory', '内存')` 收窄为 `('memory', '进程内存')`。**控制变量自证**（同一 9/24 包、只把该行改回旧形态）：
+  修复前「内存组件分布」「系统内存状态」status=`risk`、结论与「进程内存状态」**逐字相同**；
+  修复后两者回落 `normal` + 各自定制文案（clerk 账本 / 整机内存）；**内存章以外 43 项差异 0**。
+  （注：回归基线用的 7/28 包没有 `memory_clerks` / `system_memory` 两键，内存章只渲染 2 项，看不出差异 ——
+  必须用 9/24 包（46 模块）验证，与「源包须与报告封面日期一致」是同一类坑。）
+- **P1②「状态正常 / 结论风险」并排已修**：status 算式补 low 档（`severities & {'medium','low'}` → attention）。
+  同包 A/B：48 项中仅 2 项变化（`数据库清单`、`数据库文件与IO`，normal → attention），
+  分布 normal 34→32 / attention 6→8；其余 46 项不变。
+- **P1③ 新增 `PERF.WAIT_TOP`（线索型，severity=low）**：`wait_stats` 是唯一「采了、有文案、零判据」的模块。
+  判据 = 白名单类型（PAGEIOLATCH_ / IO_COMPLETION / WRITELOG / RESOURCE_SEMAPHORE / THREADPOOL / LCK_M_ /
+  ASYNC_NETWORK_IO）+ 累计门槛 `wait_attention_min_ms`（默认 60000ms）。**良性类型（CXPACKET / SOS_* /
+  PREEMPTIVE_* / MEMORY_ALLOCATION_EXT）刻意不收录** —— 健康实例里 SOS_WORK_DISPATCHER 累计占比 >60%。
+  两个真机包均不触发（候选只有秒级零头），触发路径由构造快照守门测试证明。
+- **P2 `volumes.source` 已补列**：「存储卷容量」表加「来源」列（DATABASE_FILE / XP_FIXEDDRIVES / BACKUP_MEDIA），
+  否则同一挂载点的多来源行会被读成重复行。
+- **P2 文档更正 + 豁免登记**：`docs/sqlserver-collector-interface.md` §5 的 manifest 描述由
+  `files[] + sha256` 改为实情（**只有文件名列表，无哈希**），并说明按 manifest 做完整性校验目前做不到；
+  §4-33 与 §10-7 登记 `job_steps.command_preview` 为「有意保留采集、报告不展示」（留档证据，避免把可能含
+  明文口令的命令行带进交付报告），**不是**「采了没人读」的漏项。
+- **新增守门测试** `tests/test_sqlserver_wait_rule.py`（10 项）：良性静默 / 零头静默 / 命中出低风险线索 /
+  次要候选并入 evidence / 提示按类型定制 / 标题不重复对象名 / 门槛是活旋钮 / 未采集不算通过 / 目录登记 / 阈值声明。
+- **用户未选（保留在清单）**：其余 15 个诊断型模块不补判据；`normalize_snapshot` 补 8 键；
+  其余漏展示字段；逐域重写综合结论。
+- **回归**：全量 pytest **5 failed / 292 passed / 148 subtests**，5 项与改前逐条同名（MySQL 源包缺失）
+  → **零新增回归**（passed +10 即新测试文件）。baseline `expected_summary` **未改**：7/28 包
+  `risk_register` 仍 20（新规则不触发）、`health_score` 仍 6，`tests/test_sqlserver_analyzer.py` 实跑对照通过。
+- 证据脚本（`_work/`，均含逐字节复原断言）：`_apply_changes.py`（补丁）/ `_ab_verify.py`（① 差异隔离）/
+  `_status_ab.py`（② 影响面）。
+
+### 22.45 Oracle 采集脚本审查（只读，产出两份契约文档；未改代码）
+
+- 产出：`docs/oracle-collector-fix-plan.md`（28 条 `OF-NN` + 批 0–4）+ `docs/oracle-collector-interface.md`（10 节），
+  与 `mysql-collector-*` 同级，作为 Oracle 侧下游唯一对接依据。
+- **本机实测的三条硬证据**：① `sanitize_filename` 吃掉全部中文 → 抽取脚本里 136 条 `ora_sql_to_md` 标题实跑，
+  **唯一 item_id 只有 66 个，48 条塌陷到 `sql.`**（模块名同理塌到 `module.` / `module.AWR` / `module.RAC`），
+  而 `record_status` 是**覆盖写** → 整份 `status/` 台账失真（P0，与跨库能力矩阵"不保留 Oracle item 缺少稳定 item_id"
+  同源）；② `tables/*.tsv` 实际是 `SET COLSEP '|'` 的**竖线分隔** + 空结果只写 `# no rows returned` 注释（无列名），
+  "TSV" 名不副实（P0）；③ 关键符号在 Oracle 脚本中出现 **0 次**：`run_with_timeout` / `resolve_ipv4` /
+  `is_local_connect_target` / `TARGET_IS_LOCAL` / `database_target_is_local` / `time_evidence` /
+  `collection_status` / `capabilities` / `COLLECTION_INCOMPLETE` / `--output-dir` → OS 数据归属无法证明
+  （违反 AGENTS.md 硬规则）、时区证据缺失（且 `sadf -d` 无 `-t`，两条退路都没有）、OS 采集命令无超时。
+- **OS 层结论**：结构化 OS 采集（`collect_system_static` 20 项）与 MySQL 版**基本同源、已对齐**，不用重做；
+  差距在归属/时间基准/超时四件事，外加 Oracle 专属视图缺口（`ipcs` SysV SHM、`/proc/meminfo` 的
+  `HugePages_Total/Free`、`multipath -ll`、`oracleasm listdisks`、`lsmod`、`/etc/oratab`、`ip -s link`）
+  与 limits 三层口径（`limits.conf` 只读一个文件、缺 `limits.d/*.conf`、缺进程级 `/proc/<pid>/limits`）。
+- 结构判定：**骨架不乱、边界乱**（OS 采集两套并存、item_id 派生、category 用 catch-all 的 `sql`/`module`、
+  工作目录与产物目录混用）；注释密度 **4.7%** vs MySQL 15.8%，属"难点零星注释、接口一行没写"，
+  四个改一处影响全部 item 的底层函数（`ora_sql_to_md`/`record_status`/`capture_command`/`classify_failure`）零注释。
+- 两条**已自查撤回的误报**：`get_ora_conn` 是 `get_ora_conn` 的别名（不是未定义函数）；
+  `|` 分隔是有意绕开"sqlplus 无法输出裸 TAB"，错在命名与空结果占位，不在分隔符本身。
+- 现行基线不受影响：本次**未改任何脚本与代码**，`tests/compare_analysis_outputs.py` 无需重跑。
+
+### 22.46 Oracle 采集包实测复核（真实包验证，回填两份契约文档；未改代码）
+
+- 输入：真实采集包 `oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`
+  （211 文件 / 438 KB / `collector_version` **1.4**，与工作副本一致 → 结论对应当前代码）。
+  实例：ZYDB / zydb1 / db01 / 19.16.0.0.0 / 单机 / 无 ASM / 非 CDB / PRIMARY；采集耗时 42s；**本地采集**（`host=127.0.0.1`）。
+- 产出：`docs/oracle-collector-fix-plan.md` 新增 **§0.5 实测复核**（并把原 §0.5/0.6/0.7 顺延为 §0.6/0.7/0.8）；
+  `docs/oracle-collector-interface.md` 新增 **§11 实测验证包（基线）**，并回填 §6.1/6.2/6.3/§7 的实测值。
+- **原 C 档 8 条全部落定**：OF-09 / OF-15 / OF-18 / OF-27 确认；**OF-07 与 OF-26 修正口径**；
+  OF-05 / OF-14 / OF-19 仍无法验证（需构造场景）。**两条口径修正**：
+  ① `sadf -d` 不带 `-t` **不是 Oracle 独有**（MySQL L973 同样不带），真正差距只是缺 `time_evidence` 结构化字段；
+  ② OF-26 原标题"删掉错误原文"**偏重** —— 实测 `reason` 里保留了错误原文（如 `506 Cannot talk to daemon`），
+  丢的是"第 5 行之后"与"不落模块日志"。**一条误报澄清**：`history/coverage.tsv` **存在且完整 6 行**，
+  原文"缺 coverage.json"表述准确（缺的确实只是 `.json` 那份）。
+- **台账塌陷精确量化（实测）**：136 标题 → **66 个唯一文件名**，**11 组塌陷 / 70 条被覆盖丢弃**，
+  最大组 `sql.` ← **48 条**。实测 `status/sql.*.tsv` = **47** vs `tables/` SQL 结果文件 = **98** → **错位 51**；
+  `status/module.*.tsv` = **11** vs 主流程 `run_module` = **27** → **丢 16**。
+- **新增三条契约缺陷（实测-1/2/3）**：
+  ① `status="empty"` 在 `ora_sql_to_md` 路径**永不触发**（判据 `grep 'no rows selected' "$err_file"` 读的是 stderr，
+  而该消息在 stdout）→ 实测 **34 个**空结果项 status **全为 `ok`**；
+  ② `tables/` 用 `tsv_filename()`（保留中文）、`status/` 用 `sanitize_filename()`（吃中文）→ **两套规则永不相等**，
+  且 `record_status` 第 9 列对 SQL 项恒为 `report`（不指向 tables 文件）→ **两个入口之间是断的**；
+  ③ `module` 层只塌文件名（内容第 1 列保留完整中文，**可恢复**），`sql` 层内容一起塌（**不可恢复**）。
+  → 批 1 里 **OF-01 与实测-2 必须同一次改完**，**实测-1 并入 OF-02**。
+- **两个数据口径坑（供 adapter）**：① `ora_version` 两处不一致（`snapshot`=19.16.0.0.0 来自 `version_full`
+  vs `tables/实例信息.tsv`=19.0.0.0.0 来自 `version`）；② 时间基准双轨（`history/sar_*.csv` 是 **UTC**，
+  `timeseries/*.csv` 是 **+08:00**，且 `snapshot` 无一字段声明）；③ `collection_started_at` 用 `_` 分隔，
+  与 `status`/`manifest` 的 ISO 8601 不同。
+- **判读前提（重要）**：该实例 `startup_time = 2026-10-09 22:45:17`，**采集时刚启动 2 分钟** → 包内 34 个空结果
+  （RMAN 历史 / Scheduler / 归档量等）**主要是"新实例无历史数据"，不是采集缺陷**；评"覆盖度"要扣掉这层。
+- 安全：解包产物落在 `_work/orapkg/`（已被 `.gitignore` 忽略，`*.tar.gz` 亦忽略）；**未改任何脚本与代码**。
+
+### 22.47 Oracle 采集器「批 0」实施（OF-28 去重 + OF-24 注释补全；改脚本，逻辑零改动）
+
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。批 0 定义见 `docs/oracle-collector-fix-plan.md` §0.7。
+- **OF-28**：删除 `safe_relpath()` 的**重复定义**（原 L391 / L3202 逐字相同），保留工具函数区那份。
+  改后定义 **1 处**（L436）、调用 **2 处**（L458 / L3377）；函数数 87 → **86**。
+- **OF-24**：补注释。做法 = **只新增 `#` 行、绝不动任何既有行**（脚本 `_work/_annotate_oracle.py` 按
+  「函数定义行前插入」逐条插入），因此逻辑零改动是**构造保证**，不靠人眼。
+  - L1 文件头：补「产物清单 + 两个入口（snapshot.json / status）+ 契约指向（interface / fix-plan）」。
+  - L2 阶段分隔：新增 `环境探测` / `模块执行框架` / `采集器：OS` / `采集器：数据库` / `采集器：sar 历史与实时采样` /
+    `输出：JSON / manifest / 打包` 六处，与既有 `工具函数`/`主流程` 分隔同风格。
+  - L4 引擎区：`ora_sql_to_md`（支配 136 项，原来**零注释**）、`record_status`、`capture_command`、`classify_failure`
+    给出完整「做什么 + 已知缺陷（OF-01/02/03/04/26）」注释。
+  - L5：**86 个函数逐个补头注释**（含 `get_ora_conn` 的「名古怪但非笔误」澄清）。
+- **验证（可复跑）**：`bash -n` 通过；指纹法 `diff <(grep -v '^\s*#' f | grep -v '^\s*$')` 改造前后 **逐字节一致 ✓**；
+  `diff 改造前 改造后 | grep '^>' | grep -vc '^> #'` = **0**（新增的 138 行**全是注释**）。
+- **注释密度**：4.7%（170/3584）→ **8.3%**（308/3722）。⚠ 未达 fix-plan 所写的 ≥20% 目标 ——
+  该脚本约一半行是函数体内的**内嵌 SQL 文本**（不可注释），20% 只能靠灌水；MySQL 版实测 15.8% 才是同代码库的真实上限。
+- 未做：批 3 / 批 2 / 批 1 / 批 4（含全部 P0：OF-01/02/03/06/07）。
+
+### 22.48 Oracle 采集器「批 3」实施（OF-05 打包状态 + OF-10 口令走 stdin + OF-17 退出码契约）
+
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。批 3 定义见 `docs/oracle-collector-fix-plan.md` 批 3 章节。
+- **OF-10（口令不再进 argv）**：新增统一执行入口 `ora_exec()`（L560）——`sqlplus -S /nolog` 启动，连接段
+  作为 **stdin 首行** `CONNECT …`（前置 `SET ECHO/FEEDBACK/HEADING OFF` 抑制 "Connected." 回显，保证对 `ora_value` 零污染）。
+  全脚本 **10 个 sqlplus 调用点**（`ora_try` ×2 / `ora_sql_to_md` ×2 / AWR ×2 / plan / 连接测试等）统一改为 `ora_exec`，
+  重定向与退出码语义**不变**；替换后 `-S "$(get_ora_conn)"` 形态残留 **0 处**，`get_ora_conn` 只被 `ora_exec` 调用 1 处。
+  ⚠ 唯一行为差异：CONNECT 失败时 sqlplus 不再立即非零退出（主流程前已做连接测试，正常流程不触发）。
+- **OF-05（打包结果如实登记）**：`collect_structured_package` 重写状态判定 —— 扫描被拦 → `status=error`/`exit_code=30`；
+  tar 失败 → `error`/`31`；成功或 `--no-package` → `ok`/`0`。原先恒记 `ok`、只改 reason（与 `package.security_scan` 打架）。
+- **OF-17（退出码契约）**：全局 `FINAL_EXIT_CODE`（L108）+ 尾部 `exit "$FINAL_EXIT_CODE"`（L3776）。
+  `0`=成功 / `10`=环境准备失败（4 处直接 exit）/ `20`=连接失败 / `30`=扫描拦截 / `31`=打包失败 / `130`=中断（trap 既有）。
+  契约同时写入 `show_usage` 的「退出码」段与 `interface` §8。
+- **验证（可复跑）**：`bash -n` 通过；`_work/_verify_b3.sh`（抽真实函数 + 假 sqlplus）→ **argv = `-S /nolog`**（无口令）、`CONNECT …` 只经 stdin；
+  `_work/_verify_b3_pkg.sh`（stub 控三分支）→ `ok/0/0`、`error/30/30`、`error/31/31`；本机隔离 PATH 实跑 → `EXIT=10`；假 sqlplus 连接失败 → `EXIT=20`。
+- 同步文档：`interface` §8（退出码表，撤「过渡期不要依赖」）、§3/§4.5/§6.4/§10.1/§10.2；`fix-plan` §0.1/§0.3/§0.5.1/§0.5.5/批 3 章节/§0.7/§0.8/附录。
+- 未做：批 2（OS 增量）/ 批 1（数据正确性，需 bump schema 2.0）/ 批 4。**OF-05 由 C 档升 A 档**（stub 构造验证）；仅 OF-19 仍需现场构造。
+
+### 22.49 Oracle 采集器「批 2」实施（OS 采集：归属 / 时间基准 / 超时 / Oracle 专属视图，8 项 OF）
+
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。批 2 定义与验收表见 `docs/oracle-collector-fix-plan.md` 批 2 章节。
+  脚本 3776 → 3982 行（+206），注释密度 8.3% → 10.2%，函数 86 → 93。
+- **OF-06 归属**：新增 `resolve_ipv4()` / `is_local_connect_target()`（照 MySQL 移植）；主流程算 `TARGET_RESOLVED_IP` /
+  `TARGET_IS_LOCAL`；`_INSTANCE_ADDRESS` 改用解析后的 IP；`snapshot.json` 顶层加 **3 字段**（`database_target_is_local`（bool） /
+  `collector_hostname` / `target_resolved_ip`）；非本机时**终端 + 报告头**双披露。
+- **OF-07 时间基准**：`snapshot.json` 加 `time_evidence{}`（字段名与 MySQL 完全一致，含 `timezone` / `ntp_synchronized`）。
+  ★ **否掉了计划里的 `sadf -t`**：实测 `sadf -d` 时间戳自带 `UTC` 后缀、且 **MySQL 也不带 `-t`**（四库共性），
+  Oracle 单独加 `-t` 会破坏四库归一 → 只补 `time_evidence`，sadf 参数不动。
+- **OF-08 超时**：新增 `run_with_timeout()`，**13 处**外部命令套超时（lsnrctl 10s；chronyc / crsctl / ocrcheck / gpnptool /
+  multipath / oracleasm 15s；dmesg 20s；numactl 10s）。实测 `run_with_timeout 2 sleep 10` → rc=124、≈2s。
+- **OF-09/11/12/15 新增采集项共 10 个 item_id**（结构化 OS 项 20 → **30**）：
+  `system.ipcs_shm` / `system.asm_multipath` / `system.oratab` / `system.net_error_counters`（OF-09）；
+  `system.oracle_limits`（`tables/oracle_limits.tsv` 4 列，limits.conf + limits.d 字典序合并）+ `system.oracle_actual_limits`（OF-11）；
+  `system.oracle_processes`（`-eo pid,ppid,user,etimes,%cpu,%mem,args`；独立成函数以复用 `redact_command_stream`，OF-12）；
+  `system.oracle_env` / `system.oracle_env_full` / `system.listener_status`（OF-15）。`hugepages.tsv` 扩 `/proc/meminfo` 实测值。
+- **OF-15 收敛**：`collect_sys_info` 的「网络与磁盘 / IO / limits / 进程 / 监听 / 环境变量」6 段由原始命令输出改为**指向结构化包的指引**；
+  该函数内 `df/lsblk/ip addr/vmstat/iostat/lsnrctl/ps -ef` 残留 **0**。⚠ **md 报告由此变薄**（明细只在结构化包）——
+  若现场只交 md 需回头评估。
+- **OF-18**：`collect_sadf_metric process … -w`（`history/sar_process.csv`）+ `compute_sar_coverage` 补写 `coverage.json`
+  （7 字段，与 MySQL 完全对齐，可 `json.load`）。
+- **验证（可复跑）**：`_work/_verify_b2os.sh` → **PASS=20 / FAIL=0**（OF-06/07/09/11/12/18）；`bash -n` 通过。
+- 同步文档：`interface` §4.1（20→30 项）/ §6.1（21→25 字段 + 逐字段语义表）/ §6.3（新增 2 表）/ §10.1 / §11.5（新增增量说明）；
+  `fix-plan` 批 2 章节（加验收表 + `-t` 决策）/ §0.3 / §0.7 / §0.8 / OF-07 正文。
+- 未做：批 1（数据正确性 + 结构化契约，需 bump `SNAPSHOT_SCHEMA_VERSION` → 2.0）/ 批 4。
+
+### 22.50 Oracle 采集器「批 1」实施（数据正确性 + 结构化契约，collector/schema/package 统一 → 2.0）
+
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。批 1 定义与验收表见 `docs/oracle-collector-fix-plan.md` 批 1 章节。
+  脚本 3982 → **4276** 行（+294），注释密度 10.2% → **11.9%**，函数 93 → **100**。
+  `COLLECTOR_VERSION` / `SNAPSHOT_SCHEMA_VERSION` / `PACKAGE_VERSION` 三个全局**统一 `2.0`**（OF-21：版本单一来源）。
+- **OF-01 / 实测-2（id 与文件名同源）**：`ora_sql_to_md` **重签名**为 `<item_id> <标题> <SQL>` —— item_id 由调用方显式传入
+  ASCII 点分 id（`oracle.<域>.<项>`），**不再从中文标题派生**；136 个调用点全部改写，27 个模块改用 `oracle.module.<域>`。
+  删除 `tsv_filename()`（中文命名规则的来源）。v1.4 实测：136 项塌成 66 个文件、48 项共用 `sql..tsv`、模块塌到 `module.`。
+- **OF-02 / 实测-1（psv + empty 真实触发）**：新增 `psv_normalize()`（去 CR、竖线两侧填充空白剥净、丢空行、
+  丢纯横线分隔行（长度>4 才算，避免误删单列值为 `-` 的数据行））；结构化产物改为 `tables/<item_id>.psv`；
+  status 的 **`output_file` 列写同一路径**（原先 `tables/` 用中文名、`status/` 用 sanitize 名 → 两入口永不相等）。
+  `empty` 判据由「grep stderr 的 no rows selected」改为「rc=0 且 0 数据行」——**原判据读 stderr 而消息在 stdout ⇒ empty 永不触发**，
+  34 个空结果全被记成 `ok`。空结果写自描述占位 `# oracle-inspection psv-empty item_id=… sep=| rows=0 status=…`。
+- **OF-03 分类**：`classify_failure` 重排 + 新增 **`schema_mismatch`**（`ORA-00904`/`ORA-01722`/`invalid identifier`/`invalid number`），
+  且**排在 `unsupported` 之前**（`ORA-00904` 是脚本写错列，不是环境不支持）；新增 `is_failure_status()`。
+- **OF-04 单次连接**：一条 SQL **只开一次 sqlplus**（先落 `$tmp`，md 与 psv 由**同一份**输出渲染）→ 136 项 **272→136 次连接**，
+  消除「报告里 12 个会话 / 包里 9 个」这类两处数字打架。
+- **OF-13 / OF-16 / OF-23 进包**：新增 `collect_capabilities()` → `tables/capabilities.tsv`（命令可用性 + 4 个视图探针；
+  tsv 布尔写 `0/1`、json 写 `true/false`，字符串原样）+ `snapshot.json.capabilities`；
+  新增 `generate_collection_status()` → 包内 **`collection_status.json`**（`items[]` + `summary{}`）与 **`summary.txt`**。
+- **OF-20 `ora_value` 静默吞错**：命中 `ORA-`/`SP2-` 时写**标志文件** `${RUNTIME[STATUS_DIR]}/.ora_value_flag`
+  （`$(ora_value …)` 跑在子 shell 里，变量传不出来，只能用文件传）；新增 `ora_value_ok` 读取。
+  `detect_asm` 借此区分「查到 0 个盘组」与「没权限查」（旧版把 `ORA-00942:tableorviewdoesnotexist` 拿去 `[ -gt 0 ]`，
+  既报 `integer expression expected`，又把「无权限」静默读成「没有 ASM」）。
+- **OF-22**：SQL 项 `row_count` 记**真实数据行数**（首行是列名行 ⇒ `rows-1`），不再恒为 `-`。
+- **OF-27 snapshot 8 段**：`collector` / `host_identity` / `capabilities` / `time_evidence` / `sampling` / `privacy` /
+  `collection_summary` / `artifacts`；★ **破坏性变更**：`database_target_is_local` 由**顶层移入 `host_identity`**（schema 2.0），
+  与 MySQL 同路径；顶层 v1.4 平铺字段**保留**，旧解析器仍可读。
+- **OF-25 单一来源**：新增 `MODULE_PLAN` 数组（`module_id|中文名|函数|run|bg`，28 项），dry-run 与真实执行**同源**；
+  `run_module` / `start_module_bg` 带 `module_id`，后台任务登记进 `BG_IDS`，`wait_background_modules` 按 `BG_IDS` 收口。
+  新增 `refresh_status_tally()` 作为 summary 的**唯一**统计来源；尾部摘要补 `schema_mismatch` 计数。
+- ★ **本批自测抓出的新 P0（OF-29，已修）**：`ora_sql_to_md` 的 SQL heredoc 是**未加引号**的（必须展开 `$sql` / `${page_size}`），
+  而 bash 对未加引号的 heredoc 会做**参数展开与命令替换**。批 1 为解释 OF-02 写进 heredoc 的注释里带了反引号
+  （`分隔符选 `|` 而非 TAB`）→ bash 把这对反引号当**命令**执行 → `syntax error near unexpected token '|'` 落进 `err_file`
+  → `classify_failure` 把**正常项**判成 `error`。`bash -n` 全绿（编译期无感），只在运行期往 stderr 留一行。
+  同处的 `v$parameter.value` 也被静默吞成 `v.value`。**修法**：注释去反引号、SQL/注释里的 `$` 一律写 `\$`，
+  并在 `ora_sql_to_md` 上方写明「该 heredoc 故意不加引号 ⇒ 正文禁止反引号与裸 `$`」。**守门两道**：
+  ① `_work/_b1_make_verify.py` 生成前静态扫描真实脚本，命中即**拒绝生成**；② 自测 T10 用纯 bash 状态机复扫同一约束。
+  **通用教训**：只要 stderr 参与状态判定，就必须先保证 stderr 只可能来自被测命令 —— harness 先污染 stderr，
+  会把真缺陷伪装成 harness 假失败；反之 harness 不把 `error` 当噪音，才把真缺陷翻出来。
+- **验证（可复跑）**：`bash -n` 通过；`_work/_b1_make_verify.py` → 生成 `_work/_verify_b1.sh`（从真实脚本**逐字抽取**函数 +
+  假 sqlplus + 假目录树，**不连真库**）→ **PASS=34 / FAIL=0**（批 1 当时；同一支脚本在批 4 扩到 T13 后为 **56 / 0**，见 `### 22.51`），覆盖 T1 正常项链路 / T2 空结果 / T3 三档分类 /
+  T4 台账不塌陷 / T5 单次连接 / T6 `psv_normalize` 单元 / T7 `ora_value` 成败标志 / T8 ASCII module_id /
+  T9 台账进包 + snapshot 8 段 / T10 静态守门。
+  ⚠ 两个 harness 自身的坑已记入生成器注释：`STATUS_TALLY` 需**手工** `declare -gA`（抽取器只抽函数，不抽顶层声明，
+  否则下标被当算术表达式 → 全塌到索引 0，假失败）；给 Windows 版 python 喂 JSON 要走 **stdin**，不能传 `/tmp/…` POSIX 路径。
+- **新增文档**：`docs/oracle-collector-item-ids.md`（136 行，item_id ↔ Markdown 标题 对照，item_id 的**唯一清单**；
+  生成器 `_work/_b1_apply_ids.py` 按**标题字符串**匹配而非行号，避免行号漂移）。
+- 同步文档：`interface` §4.1（OS 项 30→**31**，+`system.capabilities`）/ §4.3（**136 个唯一 item_id** + 语法 + v1.4 塌陷对照）/
+  §4.4（模块 27→**28**，附 `module_id` ↔ 中文名 ↔ 函数 ↔ run/bg 全表）；`fix-plan` §0.3（批 1 全绿 + 新增 OF-29 行）/
+  批 1 章节（加落地记录 + OF-29 复盘）/ §0.7 / 文档头「当前状态」。
+- 未做（**已于 2026-10-10 完成，见 `### 22.51`**）：**批 4**（OF-14 `--output-dir` / OF-19 `COLLECTION_INCOMPLETE` / OF-26 `capture_command` 错误原文与模块日志）。
+
+### 22.51 Oracle 采集器「批 4」一致性与体验（OF-14 / OF-19 / OF-26 + 新发现 OF-30）→ **改造清单闭环**
+
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。批 4 定义与验收表见 `docs/oracle-collector-fix-plan.md`「批 4」章节。
+  脚本 4276 → **4386** 行（+110），函数 100 → **102**，注释密度 11.9% → **12.5%**。
+  `COLLECTOR_VERSION` / `SNAPSHOT_SCHEMA_VERSION` / `PACKAGE_VERSION` 保持 **2.0**（批 4 **无**破坏性变更）。
+- **OF-14 `--output-dir`**：`parse_args` 新增 `--output-dir=DIR` 与 `--output-dir DIR` **两种写法**
+  （空格写法要防"选项在末尾且无值"，不能无条件 `shift`）；抽出 `ensure_output_dir <dir>`（`mkdir -p` + `-d`/`-w` 双检），
+  主流程 `ensure_output_dir "$filepath" || exit 10` —— 把"输出目录不可写"并入退出码 **10**。
+  `show_usage` 的"输出文件"段改为**如实描述**（默认 `/var/tmp` + `--output-dir`），并新增"中断语义"段。
+  **没有**引入 `$(dirname "$0")` 自引用（AGENTS.md：采集脚本不得依赖自身所在目录）。
+- **OF-19 `COLLECTION_INCOMPLETE`**：`trap _trap_cleanup INT TERM HUP`（**拿不到信号名**）改为三条
+  `trap '_trap_cleanup INT/TERM/HUP'`；`_trap_cleanup` 在 `TASK_DIR` 存在时写
+  `$TASK_DIR/COLLECTION_INCOMPLETE`（首行 `partial`，第二行 `interrupted_at=… signal=…`），
+  守卫用 `${TASK_DIR:-}` + `[ -d ]`（trap 安装点早于 TASK_DIR 赋值，直接引用会空）。
+  同一次 trap 里还 `rm -rf "${RUNTIME[TMP_DIR]}"`。**下游据此判包残缺**，不必猜。
+- **OF-26 模块日志**：新增 `module_log_append <category> <item_id> <rc> <src>`，
+  把**完整错误原文**追加进包内 `logs/modules/<category>.log`（带 `item/rc` 表头）。
+  `capture_command` 在 `rm -f "$err"` **之前**调用（仅 `status != ok`）；`ora_sql_to_md` 的 `err_file`
+  除进运行日志外也进 `sql.log`。**status 的 `reason` 仍只留 5 行摘要**（下游要一句话、排查要全文）。
+  TASK_DIR 初始化新增 `logs/` + `logs/modules/`；`--no-structured` 时 `MODULE_LOG_DIR` 为空 → 函数直接跳过。
+- **OF-26 顺带（tmp 泄漏）**：新增 `RUNTIME[TMP_DIR]`，位置**刻意放在 `TASK_DIR` / `STATUS_DIR` 之外**
+  （`DIR/.oracle_inspection_tmp_<tag>_<qctime>`）—— 理由：`cp -r STATUS_DIR` 与 `find TASK_DIR` 都在收口阶段发生，
+  **只要 tmp 不在 TASK_DIR 里就"漏不进包"，不必再维护一份 manifest 排除规则**（原计划提的是 `$TASK_DIR/.tmp`，改了）。
+  `append_oracle_sysstat_sample` 改用 `if ! ora_exec … then … rm -f; return 1; fi`，**两条返回路径都删**；
+  目录在正常结束（脚本尾部）与中断（trap）时都 `rm -rf`。v1.4 的 `oracle_stat_<elapsed_ms>.tsv` 曾随 STATUS_DIR 进包并登记进 manifest。
+- **OF-30（本批新发现，已修）**：`security_scan` 的 findings 原先建在 `RUNTIME[STATUS_DIR]`，
+  而 `cp -r STATUS_DIR → TASK_DIR/status` **发生在此之前** ⇒ `record_status` 写的
+  `status/security_scan_findings.txt` **在包里永远不存在**（status 指向一个不存在的证据文件）。
+  改为 findings 先落 `RUNTIME[TMP_DIR]`（不在建包树内，避免扫描结果自己进包），**命中时才 `cp` 进 `TASK_DIR/status/`**。
+- ★★ **本批把批 1 的教训制度化：静态守门 1 道 → 2 道**（都在 `_b1_make_verify.py` 生成自测脚本**之前**跑，命中即拒绝生成）：
+  ① 未加引号 heredoc 体内的**反引号**（批 1 的 OF-29）；② 未加引号 heredoc 体内的**"词内美元"** ——
+  判据只有一条：`$` **紧跟在字母/数字/下划线之后且后面不是 `{`**（`v$parameter` / `x$bh` 这种），
+  因为合法 shell 展开（`$dbid` / `$sql` / `${begin_snap}`）前面一定是空白或标点。
+  **第二道第一次跑就抓到真问题**：AWR heredoc 里的 `$dbid, $inst_num, $begin_snap, $end_snap` 被初版"允许清单"误报 →
+  说明"词内判据"比"允许清单"稳（前者只认结构，后者要不断补名单）。同源教训：**`bash -n` 对这两类全绿**。
+- **验证（可复跑）**：`bash -n` 通过；`_work/_b1_make_verify.py` → `_work/_verify_b1.sh`（从真实脚本逐字抽取函数 +
+  假 sqlplus + 假目录树，**不连真库**，约 1 分钟）→ **PASS=56 / FAIL=0**（T10 扩为两道静态守门；
+  新增 T11 输出目录 / T12 中断标记 / T13 模块日志 + tmp 不外泄）。
+  ⚠ 三个 harness 假失败已记入生成器注释：① 用**不存在的父目录**测"不可写" → `mkdir -p` 会一路建出来返回 0
+  （改用**普通文件**当父目录，必然 `ENOTDIR`）；② `grep -c -- '--output-dir'` 期望 1 实际 9（断言应写"≥1"）；
+  ③ `ORACLE_CSV` 的**父目录没建** → 重定向失败、行数为空（不是函数没写）。
+- 同步文档：`interface` §5（目录树改 v2.0：`tables/<item_id>.psv` + `collection_status.json` + `logs/modules/` +
+  `COLLECTION_INCOMPLETE` + TMP 目录）/ §6.1（snapshot **8 段** + `database_target_is_local` 移入 `host_identity`）/
+  §6.2 / §6.3（改 `.psv`）/ §7（9 → **10** 个 status）/ §8（10 码并入"输出目录不可写"、130 码并入 `COLLECTION_INCOMPLETE`）/
+  §10.1（缺陷全表划掉 + 新增状态列）/ §10.2 / **新增 §11.6**（批 1+批 4 增量与验收命令）；
+  `fix-plan` §0.3（批 4 全绿 + 新增 OF-30 行，OF-21/OF-25 改记批 1）/ 批 4 章节（**落地记录表** + T11–T13 用例表 +
+  两道守门复盘）/ §0.5.1（三条处置列更新）/ §0.7 / §0.8 / 文档头「当前状态」。
+- **改造清单已闭环**：批 0–4 全部落地（OF-01…OF-30 + 实测-1/2/3）。唯一待现场确认项：**OF-19 在真实环境中断一次**
+  （构造验证已过 T12）。下一步：**用同型号实例实采一份 2.0 包**，逐项对照 `interface` §11.2 计数表，
+  然后改 Python adapter 按 `collector_version` 分叉（1.4 走旧解析、2.0 走新解析）。
+### 22.52 Oracle 采集器「批 5」：2.0 实包体检的 5 个 P1（N-1～N-5）+ md 报告归属按 B 方案落定
+
+- 触发：用户提交**新采的真实 2.0 包**（`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-10_09-40-37.tar.gz`，
+  61 KB / 306 文件 / 156 项），问"采集脚本是否需要优化"。**结论：需要** —— 5 个 P1 + 10 个 P2。
+  体检报告 = `_work/_pkg2_check_report.md`；校验脚本 = `_work/_chk2.py`（manifest 完整性 + sha256）、`_work/_chk3.py`（`tables/*.psv` 形态分类）。
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。4386 → **4505** 行（+119），函数 102 → **104**，
+  注释密度 12.5% → **13.1%**。`COLLECTOR_VERSION` / `SNAPSHOT_SCHEMA_VERSION` / `PACKAGE_VERSION` 保持 **2.0**
+  （唯一字段改名 `artifacts.report_md` → `report_md_external`，仓库内**无消费者**，已 grep 确认，Python 侧零改动）。
+- 体检**先证明"批 1–4 确已生效"**（否则后面的结论都不可信）：156 个唯一 item_id 零重名 / 34 项 `empty` 真实触发 /
+  156 条 `output_file` 无一指向不存在的文件 / 98 个 `.psv` 与 98 条 SQL 项 **100% 同名** / manifest 305 文件 sha256 **全对** /
+  snapshot 8 段齐全 / `logs/modules/*.log` 有完整原文 / 无 `COLLECTION_INCOMPLETE`（正常收尾）。
+- **N-1（批 1 引入的回归）**：`ora_sql_to_md` 的错误判据 `grep -E 'ORA-[0-9]{5}'` **扫整行任意位置**，
+  而 `oracle.topsql.recent_errors` 查的就是告警日志（**行首时间戳、行尾 `… 256125 ORA-27125`**）→ **正常项被判 `error`**、
+  `sql_fail_count` 虚高、`logs/modules/sql.log` 被无关文本污染。v1.4 只读 stderr，不会误判。
+  修：两处 grep 都改 `^[[:space:]]*(ORA-…|SP2-…)`（与 `ora_value` 取值的判据同一口径）。
+- **N-2**：失败 SQL 的 `tables/<id>.psv` 落的是 **sqlplus 报错回显**（`SELECT …` / `*` / `ERROR at line 2:` / `ORA-00904: …`），
+  `row_count` 记成 **3**。修：把"先落 psv 再判状态"调换为"**先定状态、再决定 psv 形态**" —— 只有 `ok` 才数行数、才落数据；
+  `empty` 落 `psv-empty`；其余落**新占位 `psv-unavailable`** 且 `row_count=0`。**`.psv` 自此只有三种形态**（interface §6.3）。
+- **N-3**：包内 `status/` 与 `collection_status.json.items[]` **不含** `package.security_scan`（它写在 `cp -r STATUS_DIR` **之后**），
+  而顶部注释称这两条"随包回传"（**与事实相反**）。修：① `security_scan` **提前到台账生成之前** + 新增 `sync_status_to_package <item_id>`
+  补拷进包（`status/` + `items[]` + `manifest` 三处同时到位）；② 新增 **`packaging_status.json`**（归档前自检结论，进包）；
+  ③ 注释改写为**不变量** —— `module.structured_packaging` 由归档动作本身产生、晚于封口时间，**结构上无法进入它自己封装的归档**。
+- **N-4**：`V$RMAN_STATUS` **没有 `SESSION_KEY` 列**（该列属 `V$RMAN_BACKUP_JOB_DETAILS` / `V$RMAN_OUTPUT`；
+  该视图里表示同一次 RMAN 会话的一对列是 `SESSION_RECID` + `SESSION_STAMP`）→ ORA-00904，`oracle.validation.rman_validate`
+  **恒失败**（第一次采集就被 OF-03 的 `schema_mismatch` 抓到 —— 该状态上线第一炮即命中真 bug）。修：改用 `session_recid, session_stamp`。
+- **N-5**：`summary.txt` 漏 `partial` 行（10 档相加 **155 ≠ 156**）；控制台**另算一遍台账**且重复计数
+  （`schema_mismatch` 算进"错误"、`not_enabled` 又算进"跳过/未启用"）⇒「**包 156 / 控制台 159**」没人说得清。
+  修：尾部复用 `refresh_status_tally()`（尾部 / `snapshot.collection_summary` / `collection_status.json.summary` **三处同源**）+
+  `summary.txt` 新增**分档自校验行**（相加 ≠ 总数时当场标 `⚠ 不一致`）+ 控制台显式印出"包内台账 = 总数 − 1"及其原因。
+- **B 方案（原 N-12，用户拍板）**：`snapshot.artifacts.report_md` 指向**包外**、包内不存在的文件（同 OF-30 类）→
+  改名 **`report_md_external`**（值给**采集机上的绝对路径**）+ 新增 **`report_md_scope:"outside-package"`** +
+  `artifacts` 增加 `packaging_status`。人读报告仍由 Python 侧从包内数据生成（工具链：采集 → 分析 → DOCX）。
+- 验证（可复跑）：`bash -n` 通过；`_work/_b1_make_verify.py` → `_work/_verify_b1.sh`（从真实脚本逐字抽取 + 假 sqlplus，**不连真库**，约 1 分钟）
+  → **PASS=84 / FAIL=0**（**T1–T17**，+28 条断言）；`python -m pytest -q` → **5 failed / 292 passed / 148 subtests**
+  （5 个 FAIL 全是 `tests/test_mysql_*`，**MySQL 源包缺失**，长期存在、非本次引入）。新增：
+  T14（N-1 锚行首：数据里的 `ORA-27125` 仍判 `ok`；**带前导空白的真报错仍被抓**；`sql.log` 不含它）/
+  T15（N-2：`row_count=0` + `psv-unavailable` 占位 + **不与 `psv-empty` 同形** + 失败原文仍进模块日志）/
+  T16（N-3 补拷进包且进 `items[]` + `packaging_status.json` 可解析 + N-4 段内无 `session_key` + B 字段改名与 scope）/
+  T17（N-5 `partial` 计入 + **分档合计 == 总数** + 尾部确实复用 `refresh_status_tally`）。
+  ⚠ harness 一处修正：`MODULE_LOG_DIR` 必须在 T1 **之前**就设好（原先设在 T13 里 → T3 的失败项静默丢失，会让 T14/T15 假失败）。
+- 同步文档：`interface` §5（目录树加 `packaging_status.json`）/ §6.1（artifacts 字段改名）/ §6.3（**三种 psv 形态表**）/
+  §6.4（manifest 不自列）/ **新增 §6.5**（`packaging_status.json` + 台账口径 + "包内 = 总数 − 1"）/ §10.1（6 条全划掉）/ §10.2（+批 5/批 6）/ **新增 §11.7**；
+  `fix-plan` §0.3（+6 行）/ 文档头「当前状态」（4505 行 / 104 函数 / 13.1%）/ **新增「批 5」章节**（落地记录表 + T14–T17 用例表 + 三条方法论 + **批 6 未做清单**）/ §0.7 / §0.8。
+- **批 6（未做，P2）**：`_work/_pkg2_check_report.md` 的 N-6…N-11、N-13、N-14 —— 已在 `fix-plan` 里列成一张表待批。
+  其中 N-6（bg 模块计数丢在子 shell）与 N-3 **同源**（"同一件事在两处计数"），N-11（manifest 不自列）与 N-3 的 `packaging_status.json` 同源（**manifest 自引用**），
+  真要修时**一并复核**，别各修一遍。
+- 待现场确认：① **N-4 改完必须用同型号实例复采一份**确认 ORA-00904 消失（本机无 Oracle）；② OF-19 的中断路径仍需真实环境构造一次。
+### 22.53 Oracle 采集器「批 6」：2.0 实包体检的 P2 全部收尾（N-6～N-11、N-13、N-14 + N-15）
+
+- 触发：批 5 修完 5 个 P1 后，用户「继续批 6」。范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）。
+  4505 → **4556** 行（+51），函数 **104 → 104**（只在原函数内改），注释密度 13.1% → **13.7%**。
+  `COLLECTOR_VERSION` / `SNAPSHOT_SCHEMA_VERSION` / `PACKAGE_VERSION` 保持 **2.0**（**无新采集项**：136 SQL + 31 OS + 28 模块不变）。
+- **N-6（bg 模块计数丢在子 shell）**：`start_module_bg` 走 `run_module … &`，而 `run_module` 结尾是 `record_status`
+  （**返回值恒 0**）→ 父 shell 既看不到子 shell 里的 `RUNTIME[MODULES_EXECUTED]` 自增，也不能靠 `wait` 的 rc 判断成败。
+  修：`wait_background_modules` **只读子 shell 落盘的 status 文件**回写计数，口径与同步路径严格对齐（`skipped` 不计、`error` 计入失败）；
+  子 shell 连状态都没写（被 kill）时兜底补记 `error` 并计数。控制台「执行模块: 26 → **28**」（= `MODULE_PLAN` 长度）。
+- **N-7**：`SAR_FILE_LIST` 由 `${STATUS_DIR}/sar_files.txt` 改为 `${RUNTIME[TMP_DIR]}/sar_files.txt`
+  —— tmp 目录**在 TASK_DIR 之外**，天然不进包，**不必再维护 manifest 排除规则**；`history/source_files.txt` 成为唯一留档。
+- **N-8（扩展名说谎）**：`free -b` / `df -PT` / `df -Pi` / `lsblk -b -o …MODEL,SERIAL` 的输出是**列对齐的空格填充文本**，
+  原先落 `tables/*.tsv` —— 下游按分隔符切会**静默错位**（实测 adapter 用 `|` 切出「键=整行、值=下一行」的错位行）。
+  且 `lsblk` 的 `MODEL`/`SERIAL` **自身含空格**，**无法无损 TSV 化**。修：4 项改归 `evidence/*.txt`
+  （`memory_snapshot` / `filesystems` / `inodes` / `block_devices`），md 报告的路径指引同步改。
+  **`tables/` 契约自此收窄为两类**：`*.psv`（SQL 结果，`|` 分隔）+ 5 个**真 TAB** `*.tsv`
+  （`capabilities` / `hugepages` / `kernel_parameters` / `oracle_limits` / `oracle_env`）。
+- **N-9**：`sqlplus -V` 的输出**随版本走不同流**（10g / 部分发行版打到 stderr），旧写法 `2>/dev/null | head -1 | cut`
+  在实测的 19c 包上取到**空串**。修：`2>&1 | sed -n 's/.*Release \([0-9][0-9.]*\)\.*/\1/p' | head -1 | tr -d '\r'`
+  —— 只取**纯版本号**（`19.16.0.0.0`），取不到时为空串。
+- **N-10**：`host_identity` 里 `is_local_target` 与 `database_target_is_local` **同义重复** → 删前者。
+  ⚠️ `capabilities.is_local_target` **保留**（OF-13 能力表的一项，不是同一处的重复键），已在 interface 注明"同值"。
+- **N-11**：manifest 的**自引用**是结构性的（算不出自己的 sha256）→ 头部新增
+  `"self_excluded":["manifest.json"]` + `self_excluded_reason`，`find … ! -name 'manifest.json'` 的隐式排除保留。
+  消费者不必再靠"数出来少一个"反推。
+- **N-13**：`classify_failure` 的 `not_enabled` 分支补 `TNS-12541` / `TNS-00511` / `no listener`
+  —— listener 未运行（本机 bequeath 采集）**不是采集失败**。**同时配一条反例断言**（T21：普通致命错误仍必须判 `error`），
+  防止判据被后人继续放宽成"什么都算未启用"。
+- **N-14**：`ip` 存在时记 `system.ifconfig = skipped`；`chronyc` 存在时记 `system.ntpq_peers = skipped`；
+  **两支都没有**时记 `unsupported`。capabilities 新增 `ip_command` / `ifconfig_command`。
+  interface §4.1 新增**互斥采集项清单**（谁是谁的备选、判定依据、reason 文案）。
+- **N-15**：`summary.txt` 的"耗时最长前 10"下加说明 —— `oracle.module.realtime_sampling` 与
+  `timeseries.realtime_sampling` 是**同一动作的模块视图 / 数据文件视图**，耗时相近属正常，非重复采集。
+- 验证（可复跑）：`bash -n` ✓；`_work/_b1_make_verify.py` → `_work/_verify_b1.sh` → **PASS=107 / FAIL=0**
+  （**T1–T22**，+23 条断言，不连真库）；`python -m pytest -q` → **5 failed / 292 passed / 148 subtests**
+  （5 个 FAIL 全是 `tests/test_mysql_*`，**MySQL 源包缺失**，长期存在、非本次引入）。新增 5 个用例：
+  T18（N-6：2 个 bg 都计入；失败计入失败数；**`skipped` 不计入执行数**）/ T19（N-7 + N-8 落点 + `output_file` 跟随）/
+  T20（N-9 + N-10 + N-11）/ T21（N-13 + **不许放宽的反例**）/ T22（N-14 + N-15）。
+- ★ **harness 又踩同一个坑**：`BG_PIDS/BG_IDS/BG_NAMES/BG_START_ISO/BG_START_MS` 是**顶层 `declare -a`**，
+  抽取器只抽函数、不抽顶层声明 —— 与 `STATUS_TALLY`（`declare -gA`）**完全同源**。漏声明则
+  `wait_background_modules` 遍历空数组，"计数丢失"根本复现不出来；而 T18 第二个场景**共用同一个 BG 数组**，
+  不清空会把上一场景的 2 个模块再数一遍（本次即因此假失败一次）。
+  **凡断言"计数"，先确认被计数的容器在测试里被正确声明与重置。**
+- 同步文档：`interface` §4.1（4 项落点 + 互斥清单 + capabilities 新键）/ §4.4（bg 计数口径）/ §5（目录树：tables 只两类）/
+  §6.1（`host_identity` 去重）/ §6.3（`tables/` 契约收窄）/ §6.4（manifest `self_excluded`）/ §7（`not_enabled` / `skipped` 来源）/
+  §10.1（+8 行）/ §10.2（批 6 ✅）/ **新增 §11.8**（批 6 增量 + **给 Python 侧的提醒**）；`fix-plan` 文档头 / §0.3（+8 行）/
+  **「批 6」章节改为已完成**（落地记录表 + T18–T22 用例表 + **四条方法论** + **批 7 待办**）/ §0.7（+批 5、批 6 进度条目）/
+  §0.8（PASS=107 / T1–T22）。
+- ★ **批 7 待办（唯一遗留）**：`plugins/oracle/package_adapter.py` 对**所有** `tables/*.tsv` 都用 `parse_delimited(path, "|")`
+  —— 2.0 的 5 个**真 TAB** 表格同样被错解（`capabilities` / `hugepages` / …）。属"adapter 按 `collector_version` 分叉"的
+  独立工程，批 6 只动采集器。**N-8 对 Python 侧的可见影响**（`ctx.tables` 少了 4 个键，`bool(fs_rows)` 由 True 变 False）
+  已在 `interface` §11.8 写明处置建议。
+### 22.54 Oracle 采集器「批 7」：第二次复采包体检的 3 个 P1（N-16～N-18）+ 3 个 P2 → 台账口径收口
+
+- 触发：用户交回**批 5 / 批 6 修完后的第一次现场复采包**（`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-10_10-43-30.tar.gz`，
+  316 条目 / 161 项）问"是否需要整改"。**先证实批 5/批 6 全部生效**（三项关键行为 `topsql.recent_errors` error→ok、
+  `rman_validate` schema_mismatch→empty、`listener_status` error→not_enabled；另 8 项落点/口径全到位；manifest 307 文件 sha256 全对），
+  **再暴露 3 个 P1 + 3 个 P2**。体检报告 = `_work/_pkg3_check_report.md`；解包目录 = `_work/_pkg3/`。
+- 范围：`inspection/oracle_inspection.sh`（**唯一改动文件**）：4556 → **4610** 行（+54），函数 104 → **105**（+`first_existing_relpath`），
+  注释密度 13.7% → **14.4%**。`COLLECTOR_VERSION` / `SNAPSHOT_SCHEMA_VERSION` / `PACKAGE_VERSION` 保持 **2.0**
+  （**无新采集项**：136 SQL + 31 OS + 28 模块不变）。
+- **N-16（P1）**：归档一步写**两条** status —— `run_module` 记 `oracle.module.structured_packaging`（`func_name` 恒返回 0 ⇒ **恒 ok**），
+  `collect_structured_package` 内部又记 `module.structured_packaging`（不合 `oracle.module.*` 约定，带真 rc）。
+  ⇒ ① 控制台"包内台账 = 总数 − 1"**其实是错的**（实际差 2）；② tar 失败时两条结论**相反**；③ 多一个不合规 id。
+  修：**`run_module` 成为唯一记账者** —— `if ! ${func_name}` 改 `${func_name}; rc=$?`（**rc 原样保留**，30/31 不再被压成 1）、
+  新增 `MODULE_REASON` 出口（进入前清空，防串味）、`collect_structured_package` 删自记只 `return "$rc"`、
+  控制台 / summary / `packaging_status.json.note` 的 id 文案改合规名。**控制台的"− 1"由错的变对的**。
+- **N-17（P1）**：`snapshot.collection_summary.total`(158) ≠ `collection_status.json.summary.total`(159) ——
+  `generate_snapshot_json` 跑在 `security_scan` **之前**，那时还没有 `package.security_scan` 这条 status。
+  ★ **"同一个函数" ≠ "同一个时点"**：`refresh_status_tally()` 是同一处算式，取样时刻不同结果就不同。
+  修：snapshot 挪到 `generate_collection_status` **之后**（已核实无循环依赖），三处真正同时点同口径。
+- **N-18（P1）**：`record_status` **参数错位 4 处**（少传 `exit_code`：模块 skipped / `system.ntpq_peers` / `system.ifconfig` /
+  `system.sar_history` 各 1 处）⇒ 说明文字挤进 `output_file` 列、`reason` 变空、`output_file` 指向**不存在**的"文件"。
+  ★ 这类错**编译期全绿、运行不报错**（`bash -n` 也不管）。修：补 `0` + **新增第四道静态守门**
+  `_work/_scan_record_status.py`（按 shell 引号规则切词数实参，**≠ 10 即拒绝生成自测**），运行期由 T25 复跑。
+- **N-19（P2）**：集合型项的 `output_file` 写**目录**（`history/` / `timeseries/`）⇒ 违反"必须指向包内存在的文件"，
+  且判 `empty`/`unsupported` 时目录里可能根本没有产物。修：新增 `first_existing_relpath()` 取**代表文件**
+  （`history/coverage.json` / `timeseries/oracle_sysstat.csv`），无产物写空串。
+- **N-20（P2）**：`tables/kernel_parameters.tsv` **无表头**（其余 4 个真 TSV 都有）；**顺带修**：缺 `sysctl` 时
+  `has_cmd sysctl && …` **什么都不记**（又一个"永不出现"项，与 N-14 同类）→ 改 `if/else` 显式记 `unsupported`。
+- **N-21（P2）**：`interface` §7 的 `partial` 行过期（称"目前只有 `timeseries.realtime_sampling`"）→ 补 `system.sar_history`。
+- **验证（可复跑）**：`bash -n` ✓；`_work/_b1_make_verify.py` → `_work/_verify_b1.sh` → **PASS=139 / FAIL=0**
+  （**T1–T26**，+32 条断言，不连真库，约 1 分钟）；`python -m pytest -q` → **5 failed / 292 passed / 148 subtests**
+  （5 个 FAIL 全是 `tests/test_mysql_*`，MySQL 源包缺失，长期存在、非本次引入）。
+  生成前**三道**静态守门（反引号 / 词内美元 / `record_status` arity）全绿。新增 4 个用例：
+  T23（N-16：非零 rc 原样带出 + `MODULE_REASON` 双向 + 段内不自记）、T24（N-17：段内顺序 + 两处 total 相等）、
+  T25（N-18：4 处补参 + 守门可跑 + 10 参落列）、T26（N-19/N-20）。
+- ★ **本批三条方法论**：① **"同源" ≠ "同时点"** —— 凡说"三处同源"，必须同时约束"三处在同一时点取样"；
+  ② **位置参数 ≥ 8 个的 shell 函数必须有机械守门**（少传一个参数编译期全绿、运行不报错，只有真包/静态对账能看出来）；
+  ③ **廉价特征断言当心子串误命中** —— 合法的 `… 0 0 0 "" "reason"` 里也含 `0 0 ""`（末三 token），
+  故 `grep -c '0 0 ""' == 0` 是**假阳性**判据（第四道守门初版实测误报 5 处）。
+- 同步文档：`interface` §2.3 注（bg 两层状态）/ §4.1（`sar_history`、`realtime` 行 + `output_file` 语义）/ §6.2（`output_file` 列）/
+  §7（`partial` 行）/ §10.1（+6 行）/ §10.2（+批 7 ✅、批 8 ⬜）/ **新增 §11.9**（批 7 增量 + "给 Python 侧的提醒" + 第四道守门）；
+  `fix-plan` 文档头 / §0.3（+6 行 N-16…N-21）/ **新增「批 7」章节**（T23–T26 用例表 + 落地记录表 + **三条方法论** +
+  「批 8 待办」表）/ §0.7（+批 7 ✅、批 8 ⬜）/ §0.8（PASS=139 / T1–T26）；`interface` 验收命令加 `_scan_record_status.py`。
+- ★ **批 8 待办（唯一遗留的代码侧工作）**：`plugins/oracle/package_adapter.py` 对**所有** `tables/*.tsv` 都用
+  `parse_delimited(path, "|")` —— 2.0 的 5 个**真 TAB** 表（`capabilities` / `hugepages` / `kernel_parameters` /
+  `oracle_limits` / `oracle_env`）同样被错解。属"adapter 按 `collector_version` 分叉"的独立工程，批 7 未动 Python 侧。
+  （**编号说明**：本项原记为"批 7 待办"，后批 7 被 N-16…N-21 占用，故顺延为**批 8**。）
+- 待现场确认（累计 3 条）：① N-4 改完用同型号实例复采确认 ORA-00904 消失；② OF-19 中断路径真实构造一次；
+  ③ **批 7 复采核对**：控制台「执行模块: 28 / 包内台账 = 总数 − 1」、`snapshot.total == collection_status.total`、
+  `status/` 里不再有 `module.structured_packaging.tsv`。
+### 22.55 Oracle 采集器「批 8」：Python 侧真正消费 2.0 包（adapter 按 collector_version 分叉）
+
+**范围**：本轮**只动 Python**，`inspection/oracle_inspection.sh` **零改动**（仍 4610 行 / 105 函数 / 2.0）。
+
+- **实测的真实破坏面**（比文档里写的更大）：改前对真实 2.0 包只读出 **5 张垃圾表** ——
+  `glob("*.tsv")` 把 **98 个 `.psv` 全漏了**，5 个真 TAB `*.tsv` 又被 `|` 错解 ⇒ 34 条规则 **16 条 `not_evaluated`**
+  （覆盖率 53%）、报告只有 2 条 finding（健康分 87）。
+- **改了什么**（`plugins/oracle/package_adapter.py`）：新增 `collector_major()`（按 `collector.version` 判定）；
+  2.0 读 `.psv`（`|`）**与** `.tsv`（TAB）、1.4 只读 `.tsv`（`|`）；`item_id` 用 `status/*.tsv` 的 **`output_file` 反查**
+  （`kernel_parameters.tsv` ↔ `system.sysctl_selected`）；每张表注册到 `item_id` + **中文标题** + 唯一尾段
+  + 15 行 `LEGACY_ALIASES`；`# … psv-empty / psv-unavailable` 占位 → 空表；回填 `evidence/filesystems.txt`（`df -PT`）。
+- **新增文件**：`plugins/oracle/item_titles.json`（生成物）、`tools/gen_oracle_item_titles.py`
+  （生成器，**单一来源 = 采集脚本**）、`tests/test_oracle_package_adapter.py` **4 → 12 用例**（含"标题表与脚本同步"守门）。
+- **实测收益**（同一个包）：`ctx.tables` 键数 **5 → 416**、`not_evaluated` **16 → 2**（余 2 条 = 无 ASM / FRA 未配置，
+  **判定正确**）、覆盖率 **53% → 94%**、findings **2 → 12**、下游 66 个调用点 **64 个解析成功**。
+- **回归**：全量 `pytest` = **5 failed / 292 passed / 148 subtests**（5 个 FAIL 仍是 MySQL 源包缺失的老问题，无新增）。
+- **遗留**（已记入 fix-plan「仍未做」表）：采集器直接把 `item_id→title` 写进包（**批 9 候选**）；
+  `find_table()` 模糊匹配的顺序依赖；`_check_filesystem_usage` 未排除 `iso9660` / `squashfs` 只读挂载。
+
+详见 `docs/oracle-collector-fix-plan.md`「批 8」章节、`docs/oracle-collector-interface.md` §11.10 / §6.3。
+### 22.56 Oracle 采集器「批 10」：分析层 / 报告层对齐 MySQL（Python 侧）
+
+**范围**：本轮**只动 Python**，`inspection/oracle_inspection.sh` **零改动**（仍 4610 行 / 105 函数 / 2.0）。
+**审查报告**：`_work/oracle-analysis-gap-review.md`。
+
+- **方法**（数据面已就绪 → 反查分析/报告层缺口）：**端点跑一遍再拆 DOCX** ——
+  `plugins/oracle/cli.py` → `generate_report.py` → `python-docx` 读回，参照系 = MySQL。不读代码猜。
+- ★ **及格线只有 1 条**：`pending_confirmations` 缺失 ⇒ Word **第 14 章整章空转**
+  （改前该章全部内容只有一句"本次分析未产出待确认事项清单"；MySQL 同一章 16 条真事项）。
+  成因：`presentation.build_report_model` 信封里没这个键，而 `report_adapter` 是
+  **`deepcopy(source)` + 补**（source 里没有的键它不会造）。
+- **落地四处**（`presentation.py` ×2 / `analyzer.py` / `word_report.py`）：
+  `CONFIRMATION_TEMPLATES`（11 条）+ `pending_confirmations()`（按已触发规则派生）+
+  `attach_pending_confirmations()`（挂实例）+ `build_report_model` **条件注入**（旧基线无此键 ⇒ 不打穿冻结契约）。
+  实测第 14 章 由空转 → **5 条**（备份归属 / 归档模式 / 时间源 / 密码托管 / 锁定账号）。
+- **章节动线**：`section_order` 把 `oracle_instance` 提到 `storage_capacity` **之前**
+  （原来读者没看到"实例是什么"就先看"它装了什么"），对齐 MySQL 的 实例 → 配置 → 运行 → 容量。
+  改后 DOCX **目录页 16 条与正文 Heading1 逐条一致**（差异 0）。
+- **新增守门**：`tests/test_oracle_confirmations.py` **9 用例**，含 ★"模板引用的 `rule_id` 必须真实存在于
+  `inspection_rules_oracle.json`"（写了不存在的 rule_id ⇒ 模板**永不触发**、报告永远显示"没有待确认事项"，
+  而没有任何测试会红）；及 ★章节**顺序**断言（`test_oracle_plugin.py` 只有集合断言，对顺序完全不敏感）。
+  负控制自证（`_work/_b10_negctl.py`）：破坏两处 → 两条守门都真实变红，逐字节复原后全绿。
+- **未做（记批 11–13）**：规则补口（`oracle.dg` 6 项采集 0 条规则 / `awr.segment_bloat` 802 行 /
+  审计画像 9 项里 7 项孤儿 / `system.hugepages`）、图表"可产集合 = 声明集合"收口（`oracle_txn_rate` 生成即丢弃）、
+  展示补口（`oracle.awr` 8 项一个都不进报告）。
+- **回归**：全量 `pytest` = **5 failed / 310 passed / 159 subtests**（含本批新增 9 用例；5 个 FAIL 仍是 MySQL 源包缺失的老问题，无新增）。
+
+### 22.57 Oracle 采集器「批 11」：规则补口 —— 「采了有数据、零判据」的四个域（Python 侧）
+
+**范围**：本轮**只动 Python**（规则包 / `oracle_rules.py` / 新增守门测试 + 基线整体刷新），
+`inspection/oracle_inspection.sh` **零改动**（仍 4610 行 / 105 函数 / 2.0）。
+**审查报告**：`_work/oracle-analysis-gap-review.md` §3。
+
+- **判据（机械可查，不靠感觉）**：该采集项在包内**有数据**（`status=ok` / 有行）**且**在 `oracle_rules.py`
+  里**找不到任何消费者** ⇒ 真缺口。写规则前先用 `_work/_b11_probe.py` 打印 `status` + `output_file` +
+  **真实列名** + 样例行（列名对不上是静默的：`row.get("SIZE_GB")` 返回 `None`，规则照样"通过"）。
+- **落地 8 条规则 / 四个域**（规则包 **34 → 42**）：
+  DataGuard 4 条（`ORA.DG.TRANSPORT_ERROR` 主库亦适用 / `ORA.DG.APPLY_LAG` 解析 `+DD HH:MM:SS` /
+  `ORA.DG.LOG_GAP` / `ORA.DG.EVENT_ERROR`）、对象治理 2 条（`ORA.SCHEMA.SEGMENT_BLOAT` /
+  `ORA.CAPACITY.LARGE_SEGMENT`）、口令画像 1 条（`ORA.SECURITY.PASSWORD_PROFILE`）、大页 1 条（`ORA.SYSTEM.HUGEPAGES`）。
+  **没有新增采集项、没有改 item_id**；规则读的表键一律**同时给 `item_id`（2.0）与中文标题（1.4）**。
+- ★ **两条最容易照抄错的**：
+  ① **大页口径与 MySQL 相反** —— MySQL 只要求**关掉** THP；Oracle 还要把 SGA 放进 HugePages，
+     故多出半条判据"`Total > 0 且 Free/Total > 0.5` = 配了却闲置"。照抄 MySQL 会漏掉 Oracle 最典型的那半。
+  ② **无备库 ≠ 延迟正常** —— 未配 DG 的库上 `v$dataguard_stats` / `v$log_sequence_gap` 为空 ⇒
+     两条备库规则落 **`not_evaluated`**（延续「未采集 ≠ 0」），**不是 `passed`**。
+- **`status/*.tsv` 双行数**：第 6 列 = 库内真实行数、第 7 列 = 入包行数（TOP-N）。
+  `awr.segment_bloat` 库内 802 行 / 入包仅 4 行 —— 规则按入包行判，**不把 802 当缺陷**。
+- **新增 5 个阈值键**（全部有代码请求，受 `tests/test_rule_pack_config.py` 守门）：
+  `dg_lag_seconds_warning`(900) / `dg_log_gap_warning`(5) / `segment_bloat_mb_warning`(1024) /
+  `large_segment_gb_warning`(100) / `hugepage_free_ratio_warning`(0.5)。
+- **新增守门**：`tests/test_oracle_rule_gaps.py` **16 用例** —— 每条规则都用"改数据 / 改阈值 → 结论跟着变"
+  证明旋钮真被读（防"默认值恰好相同"的假绿），含 ★`test_hugepages_configured_but_unused_triggers` 与
+  `test_dg_lag_without_a_standby_is_not_evaluated`。负控制（`_work/_b11_negctl.py`）：破坏 4 处 →
+  **4/4 全部真实变红**（各只红 1 条），`finally` 逐字节复原 + sha256 校验，复原后全绿。
+- **基线整体重出**（`tests/baselines/oracle/current/`）：`health_score` 26→23、`rules` 34→42、
+  `triggered` 10→11、`passed` 20→24、`not_evaluated` 4→7、`risk_register` 10→11、`severity_counts` medium 4→5；
+  `sections` 9 / `items` 52 / 8 张 PNG **逐字节不变**（新规则只加 finding，不改报告结构）。
+  **`source_implementation.*` 刻意不重写**（它记录的是来源快照指纹，不是当前工作树）。
+- **实测（真实 2.0 包）**：规则 42、触发 13 / 通过 25 / 未评价 4、findings 13、健康分 10；
+  新触发的只有 `ORA.SECURITY.PASSWORD_PROFILE`（DEFAULT profile 无复杂度校验）。
+- **有意不做**：`oracle.control.recent_param_changes`（`ISSES`/`ISSYS_MOD` 语义需先核实采集 SQL）、
+  `oracle.basic.object_counts`（缺明确阈值口径）—— 宁少不错。
+- **回归**：全量 `pytest` = **5 failed / 326 passed / 159 subtests**（含本批 16 用例；5 个 FAIL 仍是 MySQL 源包缺失的老问题，无新增）。
+
+### 22.58 Oracle 采集器「批 12」：图表收口 —— 「声明集合 = 可产出集合」（Python 侧）
+
+**范围**：本轮**只动 Python**（`plugins/oracle/charts.py` / `word_report.py` /
+`inspection_core/word_engine.py` + 新增守门），`inspection/oracle_inspection.sh` **零改动**
+（仍 4610 行 / 105 函数 / 2.0）。**判据来源**：`_work/oracle-analysis-gap-review.md` §2.1 / §2.4
+（本批已在该文件 §9 闭环）。
+
+- **病因**：`charts.py` 能产 **9** 张（4 OS + 5 Oracle），`word_report.py` 只声明 **8** 张 —— 两个方向都错：
+  `oracle_txn_rate` **画出来没人声明（生成即丢弃）**、`oracle_physical_io` **声明了却可能一张不出**。
+  更隐蔽的是 `word_engine.render_section_charts` 过滤后集合为空时**静默 `return False`** ——
+  连"趋势图"小节都不出现、也不留说明，读者分不清"本章本就没有图"与"本该有图没画出来"。
+- **落地四件事**：① **单一来源** `ORACLE_CHART_IDS`（顺序即上图次序），`_figure()` 改按 chart_id
+  命名 PNG；② `word_report` 两章的 `ChartDefinition` **全部由 id 清单派生**（图题留在报告层）；
+  ③ 声明了图却一张都没产出 ⇒ **留一行原因**（不改小节号、不渲染空的"趋势图"标题），
+  原因代码串由 `CHART_SKIP_REASONS` 翻成人话、**未登记代码原样带出**；
+  ④ 产出侧防呆：未注册 chart_id **当场 `ValueError`**。
+- ★ **第③条落在四库共用的 `inspection_core/word_engine.py`** —— MySQL / PG / SQL Server 同样病灶，
+  一起治；数据齐全时**零字节影响**（MySQL 基线文档的规范化 XML hash 测试原样通过可证）。
+- ★ **两条最容易做错**：① **"单一来源"必须真派生**，不是两边各写一份碰巧相等（漏一个正是
+  `oracle_txn_rate` 的病因，静态读代码与报告都看不出来）；② **数据不足 ⇒ 不产出 ≠ 从声明里删掉**，
+  否则单机空闲库上 `oracle_txn_rate` 会被"修"成永久不存在。
+- **实测（真实 1.4 包 ZYDB）**：**8 张 PNG 逐字节不变、正文 729 段逐段相同**（唯一差异是封面"生成时间"戳）。
+  本包 `user_commits` 采样窗口内**恒为 64** ⇒ 提交速率 0 ⇒ `oracle_txn_rate` 本就未产出，故这批在该包上
+  **严格无操作**；两条新行为改由**合成数据**用例钉住，不依赖数据巧合。
+- **新增守门**：`tests/test_oracle_chart_coverage.py`（**7 用例**）+
+  `tests/test_word_engine.py::ChartSkippingTests`（**4 用例**）。★ `test_unregistered_id_is_rejected_at_production_time`
+  用 monkeypatch 常量验证产出守门（`finally` 复原）；★ 端到端那条只数**正文 Heading 2**
+  （目录页也列同名条目，混进来会数出 3 个）。
+- **负控制**（`_work/_b12_negctl.py`，只改实现）：声明侧漏 id / 恢复静默 / 清空原因翻译 / 摘掉产出守门 →
+  **4/4 全部真实变红**（各只红 1～3 条），`finally` 逐字节复原 + sha256 校验，复原后 25 passed。
+- **回归**：全量 `pytest` = **5 failed / 337 passed / 159 subtests**（含本批 11 用例；
+  5 个 FAIL 仍是 MySQL 源包缺失的老问题，无新增）。
+- **未做（批 12b）**：§2.3 的 3 张"有数据没画"的图（表空间使用率 Top-N 条形 / 归档量趋势 /
+  Top SQL Top-N）—— 需要**新图型**（公共层渲染器只有时序折线），且 `oracle.archive.daily_30d`
+  手上两份包**全空**、补出来无法用真实数据验证。
+
+### 22.59 Oracle 采集器「批 13」：展示补口 —— 「采了有数据、一个字不进报告」的四个域（Python 侧）
+
+**范围**：本轮**只动 Python**（`plugins/oracle/presentation.py` + 新增守门），
+`inspection/oracle_inspection.sh` **零改动**（仍 4610 行 / 105 函数 / 2.0）。
+**判据来源**：`_work/oracle-analysis-gap-review.md` §4（本批已在该文件 §10 闭环）。
+
+- **判据（机械可枚举）**：采集项在包内**有数据**（`status=ok` / 有行）**且**在 `presentation.py`
+  里**找不到任何消费者** ⇒ 真缺口。扫出 **27 项**，其中 `oracle.awr` / `oracle.dg` / `oracle.audit`
+  三个域**整域零展示**（AWR 是 Oracle 最有价值的诊断数据）。`_work/_b13_probe.py` 逐项打印
+  `status` + `output_file` + **真实列名** + 样例行，再用 `ctx.tables` 确认**数据早在包里**
+  （`segment_bloat` 4 行 / `undo_usage` 20 行 / `system_privileges` 19 行…）—— 缺的只是展示层引用。
+- ★ **口径纠偏**：gap-review 写的"`oracle.dg` 6 项 / `oracle.audit` 7 项"是**未展示项数**，
+  不是整域采集项数。
+- **落地 24 个展示条目**（分散进 4 个已有章节）：对象检查 4（段膨胀 / 高水位 / 索引使用 / 统计缺失）、
+  存储与容量 1（ASSM）、Oracle 实例 2（自动维护任务 / 管理包访问）、Oracle 性能 5
+  （undo 使用 / undo 参数 / 临时排序段 / 共享池碎片 / SQL 计划基线）、安全与审计 7、备份恢复与高可用 5。
+  **检查项 52 → 76**；**唯一章名改动** `备份与恢复检查` → **`备份、恢复与高可用检查`**；**章节数仍 9**。
+- **三条机制性改动**：① 新增 `_cell(row, *names)` **容忍 sqlplus 按列宽截断表头**
+  （`SEGMENT_SPACE_MANAGEMENT`→`SEGMEN`、`ADM`、`COMPRES`、`SIZ`；`row.get(完整列名)` 取不到时
+  **不报错、只静默少一列**）；② `_listed()` 让**空 / 未采**条目按真实 `collection.status` 分叉文案
+  （`success_no_data` 与 `not_evaluated` / `permission_denied` **是相反结论，不许长得一样**）；
+  ③ `_analysis()` 的 `not_evaluated` 分支**透出规则引擎 `reason`**（原先把"无备库（未配置 DataGuard）"丢了）。
+- ★ **三条最容易踩错**：① **presentation 层条目不带 `item_id`** —— 由
+  `report_adapter._extract_item_id` 从 `source` 尾段按 `" — "` 切分派生，测试要在该层对账必须先做同样切分；
+  ② **判"这项采过没有"看表键是否在 `ctx.tables`**（**空表也算登记**），不能靠 `non_ok_items`
+  （只记失败态，`empty` 与"根本没采"被一并吞掉）；③ **对着冻结基线断言抓不到实现回归** ——
+  章名断言首版只读死文件 `report_model.json`，负控制第 5 项因此**没变红**，补一条**走实现路径**的用例
+  （断言 `cls.titles["backup_recovery"]`）后才 5/5 全红（与 AST 对账盲区同源：断言形式与被测对象不匹配）。
+- **实测**：1.4 包 ZYDB **24 个新条目全部渲染**、9 条"已检查，本次未发现相关记录。"空态、
+  **8 张 PNG 逐字节不变**、健康分 **23（不变）**、findings **11（不变）**、目录与正文 H1 **1—16 逐条对齐**；
+  2.0 包全部条目 `col=ok` 或 `col=empty`、**无一条误标**、健康分 10。
+- **基线只有 `items` 变**：`expected_summary` 里仅 `items` 52 → 76，其余（health / rules / triggered /
+  passed / not_evaluated / risk_register / severity_counts）**全同** ⇒ 「纯展示层、不触发新判据」；
+  `baseline_version` → `"batch-13-display-coverage"`，`source_implementation.*` **刻意不重写**。
+- **新增守门**：`tests/test_oracle_display_coverage.py`（**16 用例 / 9 subtests**，合成 `FakeContext`）；
+  `tests/test_oracle_plugin.py` 4 处断言更新（normal 35→49 / not_evaluated 8→17 / attention 5→6 / items 52→76）。
+- **负控制**（`_work/_b13_negctl.py`，只改实现）：5 处变异 → **5/5 全部真实变红**，
+  `finally` 逐字节复原 + sha256 校验（`3dc546d2f798bf09` 前后一致），复原后 16 passed。
+- **回归**：全量 `pytest` = **5 failed / 353 passed / 168 subtests**（含本批 16 用例；5 个 FAIL 仍是
+  MySQL 源包缺失的老问题，无新增）。
+- **未做（下一轮）**：`oracle.basic.large_segments` / `oracle.index.large_segments` /
+  `system.hugepages` 同样"有判据、无展示"。
+
+### 22.60 Oracle/MySQL 取数口径统一 —— 非表格式证据文件的路径只在一处写（Python 侧）
+
+**范围**：本轮**只动 Python**（`inspection_core/models.py` + 两库 `presentation.py` + 新增守门），
+`inspection/oracle_inspection.sh` **零改动**，**基线零改动**（等价性证明见下）。
+
+- **病因**：呈现层不走 adapter，自己拼 `root / "evidence/…"` 再自己解析；而 `package_adapter.py`
+  已经在做同一件事（把 `tables/*.psv` 注册进 `ctx.tables`、还回填了 `evidence/filesystems.txt`）
+  ⇒ 同一份 `kernel_parameters.tsv` 有**两份解析实现**，改一处忘另一处**没有测试会红**。
+  Oracle **6 处**、MySQL **5 处**。
+- ★ **真风险是静默少一节内容**：批 6 / N-8 曾把 4 个「列对齐文本」从 `tables/` 挪到 `evidence/`；
+  路径写死的读法移动后**只返回空** —— 报告少一节、规则层不报、测试不红。
+- **落地**：① 新增 `PackageContext.raw_lines(name)` —— 按**契约文件名**在 `tables/`、`evidence/`
+  两处查找并返回原始行（缺文件返回 `[]`）；② 目录集中到模块级 `_RAW_FILE_DIRS = ("tables", "evidence")`
+  （**全仓库只此一处**）；③ 11 处调用点改走它；5 + 4 个解析器从「收 `Path`」改成「收 `list[str]`」。
+- ★ **「收行」不是「收路径」是有意的**：解析器拿到 `Path` 会直接 `TypeError`（不可迭代）
+  ⇒「必须走 `ctx.raw_lines`」这个口径**在运行期也成立**，不只写在注释里。
+- ★ **PG 还有同一模式 9 处**（`plugins/postgresql/presentation.py:111/119/173/175/176/177/560/563/567`），
+  本批**未纳入**（守门只覆盖 Oracle + MySQL）= **待办，不是缺陷**。
+- **等价性证明（同一 1.4 包，改造前 vs 改造后）**：8 张 PNG **逐字节相同**；`llm_input.json`
+  **完全相同**；`analysis` / `analyzer_status` / `report_model` / `report_model_standard` 抹掉
+  `generated_at` / `duration_ms` / 图表 `path` 后**实质差异 0**；`oracle_professional_report.docx`
+  的 `word/document.xml` 抹掉时间戳后**完全相同** ⇒ **基线一个字没改**。
+- **跨包形态复核（2.0 包 `…_2026-10-10_14-30-48`）**：PNG 逐字节相同；仅 `analysis.json` /
+  `report_model.json` 各 2 处差异，全部是**批 13** 顺手修的 `_analysis()` 透出规则引擎 `reason`
+  （`无 FRA 记录` / `无备库统计（未配置 DataGuard）`），**与取数路径无关**（`_b13_20` 是那次修改
+  **之前**的产物）；且 2.0 包里关键内核参数 14 行 / 挂载参数 39 行 / 内核错误摘要 4 行 /
+  时间与时区 2 行**全部正常渲染** ⇒ `raw_lines` 在 2.0 布局下同样命中。
+- **新增守门**：`tests/test_raw_file_access.py`（**17 用例**）—— 访问点行为 / 目录顺序单一来源 /
+  **继承而非覆写**（子类改了 `raw_lines` ⇒ 两份口径，当场红）/ 两库 `presentation.py` 零
+  `ctx.root / …` 拼接（AST，只看 `BinOp(Div)` 的左操作数，避免误伤数值除法）/ **契约文件名集合**
+  （改名会静默返回空）。★ 每条结构断言都配**尺子自证**（同一函数喂故意违规源码必须抓到）。
+- **负控制**：`_work/_b14_negctl.py` **4/4 全部真实变红**（`_RAW_FILE_DIRS` 去掉 `tables/` /
+  重新拼 `root / …` / 子类覆写 `raw_lines` / 契约文件名改名），逐字节复原 + sha256 校验，
+  复原后 17 passed。
+- **回归**：全量 `pytest` = **5 failed / 370 passed / 168 subtests**（5 个 FAIL 仍是 MySQL 源包缺失的
+  老问题，无新增）。★ **MySQL 侧没有端到端覆盖**（`test_mysql_*` 因源包不在仓库而失败）—— 本批为该侧
+  补了直接打解析器的用例，但**真实 MySQL 包上的端到端验证仍未做**。
+- **未做（批 14b）**：把同一收口推到 PostgreSQL 9 处（共享访问点已就位，纯机械替换）。
