@@ -26,13 +26,16 @@ class OraclePluginTests(unittest.TestCase):
         result = adapt_report_model(source)
         self.assertEqual(result["generator_contract"], REPORT_CONTRACT)
         self.assertEqual(result["health_assessment"]["score"], source["health_assessment"]["score"])
-        # 第⑦步 severity 二级分级后 LIBRARY_CACHE 升为 critical，健康分由 43 变为 26。
-        self.assertEqual(result["health_assessment"]["score"], 26)
+        # 第⑦步 severity 二级分级后 LIBRARY_CACHE 升为 critical，健康分由 43 变为 26；
+        # 批 11 新增「口令 Profile 策略偏弱」（medium）后又降到 23。
+        self.assertEqual(result["health_assessment"]["score"], 23)
         self.assertEqual(len(result["risk_register"]), len(source["risk_register"]))
-        self.assertEqual(len(result["risk_register"]), 10)
+        self.assertEqual(len(result["risk_register"]), 11)
         self.assertEqual(len(result["inspection_sections"]), 9)
-        self.assertEqual(sum(len(section["items"]) for section in result["inspection_sections"]), 52)
-        self.assertEqual(len(result["appendix"]["rule_evaluations"]), 34)
+        # 批 13 展示补口：AWR 8 / DataGuard 6 / 审计画像 7 / 性能明细 4 共 24 个条目
+        # 补进**已有章节**（章节数不变），检查项 52 → 76。
+        self.assertEqual(sum(len(section["items"]) for section in result["inspection_sections"]), 76)
+        self.assertEqual(len(result["appendix"]["rule_evaluations"]), 42)
         self.assertTrue(all("source_severity" in finding for finding in result["risk_register"]))
 
     def test_adapter_assigns_stable_unique_item_ids(self) -> None:
@@ -42,8 +45,8 @@ class OraclePluginTests(unittest.TestCase):
             for section in result["inspection_sections"]
             for item in section["items"]
         ]
-        self.assertEqual(len(item_ids), 52)
-        self.assertEqual(len(set(item_ids)), 52)
+        self.assertEqual(len(item_ids), 76)
+        self.assertEqual(len(set(item_ids)), 76)
         self.assertTrue(all(isinstance(value, str) and value for value in item_ids))
         self.assertEqual(item_ids[0], "system.host")
         self.assertIn("ORA.ARCHIVE.MODE", item_ids)
@@ -55,13 +58,15 @@ class OraclePluginTests(unittest.TestCase):
             for section in result["inspection_sections"]
             for item in section["items"]
         ]
-        # 20 fact-only items: 15 with rows become normal, 5 without rows stay not_evaluated.
-        self.assertEqual(statuses.count("normal"), 35)
-        self.assertEqual(statuses.count("not_evaluated"), 8)
+        # 事实型条目：有行 → normal，无行 → 保持 not_evaluated（绝不冒充"通过"）。
+        # 批 13 新增 24 项里 14 项有数据（normal）、9 项无行（not_evaluated）、
+        # 1 项由规则给结论（口令 Profile 偏弱 → attention）。
+        self.assertEqual(statuses.count("normal"), 49)
+        self.assertEqual(statuses.count("not_evaluated"), 17)
         # LIBRARY_CACHE 在第⑦步升为 critical，对应巡检项由 attention 变 risk（3→4 / 6→5）。
         self.assertEqual(statuses.count("risk"), 4)
-        self.assertEqual(statuses.count("attention"), 5)
-        self.assertEqual(len(result["appendix"]["rule_evaluations"]), 34)
+        self.assertEqual(statuses.count("attention"), 6)
+        self.assertEqual(len(result["appendix"]["rule_evaluations"]), 42)
 
     def test_adapter_is_idempotent(self) -> None:
         source = load_source()
@@ -130,7 +135,7 @@ class OraclePluginTests(unittest.TestCase):
             for finding in adapt_report_model(load_source())["risk_register"]:
                 self.assertIn(finding["finding_id"], table_text)
                 self.assertIn(finding["title"], table_text)
-            self.assertIn("26 / 100", table_text)
+            self.assertIn("23 / 100", table_text)
             self.assertIn("NOARCHIVELOG", table_text)
             # 8 张技术图 + 封面 1 个 logo；逐张都从 charts/ 取到才会被内嵌。
             self.assertEqual(len(generated.inline_shapes), 9)

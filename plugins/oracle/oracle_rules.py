@@ -9,6 +9,7 @@ RuleEvaluation dataclasses as the analyzer.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,17 @@ class OracleRuleEngine:
         self._check_index_unusable(ctx)
         self._check_missing_stats(ctx)
         self._check_io_hotfile(ctx)
+
+        # ── 扩展规则 v2.2（批 11：补"采了没判"的域） ──
+        # DataGuard 6 项采集此前 0 条判据；对象治理 / 口令 Profile / 大页同病。
+        self._check_dg_transport(ctx)
+        self._check_dg_lag(ctx, metrics)
+        self._check_dg_log_gap(ctx)
+        self._check_dg_events(ctx)
+        self._check_segment_bloat(ctx)
+        self._check_large_segment(ctx)
+        self._check_password_profile(ctx)
+        self._check_hugepages(ctx)
 
         # Assign finding IDs
         order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -676,3 +688,264 @@ class OracleRuleEngine:
             f"TOP1 数据文件 IO 占比 {pct:.1f}%" + ("，存在热点" if triggered else "，分布正常"),
             [f"max_file_io_pct={pct:.1f}"],
         )
+
+    # ── 批 11：DataGuard / 对象治理 / 口令 Profile / 大页 ──
+    #
+    # 背景：这些域的采集项在包内一直有数据，但规则侧**一条判据都没有**（见
+    # `_work/oracle-analysis-gap-review.md` §3）。补充时守两条既有口径：
+    #   * 「未采集 ≠ 0」—— 表为空一律落 not_evaluated，不当成"没问题"；
+    #   * 表键同时给 2.0 的 `item_id` 与 1.4 的中文标题，`find_table` 两套包都命中。
+
+    def _check_dg_transport(self, ctx: PackageContext) -> None:
+        """归档 / DG 传输目的地报错（v$archive_dest，主库也适用）。"""
+        rule = "ORA.DG.TRANSPORT_ERROR"
+        rows = ctx.find_table("oracle.dg.archive_dest", "日志传输服务状态")
+        broken = [
+            row for row in rows
+            if str(row.get("ERROR", "")).strip().upper() not in {"", "-", "0", "NULL", "NONE"}
+        ]
+        facts = [
+            f"{row.get('DEST_NAME') or row.get('dest_name')}: {row.get('ERROR')}"
+            for row in broken[:5]
+        ]
+        self._evaluate(
+            rule, True, bool(rows), bool(broken),
+            f"{len(broken)} 个归档目的地报错" if broken
+            else (f"{len(rows)} 个归档目的地状态正常" if rows else "未采集到归档目的地"),
+            facts,
+        )
+
+    def _check_dg_lag(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
+        """备库传输 / 应用延迟（v$dataguard_stats 的 transport lag / apply lag）。
+
+        单实例（无备库）时该视图为空 —— 落 not_evaluated，不当作"延迟正常"。
+        """
+        rule = "ORA.DG.APPLY_LAG"
+        rows = ctx.find_table("oracle.dg.protection_mode", "保护模式与主库统计")
+        if not rows:
+            self._evaluate(rule, True, False, False, "无备库统计（未配置 DataGuard）", [])
+            return
+        lags: dict[str, float] = {}
+        for row in rows:
+            name = str(row.get("NAME") or row.get("name") or "").strip().lower()
+            seconds = _parse_interval_seconds(row.get("VALUE") or row.get("value"))
+            if name and seconds is not None:
+                lags[name] = seconds
+        if not lags:
+            self._evaluate(rule, True, False, False, "统计中无可用延迟值", [])
+            return
+        worst_key = max(lags, key=lambda key: lags[key])
+        worst = lags[worst_key]
+        threshold = self._threshold(rule, "dg_lag_seconds_warning", 900)
+        triggered = worst > threshold
+        self._evaluate(
+            rule, True, True, triggered,
+            f"最大延迟 {worst_key}={worst:.0f}s" + ("，超过阈值" if triggered else "，正常"),
+            [f"{key}={value:.0f}s" for key, value in sorted(lags.items())],
+        )
+
+    def _check_dg_log_gap(self, ctx: PackageContext) -> None:
+        """主备库归档日志序差距（备库落后主库多少个归档）。"""
+        rule = "ORA.DG.LOG_GAP"
+        rows = ctx.find_table("oracle.dg.log_sequence_gap", "主备库日志序差距")
+        if not rows:
+            self._evaluate(rule, True, False, False, "无备库（未配置 DataGuard）", [])
+            return
+        gaps = [safe_int(row.get("GAP") or row.get("gap")) for row in rows]
+        gaps = [gap for gap in gaps if gap is not None]
+        if not gaps:
+            self._evaluate(rule, True, False, False, "无法解析日志序差距", [])
+            return
+        worst = max(gaps)
+        threshold = self._threshold(rule, "dg_log_gap_warning", 5)
+        triggered = worst > threshold
+        self._evaluate(
+            rule, True, True, triggered,
+            f"最大日志序差距 {worst}" + ("，备库落后" if triggered else "，正常"),
+            [f"max_gap={worst}", f"threads={len(gaps)}"],
+        )
+
+    def _check_dg_events(self, ctx: PackageContext) -> None:
+        """近 24 小时 DataGuard 事件里是否有非零错误码。"""
+        rule = "ORA.DG.EVENT_ERROR"
+        rows = ctx.find_table("oracle.dg.recent_events", "最近 DG 事件")
+        broken = [
+            row for row in rows
+            if safe_int(row.get("ERROR_CODE") or row.get("error_code")) not in (None, 0)
+        ]
+        facts = [
+            f"{row.get('TIMESTAMP')} {row.get('MESSAGE')}: {row.get('ERROR_CODE')}"
+            for row in broken[:5]
+        ]
+        self._evaluate(
+            rule, True, bool(rows), bool(broken),
+            f"近 24h {len(broken)} 条 DG 错误事件" if broken
+            else (f"近 24h {len(rows)} 条 DG 事件均无错误" if rows else "近 24h 无 DG 事件记录"),
+            facts,
+        )
+
+    def _check_segment_bloat(self, ctx: PackageContext) -> None:
+        """段空间膨胀：实际占用 - 按统计信息估算的应有大小。"""
+        rule = "ORA.SCHEMA.SEGMENT_BLOAT"
+        rows = ctx.find_table("oracle.awr.segment_bloat", "数据膨胀预估")
+        if not rows:
+            self._evaluate(rule, True, False, False, "未采集到段膨胀数据（需统计信息）", [])
+            return
+        threshold = self._threshold(rule, "segment_bloat_mb_warning", 1024)
+        worst, worst_name = 0.0, ""
+        for row in rows:
+            bloat = safe_float(row.get("BLOAT_MB")) or 0.0
+            if bloat > worst:
+                worst = bloat
+                worst_name = f"{row.get('OWNER')}.{row.get('TABLE_NAME')}"
+        triggered = worst >= threshold
+        self._evaluate(
+            rule, True, True, triggered,
+            f"最大可回收空间 {worst:.1f}MB（{worst_name}）" + ("，超过阈值" if triggered else ""),
+            [f"max_bloat_mb={worst:.2f}", f"candidates={len(rows)}"],
+        )
+
+    def _check_large_segment(self, ctx: PackageContext) -> None:
+        """超大表 / 索引段（表的 SIZE_GB 与索引的 SIZE_MB 统一折成 GB 比较）。"""
+        rule = "ORA.CAPACITY.LARGE_SEGMENT"
+        table_rows = ctx.find_table("oracle.basic.large_segments", "大表段")
+        index_rows = ctx.find_table("oracle.index.large_segments", "大索引段")
+        if not table_rows and not index_rows:
+            self._evaluate(rule, True, False, False, "未采集到大段数据", [])
+            return
+        worst_gb, worst = 0.0, ""
+        for row in table_rows:
+            gb = safe_float(row.get("SIZE_GB")) or 0.0
+            if gb > worst_gb:
+                worst_gb = gb
+                worst = f"{row.get('OWNER')}.{row.get('TABLE_NAME')}"
+        for row in index_rows:
+            gb = (safe_float(row.get("SIZE_MB")) or 0.0) / 1024.0
+            if gb > worst_gb:
+                worst_gb = gb
+                worst = f"{row.get('OWNER')}.{row.get('INDEX_NAME')}（索引）"
+        threshold = self._threshold(rule, "large_segment_gb_warning", 100)
+        triggered = worst_gb >= threshold
+        self._evaluate(
+            rule, True, True, triggered,
+            f"最大段 {worst_gb:.2f}GB（{worst}）" + ("，超过阈值" if triggered else ""),
+            [f"max_segment_gb={worst_gb:.3f}"],
+        )
+
+    def _check_password_profile(self, ctx: PackageContext) -> None:
+        """口令 Profile 弱策略：无复杂度校验 / 口令永不过期 / 失败次数不受限。"""
+        rule = "ORA.SECURITY.PASSWORD_PROFILE"
+        rows = ctx.find_table("oracle.audit.profile_params", "密码配置文件参数")
+        if not rows:
+            self._evaluate(rule, True, False, False, "未采集到 Profile 参数", [])
+            return
+        weak: list[str] = []
+        for row in rows:
+            name = str(row.get("RESOURCE_NAME") or "").strip().upper()
+            limit = str(row.get("LIMIT") or "").strip().upper()
+            profile = str(row.get("PROFILE") or "").strip()
+            if name == "PASSWORD_VERIFY_FUNCTION" and limit in {"", "NULL", "NONE"}:
+                weak.append(f"{profile}.PASSWORD_VERIFY_FUNCTION 未启用")
+            elif name == "FAILED_LOGIN_ATTEMPTS" and limit in {"", "UNLIMITED"}:
+                weak.append(f"{profile}.FAILED_LOGIN_ATTEMPTS 不受限")
+            elif name == "PASSWORD_LIFE_TIME" and limit in {"", "UNLIMITED"}:
+                weak.append(f"{profile}.PASSWORD_LIFE_TIME 永不过期")
+        self._evaluate(
+            rule, True, True, bool(weak),
+            f"{len(weak)} 项口令策略偏弱" if weak else "口令 Profile 策略正常",
+            weak[:6],
+        )
+
+    def _check_hugepages(self, ctx: PackageContext) -> None:
+        """透明大页 / HugePages —— **Oracle 口径**，与 MySQL 只判 THP 不同。
+
+        Oracle 既要 THP 关闭（`never`），又要 HugePages 承载 SGA；而"配了却闲置"
+        （Total>0 但 Free 占比高）说明实例没有真正用上静态大页，同样要报。
+        """
+        rule = "ORA.SYSTEM.HUGEPAGES"
+        states = _hugepage_states(ctx)
+        enabled = states.get("enabled", "")
+        if not enabled:
+            self._evaluate(rule, True, False, False, "未采集到透明大页状态", [])
+            return
+        total = safe_int(states.get("total")) or 0
+        free = safe_int(states.get("free")) or 0
+        facts = [f"transparent_hugepage/enabled={enabled}"]
+        if states.get("defrag"):
+            facts.append(f"transparent_hugepage/defrag={states['defrag']}")
+        facts.append(f"HugePages_Total={total}")
+        if total:
+            facts.append(f"HugePages_Free={free}")
+        threshold = self._threshold(rule, "hugepage_free_ratio_warning", 0.5)
+        thp_bad = enabled != "never"
+        unused = total > 0 and (free / total) > threshold
+        reasons: list[str] = []
+        if thp_bad:
+            reasons.append(f"透明大页未关闭（{enabled}）")
+        if unused:
+            reasons.append(f"已配 HugePages 但闲置 {free / total * 100:.0f}%")
+        self._evaluate(
+            rule, True, True, bool(reasons),
+            "；".join(reasons) if reasons else "透明大页已关闭",
+            facts,
+        )
+
+
+def _parse_interval_seconds(value: Any) -> float | None:
+    """Oracle 间隔型统计值 → 秒。
+
+    `v$dataguard_stats` 的 `value` 形如 ``+00 00:00:05``（天 时:分:秒），个别版本带
+    小数秒。解析不出来（``NULL`` / 空 / 纯数字异常）就返回 None —— 让调用方落
+    not_evaluated，不拿 0 冒充"无延迟"。
+    """
+    text = str(value or "").strip()
+    if not text or text.upper() in {"NULL", "NONE", "-"}:
+        return None
+    match = re.match(r"^([+-]?)(\d+)\s+(\d+):(\d+):(\d+(?:\.\d+)?)$", text)
+    if match:
+        sign = -1.0 if match.group(1) == "-" else 1.0
+        days, hours, minutes, seconds = (
+            float(match.group(2)), float(match.group(3)),
+            float(match.group(4)), float(match.group(5)),
+        )
+        return sign * (days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    # 少数环境直接给秒数
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _hugepage_states(ctx: PackageContext) -> dict[str, str]:
+    """还原 THP / HugePages 状态（`tables/hugepages.tsv`，真 TAB 表，列 `path`/`value`）。
+
+    `value` 形如 ``[never]`` / ``always madvise [never]`` —— 方括号里的是当前生效值。
+    `/proc/meminfo:` 前缀的几行是批 2 新增的**实测值**，只有 Total 与 Free 对照才
+    算得出"配了但没被用掉"。
+    """
+    states: dict[str, str] = {}
+    for row in ctx.tables.get("hugepages", []) or []:
+        path = str(row.get("path") or "").strip()
+        raw = str(row.get("value") or "").strip()
+        if not path:
+            continue
+        if path.endswith("nr_hugepages"):
+            states["nr_hugepages"] = raw
+            continue
+        if path.endswith("meminfo:HugePages_Total"):
+            states["total"] = raw
+            continue
+        if path.endswith("meminfo:HugePages_Free"):
+            states["free"] = raw
+            continue
+        if "transparent_hugepage" not in path:
+            continue
+        active = ""
+        for token in raw.split():
+            if token.startswith("[") and token.endswith("]"):
+                active = token.strip("[]")
+                break
+        if not active:
+            active = raw.split()[0] if raw.split() else ""
+        states["enabled" if path.endswith("/enabled") else "defrag"] = active
+    return states

@@ -1,4 +1,4 @@
-"""Oracle ??????????????????? report model?"""
+"""Oracle 呈现层：把分析结果组织成报告模型（章节 / 风险台账 / 待确认事项）。"""
 
 from __future__ import annotations
 
@@ -26,15 +26,144 @@ _RULE_MEMORY_PRESSURE = CANONICAL_RULE_IDS["memory_pressure"]
 _RULE_FILESYSTEM_USAGE = CANONICAL_RULE_IDS["filesystem_usage"]
 
 
+# 「待客户确认事项」的模板，按**已触发的规则**派生（rule_id → 主题 / 待确认内容）。
+# 刻意不重复判定：规则引擎已经回答「这是不是风险」，本表只回答「这件事要客户拍板什么」。
+#
+# 收录口径（与 MySQL 同一条线，见 plugins/mysql/presentation.py::CONFIRMATION_TEMPLATES）：
+#   ① 需要业务语义决策的 —— 未开自动扩展是有意管控还是遗漏、哪些是高权限业务账号、
+#      失败作业归谁维护，这些答案只在客户那边；
+#   ② 数据库侧无法自证的 —— 备份可恢复性（库里看不到备份平台/存储快照）、坏块修复
+#      能容忍多少数据损失；
+#   ③ 需要外部资源或停机窗口的 —— 表空间/FRA 扩容要走采购与审批、开归档必须停库。
+# **不收**纯技术整改项（redo 尺寸、控制文件冗余、日志成员数、统计信息收集、无效对象）：
+# 那些直接改就行，问了只增加沟通成本，还会把清单做成第二个风险台账。
+CONFIRMATION_TEMPLATES: dict[str, tuple[str, str]] = {
+    "ORA.BACKUP.RECENT": (
+        "备份归属与可恢复性",
+        "实例内没有可确认的成功备份记录。请确认备份由谁发起（RMAN 本地脚本 / 备份平台 / "
+        "存储侧快照），并提供最近 3 次成功记录与至少 1 次恢复演练记录 —— "
+        "「有备份」以能恢复为准，不以存在任务配置为准。",
+    ),
+    "ORA.ARCHIVE.MODE": (
+        "归档模式的启用窗口与备份策略",
+        "数据库当前运行在 NOARCHIVELOG 模式，无法做在线备份与时间点恢复。开启归档需停机"
+        "（MOUNT 状态执行），且归档目的地与保留策略须同步落地。请确认可安排的停机窗口、"
+        "归档目的地（本地目录 / 快速恢复区）以及归档保留时长。",
+    ),
+    "ORA.CONFIG.AUTOEXTEND": (
+        "数据文件关闭自动扩展是否有意设计",
+        "存在未开启自动扩展的数据文件。请确认这是存储配额管控的有意设计（统一分配、扩容走"
+        "审批），还是建库/扩容时的遗漏。若为前者，请给出容量告警阈值与扩容响应时限；"
+        "若为后者，建议在业务低峰开启并设定合理的 MAXSIZE。",
+    ),
+    "ORA.STORAGE.TABLESPACE": (
+        "表空间扩容的审批与执行路径",
+        "存在使用率偏高的表空间。扩容涉及存储采购或配额调整，须确认可用空间、审批流程与"
+        "执行窗口；扩容落地前，请确认业务侧是否有可先行归档或清理的历史数据。",
+    ),
+    "ORA.STORAGE.FRA": (
+        "快速恢复区容量与归档保留策略",
+        "快速恢复区使用率告警。FRA 写满会使数据库挂起（所有需要写归档/FRA 的操作阻塞）。"
+        "请确认归档保留策略（保留时长、是否配置备份后自动删除）与 FRA 目标容量的调整窗口。",
+    ),
+    "ORA.SECURITY.DBA_COUNT": (
+        "高权限账户的业务归属与回收范围",
+        "存在多个拥有 DBA 角色的账户。请确认哪些是应用连接账号、哪些是历史遗留或厂商维护"
+        "账号，以及各自是否仍有使用需求 —— 回收范围属于业务语义决策，不由 DBA 单方面执行。",
+    ),
+    "ORA.SECURITY.PASSWORD_EXPIRY": (
+        "账户密码的托管方式与轮换窗口",
+        "存在密码临近过期或已锁定的账户。请确认这些账户的口令由谁托管（应用配置中心 / "
+        "密码管理系统 / 人工维护），以及轮换时的应用重启窗口 —— 口令变更必须与应用侧"
+        "同步，否则会造成连接失败。",
+    ),
+    "ORA.SECURITY.ACCOUNT_LOCKED": (
+        "锁定账户是否为废弃账号",
+        "存在处于锁定状态的账户。请确认这些账户是否已停用（历史人员、下线系统、厂商账号）；"
+        "若确认废弃，可执行清理或保持锁定并移出巡检白名单，避免每次巡检重复告警。",
+    ),
+    "COMMON.SYSTEM.TIME_SYNC": (
+        "时间源的提供方与同步要求",
+        "主机时间未同步。请确认时间源由谁提供（内网 NTP 服务器地址、是否允许访问公网授时），"
+        "以及该主机是否需要纳入统一时间同步 —— DataGuard / RAC 环境对时间偏差敏感。",
+    ),
+    "ORA.JOB.FAILURE": (
+        "失败调度作业的归属方",
+        "存在执行失败的 Scheduler 作业。请确认这些作业归业务方还是 DBA 维护，以及失败是否"
+        "已被业务侧知晓 —— 作业失败往往对应数据未按时生成，属于业务影响面，不只是任务状态。",
+    ),
+    "ORA.DATA.BLOCK_CORRUPTION": (
+        "坏块修复策略与业务可接受窗口",
+        "检测到物理坏块。修复方式（RMAN BLOCKRECOVER / 从备库同步 / 跳过坏块）与是否需要"
+        "停机，取决于数据重要性与可接受的数据损失。请确认业务侧可接受的修复窗口与"
+        "数据丢失容忍度。",
+    ),
+}
+
+
+def pending_confirmations(
+    instance: dict[str, Any], *, node: str = ""
+) -> list[dict[str, Any]]:
+    """按已触发的规则派生「待客户确认事项」。
+
+    与风险台账的分工：台账答「是什么风险、怎么改」，本表答「哪几件事必须由客户拍板、
+    或必须由客户提供外部证据」。规则未触发则不进表 —— 没触发就说明本节点没有该问题，
+    不该把模板空转成一张「欢迎确认」清单。
+
+    ``node`` 默认留空：Oracle 现场以单实例为主，节点列在单实例报告里只是噪音（引擎
+    按 ``has_node`` 决定是否渲染该列）。将来接多实例 / RAC 时再按对端 IP 传入。
+    """
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for finding in instance.get("findings") or []:
+        rule_id = str(finding.get("rule_id") or "").strip()
+        template = CONFIRMATION_TEMPLATES.get(rule_id)
+        if not template or rule_id in seen:
+            continue
+        seen.add(rule_id)
+        items.append({
+            "topic": template[0],
+            "question": template[1],
+            "node": node,
+            "rule_id": rule_id,
+            "finding_id": finding.get("finding_id"),
+            "evidence": list(finding.get("facts") or []),
+        })
+    return items
+
+
+def _merged_confirmations(instances: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    """跨实例合并「待客户确认事项」。
+
+    只取 ``instances[0]`` 会让其余节点需要客户确认的事项整段消失。同一主题在多个
+    节点都触发时**保留各自的行**，不按主题归并 —— 不同节点的证据（容量水位、涉及
+    账号、失败作业）通常并不相同。
+
+    返回 ``None`` 表示所有实例都没有该字段（旧分析产物 / 未接入），渲染层据此区分
+    「未产出清单」与「本次没有待确认事项」—— 延续「未采集 ≠ 0」。
+    """
+    merged: list[dict[str, Any]] = []
+    present = False
+    for instance in instances:
+        items = instance.get("pending_confirmations")
+        if items is None:
+            continue
+        present = True
+        merged.extend(items)
+    if not present:
+        return None
+    merged.sort(key=lambda item: (str(item.get("topic") or ""), str(item.get("node") or "")))
+    return merged
+
+
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _colon_map(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
+def _colon_map(lines: list[str]) -> dict[str, str]:
+    """解析 `lscpu` 的 `key: value` 原文（行由 `ctx.raw_lines` 提供，见批 14）。"""
     result: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in lines:
         if ":" not in raw:
             continue
         name, value = raw.split(":", 1)
@@ -42,11 +171,10 @@ def _colon_map(path: Path) -> dict[str, str]:
     return result
 
 
-def _kv_map(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
+def _kv_map(lines: list[str]) -> dict[str, str]:
+    """解析 `key=value` 原文（`time_status.txt`）。"""
     result: dict[str, str] = {}
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in lines:
         if "=" not in raw:
             continue
         name, value = raw.split("=", 1)
@@ -54,11 +182,10 @@ def _kv_map(path: Path) -> dict[str, str]:
     return result
 
 
-def _key_value_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
+def _key_value_rows(lines: list[str]) -> list[dict[str, str]]:
+    """解析 key-value 文本（`kernel_parameters.tsv`：TAB 或 `=` 分隔）。"""
     rows: list[dict[str, str]] = []
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -72,12 +199,11 @@ def _key_value_rows(path: Path) -> list[dict[str, str]]:
     return rows
 
 
-def _mount_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
+def _mount_rows(lines: list[str]) -> list[dict[str, str]]:
+    """解析 `mount` 原文（`设备 on 挂载点 type 类型 (选项)`）。"""
     rows: list[dict[str, str]] = []
     pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for raw in lines:
         matched = pattern.match(raw.strip())
         if not matched:
             continue
@@ -90,11 +216,10 @@ def _mount_rows(path: Path) -> list[dict[str, str]]:
     return rows
 
 
-def _dmesg_rows(path: Path, limit: int = 20) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    lines = [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
-    return [{"内核错误日志": line} for line in lines[:limit]]
+def _dmesg_rows(lines: list[str], limit: int = 20) -> list[dict[str, str]]:
+    """取 `dmesg` 错误原文的前 `limit` 行。"""
+    content = [line.strip() for line in lines if line.strip()]
+    return [{"内核错误日志": line} for line in content[:limit]]
 
 
 @dataclass
@@ -130,6 +255,34 @@ class Finding:
             "requires_restart": self.requires_restart,
         }
 
+def _cell(row: dict[str, Any], *names: str) -> Any:
+    """从一行里按候选列名取值，容忍 sqlplus 的表头截断。
+
+    ★ 为什么需要它：sqlplus 会按列的**显示宽度**截断表头（真实采集包实测：
+    `SEGMENT_SPACE_MANAGEMENT` → `SEGMEN`、`ADMIN_OPTION` → `ADM`、
+    `COMPRESSION` → `COMPRES`、`RESOURCE_TYPE` → `RESOURCE`、`SYSOPER` → `SYSOP`），
+    截断长度取决于该列的**数据 / 声明宽度**，换一套库就可能不同。
+    `row.get("完整列名")` 在取不到时**既不报错也不告警，只是少一列** —— 静默失真，
+    比抛异常更难发现（与规则层 L-2「列名对不上是静默的」同源）。
+
+    匹配顺序：① 精确且非空 → ② 前缀互含（`wanted.startswith(key)` 或 `key.startswith(wanted)`，
+    要求该键长度 ≥ 3，避免 `A` 这类单字符误配）→ ③ 精确但空值。都取不到时返回 `""`。
+    """
+    for name in names:
+        if name in row and str(row.get(name) or "").strip():
+            return row[name]
+    upper = {str(key).upper(): key for key in row}
+    for name in names:
+        wanted = name.upper()
+        for key, original in upper.items():
+            if len(key) >= 3 and (wanted.startswith(key) or key.startswith(wanted)):
+                return row[original]
+    for name in names:
+        if name in row:
+            return row[name]
+    return ""
+
+
 def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                                findings: list[Finding],
                                evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -147,19 +300,19 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     sys_rt = metrics.get("system_realtime", {})
     sys_hist = metrics.get("system_history", {})
 
-    root = ctx.root
-    lscpu = _colon_map(root / "evidence/lscpu.txt")
-    time_info = _kv_map(root / "evidence/time_status.txt")
-    kernel_rows = _key_value_rows(root / "tables/kernel_parameters.tsv")
-    mount_rows = _mount_rows(root / "evidence/mounts.txt")
-    dmesg_rows = _dmesg_rows(root / "evidence/dmesg_errors.txt")
+    # 批 14：这些**非表格式**证据文件的路径一律由 `ctx.raw_lines` 解析，呈现层不再自己拼
+    # `root / "evidence" / …`。目录曾在 N-8 从 `tables/` 挪到 `evidence/`，写死目录的后果是
+    # **静默少一节内容**（读不到只返回空，规则层不报、测试不红）。目录只认 `_RAW_FILE_DIRS`。
+    lscpu = _colon_map(ctx.raw_lines("lscpu.txt"))
+    time_info = _kv_map(ctx.raw_lines("time_status.txt"))
+    kernel_rows = _key_value_rows(ctx.raw_lines("kernel_parameters.tsv"))
+    mount_rows = _mount_rows(ctx.raw_lines("mounts.txt"))
+    dmesg_rows = _dmesg_rows(ctx.raw_lines("dmesg_errors.txt"))
     os_name = env.get("os") or env.get("distribution") or ""
-    os_release_path = root / "evidence/os_release.txt"
-    if os_release_path.exists():
-        for line in os_release_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("PRETTY_NAME="):
-                os_name = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
+    for line in ctx.raw_lines("os_release.txt"):
+        if line.startswith("PRETTY_NAME="):
+            os_name = line.split("=", 1)[1].strip().strip('"').strip("'")
+            break
 
     # ── build lookup indexes ──
     _finding_by_rule: dict[str, dict[str, Any]] = {}
@@ -199,7 +352,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         elif ev_status == "not_applicable":
             return {"status": "not_applicable", "conclusion": "当前架构不适用此项检查。", "evidence": [], "recommendation": ""}
         elif ev_status:  # has evaluation but not triggered/passed/applicable
-            return {"status": "not_evaluated", "conclusion": "证据不足，未执行评价。", "evidence": [], "recommendation": ""}
+            # ★「证据不足」必须带上**为什么不足**：规则引擎已经给出 `reason`
+            #   （如「无备库（未配置 DataGuard）」）。只印"证据不足"会让读者以为是
+            #   采集失败，而事实常常是"这项在当前架构下根本不存在" —— 与
+            #   「未采集 ≠ 0」同源：不许让两种相反结论长成一句话。
+            reason = str(ev.get("reason") or "").strip()
+            return {"status": "not_evaluated", "conclusion": reason or "证据不足，未执行评价。",
+                    "evidence": [], "recommendation": ""}
         else:  # no evaluation at all — data-only display item
             return {"status": "", "conclusion": ""}
 
@@ -221,6 +380,74 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     def _data_item(title: str, item_id: str, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Data-only display item — no analysis block."""
         return _item(title, item_id, rows=rows, analysis={"status": "", "conclusion": ""})
+
+    # ── 数据展示条目（批 13）─────────────────────────────────────────────
+    # `quality.non_ok_items` **只记失败态**（permission_denied / timeout / error…），
+    # 「查了没有」(`empty`) 与「根本没采」被它一并吞掉。数据展示条目若只看它，会把两种
+    # **相反结论**写成同一句含糊话 —— 于是这里直读 `ctx.status` 的逐项状态。
+    # 2.0 包按 `oracle.<域>.<项>` 登记，1.4 包按中文标题登记，两者都要覆盖。
+    _real_status: dict[str, str] = {
+        str(entry.get("item_id")): str(entry.get("status") or "")
+        for entry in (ctx.status.get("items") or [])
+        if entry.get("item_id")
+    }
+    _EMPTY_TEXT = {
+        "empty": "已检查，本次未发现相关记录。",
+        "not_enabled": "本项未启用，无明细可展示。",
+        "not_applicable": "当前架构不适用，无明细可展示。",
+        "permission_denied": "采集权限不足，未能取得明细。",
+        "timeout": "采集超时，未能取得明细。",
+        "error": "采集失败，未能取得明细。",
+        "skipped": "本项已跳过，未取得明细。",
+        "unsupported": "当前环境不支持该项采集。",
+        "partial": "采集不完整，仅取得部分明细。",
+    }
+
+    def _real_status_of(*names: str) -> str:
+        for name in names:
+            if name and name in _real_status and _real_status[name]:
+                return _real_status[name]
+        for name in names:
+            lowered = (name or "").lower()
+            if not lowered:
+                continue
+            for key, value in _real_status.items():
+                if value and lowered in key.lower():
+                    return value
+        return ""
+
+    def _table_seen(*names: str) -> bool:
+        """包内是否登记过这张表（**空表也算登记**）。
+
+        1.4 包的逐项状态登记为 `sql.<代号>`（如 `sql.HWM`），与 `item_id` 之间没有
+        可用的映射；此时「有没有采过」只能由**表键是否存在**来判定 —— 这一步很关键，
+        否则「查了没有」会被写成「没采到」，两种相反结论又长成一样。
+        """
+        for name in names:
+            if name and name in ctx.tables:
+                return True
+        for name in names:
+            lowered = (name or "").lower()
+            if not lowered:
+                continue
+            for key in ctx.tables:
+                if lowered in key.lower():
+                    return True
+        return False
+
+    def _listed(title: str, item_id: str, rows: list[dict[str, Any]] | None = None,
+                alias: str = "", analysis: dict[str, Any] | None = None) -> dict[str, Any]:
+        """带**真实采集状态**的展示条目；无数据时按采集状态给出准确空态文案。"""
+        item = (_data_item(title, item_id, rows=rows) if analysis is None
+                else _item(title, item_id, rows=rows, analysis=analysis))
+        if not rows:
+            real = _real_status_of(item_id, alias)
+            if not real and _table_seen(item_id, alias):
+                real = "empty"  # 表在包里 ⇒ 采过；无行 ⇒ 查了没有
+            if real:
+                item["collection"]["status"] = real
+            item["display"]["empty_text"] = _EMPTY_TEXT.get(real, "本项未采集到数据，无法呈现明细。")
+        return item
 
     sections: list[dict[str, Any]] = []
 
@@ -424,6 +651,18 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                            rows=display_ae,
                            analysis=_analysis("ORA.CONFIG.AUTOEXTEND")))
 
+    # ── 自动段空间管理（批 13）：表空间级属性，归容量章 ──
+    assm_rows = ctx.find_table("oracle.awr.assm_status", "自动段空间管理")
+    display_assm: list[dict[str, Any]] = []
+    for row in assm_rows[:20]:
+        display_assm.append({
+            "表空间": _cell(row, "TABLESPACE_NAME"),
+            "段空间管理": _cell(row, "SEGMENT_SPACE_MANAGEMENT"),
+            "区管理": _cell(row, "EXTENT_MANAGEMENT"),
+        })
+    sc_items.append(_listed("自动段空间管理 (ASSM)", "oracle.awr.assm_status",
+                            display_assm, alias="自动段空间管理"))
+
     sections.append({"section_id": "storage_capacity", "title": "存储与容量检查", "items": sc_items})
 
     # ── 6. Oracle 实例检查 (oracle_instance) ──
@@ -502,6 +741,28 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     oi_items.append(_item("Scheduler 作业状态", "ORA.JOB.FAILURE",
                            rows=display_sched,
                            analysis=_analysis("ORA.JOB.FAILURE")))
+
+    # ── 自动维护任务 / 管理包访问（批 13）：实例级配置，归实例章 ──
+    auto_stats_rows = ctx.find_table("oracle.awr.auto_stats_job", "自动统计信息收集 Job")
+    display_auto_stats: list[dict[str, Any]] = []
+    for row in auto_stats_rows[:10]:
+        display_auto_stats.append({
+            "任务": _cell(row, "CLIENT_NAME"),
+            "状态": _cell(row, "STATUS"),
+            "维护窗口组": _cell(row, "WINDOW_GROUP"),
+        })
+    oi_items.append(_listed("自动维护任务", "oracle.awr.auto_stats_job",
+                            display_auto_stats, alias="自动统计信息收集 Job"))
+
+    pack_rows = ctx.find_table("oracle.awr.package_access", "管理包访问设置")
+    display_pack: list[dict[str, Any]] = []
+    for row in pack_rows[:10]:
+        display_pack.append({
+            "参数": _cell(row, "NAME"),
+            "值": _cell(row, "VALUE"),
+        })
+    oi_items.append(_listed("管理包访问设置", "oracle.awr.package_access",
+                            display_pack, alias="管理包访问设置"))
 
     sections.append({"section_id": "oracle_instance", "title": "Oracle 实例检查", "items": oi_items})
 
@@ -622,6 +883,74 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                analysis=_analysis("ORA.PERFORMANCE.IO_HOTFILE")),
         _item("CPU 高消耗会话", "oracle.cpu_top_sessions", rows=display_cpu),
     ]
+
+    # ── UNDO / 临时段 / 共享池（批 13）：报告原先只展"性能指标"与"命中率规则项" ──
+    undo_usage_rows = ctx.find_table("oracle.performance.undo_usage", "UNDO 使用统计")
+    display_undo_usage: list[dict[str, Any]] = []
+    for row in undo_usage_rows[:20]:
+        display_undo_usage.append({
+            "开始时间": _cell(row, "BEGIN_TIME"),
+            "结束时间": _cell(row, "END_TIME"),
+            "UNDO 块": _cell(row, "UNDOBLKS"),
+            "事务数": _cell(row, "TXNCOUNT"),
+            "最长查询(s)": _cell(row, "MAXQUERYLEN"),
+            "快照过旧错误": _cell(row, "SSOLDERRCNT"),
+            "空间不足错误": _cell(row, "NOSPACEERRCNT"),
+        })
+    op_items.append(_listed("UNDO 使用统计", "oracle.performance.undo_usage",
+                            display_undo_usage, alias="UNDO 使用统计"))
+
+    undo_param_rows = ctx.find_table("oracle.performance.undo_params", "UNDO 参数")
+    display_undo_param: list[dict[str, Any]] = []
+    for row in undo_param_rows[:10]:
+        display_undo_param.append({
+            "参数": _cell(row, "NAME"),
+            "值": _cell(row, "VALUE"),
+        })
+    op_items.append(_listed("UNDO 参数", "oracle.performance.undo_params",
+                            display_undo_param, alias="UNDO 参数"))
+
+    temp_sort_rows = ctx.find_table("oracle.performance.temp_sort_usage", "临时表空间排序段使用")
+    display_temp_sort: list[dict[str, Any]] = []
+    for row in temp_sort_rows[:10]:
+        display_temp_sort.append({
+            "实例": _cell(row, "INSTANCE_NAME"),
+            "临时表空间": _cell(row, "TABLESPACE_NAME"),
+            "当前用户": _cell(row, "CURRENT_USERS"),
+            "总大小(MB)": _cell(row, "TOTAL_MB"),
+            "已用(MB)": _cell(row, "USED_MB"),
+            "使用率(%)": _cell(row, "PCT_USED"),
+            "空闲请求": _cell(row, "FREE_REQUESTS"),
+        })
+    op_items.append(_listed("临时表空间排序段", "oracle.performance.temp_sort_usage",
+                            display_temp_sort, alias="临时表空间排序段使用"))
+
+    spf_rows = ctx.find_table("oracle.performance.shared_pool_frag", "共享池碎片")
+    display_spf: list[dict[str, Any]] = []
+    for row in spf_rows[:10]:
+        display_spf.append({
+            "池": _cell(row, "POOL"),
+            "空闲(MB)": _cell(row, "FREE_MB"),
+            "平均空闲块(KB)": _cell(row, "AVG_FREE_KB"),
+            "空闲块数": _cell(row, "FREE_CHUNKS"),
+        })
+    op_items.append(_listed("共享池碎片", "oracle.performance.shared_pool_frag",
+                            display_spf, alias="共享池碎片"))
+
+    plan_rows = ctx.find_table("oracle.awr.sql_plan_baseline", "SQL Plan Baseline")
+    display_plan: list[dict[str, Any]] = []
+    for row in plan_rows[:20]:
+        display_plan.append({
+            "SQL Handle": _cell(row, "SQL_HANDLE"),
+            "Plan 名": _cell(row, "PLAN_NAME"),
+            "来源": _cell(row, "ORIGIN"),
+            "启用": _cell(row, "ENABLED"),
+            "已接受": _cell(row, "ACCEPTED"),
+            "创建时间": _cell(row, "CREATED"),
+        })
+    op_items.append(_listed("SQL Plan Baseline", "oracle.awr.sql_plan_baseline",
+                            display_plan, alias="SQL Plan Baseline"))
+
     sections.append({"section_id": "oracle_performance", "title": "Oracle 性能检查", "items": op_items})
 
     # ── 8. 会话与事务检查 (sessions_transactions) ──
@@ -673,6 +1002,63 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         _item("统计信息缺失", "ORA.DATA.MISSING_STATS",
                analysis=_analysis("ORA.DATA.MISSING_STATS")),
     ]
+
+    # ── 段 / 统计诊断（批 13）：这批采集项此前「采了有数据、一个字不进报告」──
+    bloat_rows = ctx.find_table("oracle.awr.segment_bloat", "数据膨胀预估")
+    display_bloat: list[dict[str, Any]] = []
+    for row in bloat_rows[:20]:
+        display_bloat.append({
+            "Owner": _cell(row, "OWNER"),
+            "表名": _cell(row, "TABLE_NAME"),
+            "行数": _cell(row, "NUM_ROWS"),
+            "段大小(MB)": _cell(row, "SEGMENT_MB"),
+            "理论大小(MB)": _cell(row, "ESTIMATED_MB"),
+            "可回收(MB)": _cell(row, "BLOAT_MB"),
+        })
+    obj_items.append(_listed("段空间膨胀预估", "oracle.awr.segment_bloat",
+                             display_bloat, alias="数据膨胀预估",
+                             analysis=_analysis("ORA.SCHEMA.SEGMENT_BLOAT")))
+
+    hwm_rows = ctx.find_table("oracle.awr.hwm_segments", "段级高水位统计")
+    display_hwm: list[dict[str, Any]] = []
+    for row in hwm_rows[:20]:
+        display_hwm.append({
+            "Owner": _cell(row, "OWNER"),
+            "段名": _cell(row, "SEGMENT_NAME"),
+            "类型": _cell(row, "SEGMENT_TYPE"),
+            "表空间": _cell(row, "TABLESPACE_NAME"),
+            "大小(GB)": _cell(row, "SIZE_GB"),
+            "块数": _cell(row, "BLOCKS"),
+        })
+    obj_items.append(_listed("段级高水位 (HWM)", "oracle.awr.hwm_segments",
+                             display_hwm, alias="段级高水位统计"))
+
+    index_usage_rows = ctx.find_table("oracle.awr.index_usage", "索引使用状态")
+    display_index_usage: list[dict[str, Any]] = []
+    for row in index_usage_rows[:20]:
+        display_index_usage.append({
+            "索引名": _cell(row, "INDEX_NAME"),
+            "表名": _cell(row, "TABLE_NAME"),
+            "监控": _cell(row, "MONITORING"),
+            "是否使用": _cell(row, "USED"),
+            "监控开始": _cell(row, "START_MONITORING"),
+        })
+    obj_items.append(_listed("索引使用状态", "oracle.awr.index_usage",
+                             display_index_usage, alias="索引使用状态"))
+
+    missing_stats_rows = ctx.find_table("oracle.awr.missing_stats", "缺失统计信息表")
+    display_missing_stats: list[dict[str, Any]] = []
+    for row in missing_stats_rows[:20]:
+        display_missing_stats.append({
+            "Owner": _cell(row, "OWNER"),
+            "表名": _cell(row, "TABLE_NAME"),
+            "行数": _cell(row, "NUM_ROWS"),
+            "上次分析": _cell(row, "LAST_ANALYZED"),
+            "统计陈旧": _cell(row, "STALE_STATS"),
+        })
+    obj_items.append(_listed("陈旧统计信息 (TOP20)", "oracle.awr.missing_stats",
+                             display_missing_stats, alias="缺失统计信息表"))
+
     sections.append({"section_id": "objects", "title": "对象检查", "items": obj_items})
 
     # ── 10. 安全与审计检查 (security) ──
@@ -711,6 +1097,93 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                rows=display_locked,
                analysis=_analysis("ORA.SECURITY.ACCOUNT_LOCKED")),
     ]
+
+    # ── 权限画像 / 口令 Profile（批 13）：报告原先只有"账户密码过期 + DBA 用户 + 锁定账户"
+    #    三类，`oracle.audit` 的其余 7 项一个字都不进报告。规则 ORA.SECURITY.PASSWORD_PROFILE
+    #    在批 11 已就位，这里把它的数据源接到「密码配置文件参数」条目上。
+    priv_rows = ctx.find_table("oracle.audit.system_privileges", "系统特权授予")
+    display_priv: list[dict[str, Any]] = []
+    for row in priv_rows[:30]:
+        display_priv.append({
+            "被授予者": _cell(row, "GRANTEE"),
+            "系统特权": _cell(row, "PRIVILEGE"),
+            "可转授": _cell(row, "ADMIN_OPTION"),
+            "通用": _cell(row, "COMMON"),
+        })
+    sec_items.append(_listed("系统特权授予（可转授）", "oracle.audit.system_privileges",
+                             display_priv, alias="系统特权授予"))
+
+    profile_rows = ctx.find_table("oracle.audit.profile_params", "密码配置文件参数")
+    display_profile: list[dict[str, Any]] = []
+    for row in profile_rows[:20]:
+        display_profile.append({
+            "Profile": _cell(row, "PROFILE"),
+            "资源名": _cell(row, "RESOURCE_NAME"),
+            "类别": _cell(row, "RESOURCE_TYPE"),
+            "限制值": _cell(row, "LIMIT"),
+        })
+    sec_items.append(_listed("密码配置文件参数", "oracle.audit.profile_params",
+                             display_profile, alias="密码配置文件参数",
+                             analysis=_analysis("ORA.SECURITY.PASSWORD_PROFILE")))
+
+    profile_nd_rows = ctx.find_table("oracle.audit.profile_nondefault", "默认配置文件非默认设置")
+    display_profile_nd: list[dict[str, Any]] = []
+    for row in profile_nd_rows[:20]:
+        display_profile_nd.append({
+            "Profile": _cell(row, "PROFILE"),
+            "资源名": _cell(row, "RESOURCE_NAME"),
+            "限制值": _cell(row, "LIMIT"),
+        })
+    sec_items.append(_listed("自定义 Profile 口令设置", "oracle.audit.profile_nondefault",
+                             display_profile_nd, alias="默认配置文件非默认设置"))
+
+    pwf_rows = ctx.find_table("oracle.audit.password_file_members", "密码文件成员")
+    display_pwf: list[dict[str, Any]] = []
+    for row in pwf_rows[:20]:
+        display_pwf.append({
+            "用户名": _cell(row, "USERNAME"),
+            "SYSDBA": _cell(row, "SYSDB", "SYSDBA"),
+            "SYSOPER": _cell(row, "SYSOP", "SYSOPER"),
+            "SYSASM": _cell(row, "SYSAS", "SYSASM"),
+        })
+    sec_items.append(_listed("密码文件特权成员", "oracle.audit.password_file_members",
+                             display_pwf, alias="密码文件成员"))
+
+    fga_rows = ctx.find_table("oracle.audit.fga", "审计策略检查")
+    display_fga: list[dict[str, Any]] = []
+    for row in fga_rows[:20]:
+        display_fga.append({
+            "策略名": _cell(row, "POLICY_NAME"),
+            "对象 Schema": _cell(row, "OBJECT_SCHEMA"),
+            "对象名": _cell(row, "OBJECT_NAME"),
+            "启用": _cell(row, "ENABLED"),
+        })
+    sec_items.append(_listed("细粒度审计策略 (FGA)", "oracle.audit.fga",
+                             display_fga, alias="审计策略检查"))
+
+    obj_audit_rows = ctx.find_table("oracle.audit.object_audit", "对象审计统计")
+    display_obj_audit: list[dict[str, Any]] = []
+    for row in obj_audit_rows[:20]:
+        display_obj_audit.append({
+            "Owner": _cell(row, "OWNER"),
+            "对象名": _cell(row, "OBJ_NAME"),
+            "操作": _cell(row, "ACTION_NAME"),
+            "次数": _cell(row, "EXEC_COUNT"),
+        })
+    sec_items.append(_listed("对象审计统计（近7天）", "oracle.audit.object_audit",
+                             display_obj_audit, alias="对象审计统计"))
+
+    failed_login_rows = ctx.find_table("oracle.audit.failed_logins", "失败登录审计统计")
+    display_failed: list[dict[str, Any]] = []
+    for row in failed_login_rows[:20]:
+        display_failed.append({
+            "用户": _cell(row, "USERID"),
+            "失败次数": _cell(row, "CNT"),
+            "最近尝试": _cell(row, "LAST_ATTEMPT"),
+        })
+    sec_items.append(_listed("失败登录统计（近7天）", "oracle.audit.failed_logins",
+                             display_failed, alias="失败登录审计统计"))
+
     sections.append({"section_id": "security", "title": "安全与审计检查", "items": sec_items})
 
     # ── 11. 备份与恢复检查 (backup_recovery) ──
@@ -800,7 +1273,65 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                            rows=display_ctrl,
                            analysis=_analysis("ORA.CONTROL.REDUNDANCY")))
 
-    sections.append({"section_id": "backup_recovery", "title": "备份与恢复检查", "items": br_items})
+    # ── DataGuard / 高可用（批 13）：6 项采集此前全部不进报告。
+    #    动线对齐 MySQL —— 复制与高可用**折叠进备份章**，不另开一章（MySQL 的
+    #    「日志、备份与复制」就是一章收口；Oracle 原先把"归档模式"放实例章、
+    #    "归档趋势"放备份章，同一主题拆两处，读者要在两章之间拼）。
+    dg_dest_rows = ctx.find_table("oracle.dg.archive_dest", "日志传输服务状态")
+    display_dg_dest: list[dict[str, Any]] = []
+    for row in dg_dest_rows[:10]:
+        display_dg_dest.append({
+            "目的地": _cell(row, "DEST_ID"),
+            "名称": _cell(row, "DEST_NAME"),
+            "类型": _cell(row, "TYPE"),
+            "状态": _cell(row, "STATUS"),
+            "错误": _cell(row, "ERROR"),
+            "传输模式": _cell(row, "TRANSMIT_MODE"),
+            "压缩": _cell(row, "COMPRESSION"),
+        })
+    br_items.append(_listed("日志传输服务状态", "oracle.dg.archive_dest",
+                            display_dg_dest, alias="日志传输服务状态",
+                            analysis=_analysis("ORA.DG.TRANSPORT_ERROR")))
+
+    dg_broker_rows: list[dict[str, Any]] = []
+    for row in ctx.find_table("oracle.dg.broker_enabled", "DG Broker 启用状态")[:5]:
+        dg_broker_rows.append({"参数": _cell(row, "NAME"), "值": _cell(row, "VALUE")})
+    for row in ctx.find_table("oracle.dg.broker_params", "DG Broker 配置参数")[:10]:
+        dg_broker_rows.append({"参数": _cell(row, "NAME"), "值": _cell(row, "VALUE")})
+    br_items.append(_listed("DataGuard Broker 配置", "oracle.dg.broker_params",
+                            dg_broker_rows, alias="DG Broker"))
+
+    dg_mode_rows = ctx.find_table("oracle.dg.protection_mode", "保护模式与主库统计")
+    display_dg_mode: list[dict[str, Any]] = []
+    for row in dg_mode_rows[:20]:
+        display_dg_mode.append({"统计项": _cell(row, "NAME"), "值": _cell(row, "VALUE")})
+    br_items.append(_listed("保护模式与备库延迟", "oracle.dg.protection_mode",
+                            display_dg_mode, alias="保护模式与主库统计",
+                            analysis=_analysis("ORA.DG.APPLY_LAG")))
+
+    dg_gap_rows = ctx.find_table("oracle.dg.log_sequence_gap", "主备库日志序差距")
+    display_dg_gap: list[dict[str, Any]] = []
+    for row in dg_gap_rows[:10]:
+        display_dg_gap.append({
+            "线程": _cell(row, "THREAD#", "THREAD"),
+            "日志序差距": _cell(row, "GAP"),
+        })
+    br_items.append(_listed("主备库日志序差距", "oracle.dg.log_sequence_gap",
+                            display_dg_gap, alias="主备库日志序差距"))
+
+    dg_event_rows = ctx.find_table("oracle.dg.recent_events", "最近 DG 事件")
+    display_dg_event: list[dict[str, Any]] = []
+    for row in dg_event_rows[:20]:
+        display_dg_event.append({
+            "时间": _cell(row, "TIMESTAMP"),
+            "消息": _cell(row, "MESSAGE"),
+            "错误码": _cell(row, "ERROR_CODE"),
+        })
+    br_items.append(_listed("最近 DataGuard 事件", "oracle.dg.recent_events",
+                            display_dg_event, alias="最近 DG 事件",
+                            analysis=_analysis("ORA.DG.EVENT_ERROR")))
+
+    sections.append({"section_id": "backup_recovery", "title": "备份、恢复与高可用检查", "items": br_items})
 
     return sections
 
@@ -945,7 +1476,7 @@ def build_report_model(analysis: dict[str, Any], inspection_sections_list: list[
             "source_points": c.get("source_points", 0),
         })
 
-    return {
+    model = {
         "schema_version": "2.0",
         "generator_contract": "oracle_inspection_report_model",
         "cover": cover,
@@ -961,6 +1492,13 @@ def build_report_model(analysis: dict[str, Any], inspection_sections_list: list[
         "charts": charts_normalized,
         "appendix": appendix,
     }
+    # 「待客户确认事项」（清单 G1）。**条件注入**：旧基线 report_model.json 里没有这个
+    # 键，无条件写入会打穿冻结契约测试（逐字典等值比对）。它派生自已触发的规则，
+    # 不新增数据来源 —— 修的是「第 14 章只剩一句『未产出清单』」的空转。
+    pending = _merged_confirmations(instances)
+    if pending is not None:
+        model["pending_confirmations"] = pending
+    return model
 
 # ---- Main Pipeline ----
 

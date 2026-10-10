@@ -20,6 +20,7 @@ from .presentation import (
     build_inspection_sections,
     build_report_model,
     now_iso,
+    pending_confirmations,
 )
 from .rule_provider import OracleRuleProvider
 
@@ -55,6 +56,20 @@ class OracleAnalyzer:
                 "duration_ms": duration_ms(start_ns),
                 "reason": reason,
             })
+
+    def attach_pending_confirmations(self, analysis: dict[str, Any]) -> None:
+        """给每个实例挂上「待客户确认事项」。
+
+        派生自该实例**已触发的规则**（模板见 ``presentation.CONFIRMATION_TEMPLATES``），
+        与风险台账同源但不同问：台账答「是什么风险、怎么改」，本表答「哪几件事必须由
+        客户拍板、或必须由客户提供外部证据」。规则未触发则不进表。
+
+        必须排在 findings 定型之后调用。单实例同样会产出本键（只要有触发项）；它是
+        新增字段、旧基线 analysis.json 里并不存在，因此报告层必须**条件注入**，
+        否则会打穿冻结契约测试。
+        """
+        for instance in analysis.get("instances", []):
+            instance["pending_confirmations"] = pending_confirmations(instance)
 
     def analyze(self, sources: list[Path]) -> dict[str, Any]:
         self.output.mkdir(parents=True, exist_ok=True)
@@ -189,6 +204,9 @@ class OracleAnalyzer:
             "report_model": "oracle_inspection_report_model_2.0",
             "missing_value_policy": "缺失值保持 null；生成报告时显示'未采集/不适用'，不得显示为 0。",
         }
+        # 「待客户确认事项」（清单 G1）。挂在 findings 定型之后、报告模型之前 ——
+        # 它按 rule_id 查模板，取早了会漏项。
+        self.attach_pending_confirmations(analysis)
 
         write_json(self.output / "analysis.json", analysis)
         report_model = build_report_model(analysis, inspection_sections_collector, self.output)

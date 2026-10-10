@@ -1,12 +1,17 @@
-"""Oracle 图表生成：系统四张走公共层，Oracle 专属四张留插件，不参与风险判断。
+"""Oracle 图表生成：系统四张走公共层，Oracle 专属五张留插件，不参与风险判断。
 
 分层边界（阶段 14 第③步）：
 - CPU / 内存 / 磁盘 / 网络四张是纯 OS 图，直接取 ``os_chart_specs()`` 并用公共
   渲染器出图 —— 与 MySQL 同一套规格、同一套配色、同一套时间处理，matplotlib
   缺失时自动降级到 Pillow。
-- ``oracle_physical_io`` / ``oracle_logical_vs_physical`` / ``oracle_redo_rate`` /
-  ``oracle_parse_ratio`` 依赖 Oracle 语义（统计项速率、双轴解析率），仍由本插件
-  用 matplotlib 绘制，但配色与时间处理一律取自公共层。
+- ``ORACLE_CHART_IDS`` 里的五张依赖 Oracle 语义（统计项速率、双轴解析率），仍由
+  本插件用 matplotlib 绘制，但配色与时间处理一律取自公共层。
+
+★ **``ORACLE_CHART_IDS`` 是「产出」与「声明」的单一来源**：本模块按它出图，
+  ``plugins/oracle/word_report.py`` 的 ``section_charts`` 按它声明。两份集合一旦
+  分叉就会出现两种静默缺陷 —— 产出了没人声明（**生成即丢弃**，图算了白算），
+  或声明了产不出（报告里"这个位置本该有图"只能靠读代码才知道）。
+  ``tests/test_oracle_chart_coverage.py`` 钉住两者相等，别再手抄第二份清单。
 
 输出记录保持 Oracle 报告契约的字段（``chart_id`` + ``path`` + ``source_points``），
 并补上 ``status`` / ``source_scope``，让下游不必再按图名猜数据来源。
@@ -35,7 +40,18 @@ from .metrics import safe_float
 
 OS_CHART_IDS = ("SYSTEM_CPU", "SYSTEM_MEMORY", "SYSTEM_DISK", "SYSTEM_NETWORK_REALTIME")
 
-# matplotlib 缺失时只影响这四张 Oracle 专属图。
+# Oracle 专属图的 chart_id —— **产出（本模块）与声明（word_report）的唯一清单**。
+# 顺序即报告里的上图顺序；``_figure()`` 用 chart_id 直接命名 PNG，不再手写文件名，
+# 因此这里改一个 id 就等于同时改了产出与声明（前提是 word_report 从本常量派生）。
+ORACLE_CHART_IDS = (
+    "oracle_txn_rate",
+    "oracle_physical_io",
+    "oracle_logical_vs_physical",
+    "oracle_redo_rate",
+    "oracle_parse_ratio",
+)
+
+# matplotlib 缺失时只影响上面这五张 Oracle 专属图。
 _MATPLOTLIB_REASON = "matplotlib_not_installed"
 
 
@@ -103,10 +119,14 @@ class OracleChartProvider:
         timezone_name, display_tz = display_timezone(ctx)
         records: list[dict[str, Any]] = []
 
-        def _figure(title: str, ylabel: str, filename: str,
+        def _figure(title: str, ylabel: str, chart_id: str,
                     series: list[tuple[str, list[tuple[datetime, float]]]],
                     *, secondary: tuple[str, list[tuple[datetime, float]]] | None = None,
                     points: int) -> None:
+            # 产出侧自守门：id 必须在单一来源里注册过，否则会画出一张没人声明、
+            # 永远不会出现在报告里的图（生成即丢弃）。宁可当场报错，也别静默产垃圾。
+            if chart_id not in ORACLE_CHART_IDS:
+                raise ValueError(f"未在 ORACLE_CHART_IDS 注册的 Oracle 图：{chart_id}")
             fig, axis = plt.subplots()
             for label, pairs in series:
                 axis.plot([p[0] for p in pairs], [p[1] for p in pairs],
@@ -128,7 +148,7 @@ class OracleChartProvider:
             axis.xaxis.set_major_locator(mdates.AutoDateLocator(tz=display_tz))
             fig.autofmt_xdate(rotation=25)
             fig.tight_layout()
-            path = self.charts_dir / filename
+            path = self.charts_dir / f"{chart_id}.png"
             start_ns = time.monotonic_ns()
             fig.savefig(path)
             plt.close(fig)
@@ -159,23 +179,23 @@ class OracleChartProvider:
         hard = _series("parse_count_hard_per_sec")
 
         if _positive(commits) or _positive(rollbacks):
-            _figure("Oracle Transaction Rate", "txn/s", "oracle_txn_rate.png",
+            _figure("Oracle Transaction Rate", "txn/s", "oracle_txn_rate",
                     [("commits/s", commits), ("rollbacks/s", rollbacks)], points=len(commits))
         if _positive(reads) or _positive(writes):
-            _figure("Oracle Physical IO Rate", "IO/s", "oracle_physical_io.png",
+            _figure("Oracle Physical IO Rate", "IO/s", "oracle_physical_io",
                     [("reads/s", reads), ("writes/s", writes)], points=len(reads))
         if _positive(logical) and len(reads) >= 2:
             _figure("Oracle Reads: Logical vs Physical", "reads/s",
-                    "oracle_logical_vs_physical.png",
+                    "oracle_logical_vs_physical",
                     [("logical reads/s", logical), ("physical reads/s", reads)],
                     points=len(logical))
         if _positive(redo):
-            _figure("Oracle Redo Rate", "MB/s", "oracle_redo_rate.png",
+            _figure("Oracle Redo Rate", "MB/s", "oracle_redo_rate",
                     [("redo MB/s", [(moment, value / 1024 / 1024) for moment, value in redo])],
                     points=len(redo))
         if any(value >= 1 for _, value in execs) and len(hard) >= 2:
             ratio = [(moment, hard_value / (exec_value or 1) * 100)
                      for (moment, exec_value), (_, hard_value) in zip(execs, hard)]
-            _figure("Oracle Exec Rate & Hard Parse %", "exec/s", "oracle_parse_ratio.png",
+            _figure("Oracle Exec Rate & Hard Parse %", "exec/s", "oracle_parse_ratio",
                     [("exec/s", execs)], secondary=("hard parse %", ratio), points=len(execs))
         return records

@@ -330,6 +330,84 @@
       "summary": "单个数据文件的读写 IO 占比显著偏高，可能成为存储瓶颈。",
       "recommendation": "考虑将该数据文件迁移到更快的存储，或分散热点段到不同表空间。",
       "evidence_refs": ["tables/IO 消耗最高数据文件 TOP10.tsv"]
+    },
+
+    "ORA.DG.TRANSPORT_ERROR": {
+      "category": "dataguard",
+      "severity": "high",
+      "confidence": 0.95,
+      "title": "归档 / DG 日志传输目的地异常",
+      "summary": "v$archive_dest 中存在 ERROR 非空的目的地，归档或备库日志传输可能已中断；主库可能因归档目录写满而挂起。",
+      "recommendation": "检查该目的地对应的网络、目录权限与 TNS 配置，确认归档空间未满；必要时先清理再重试传输。",
+      "evidence_refs": ["tables/日志传输服务状态 (v$archive_dest).tsv"]
+    },
+    "ORA.DG.APPLY_LAG": {
+      "category": "dataguard",
+      "severity": "medium",
+      "confidence": 0.85,
+      "threshold": { "dg_lag_seconds_warning": 900 },
+      "title": "DataGuard 备库延迟偏大",
+      "summary": "备库的传输延迟或应用延迟超过阈值，故障切换时可能丢失较多数据（实际损失取决于保护模式）。",
+      "recommendation": "确认备库 MRP / RFS 进程正常、日志传输链路与网络带宽无瓶颈，并核对保护模式与 RPO 诉求。",
+      "evidence_refs": ["tables/保护模式与主库统计.tsv"]
+    },
+    "ORA.DG.LOG_GAP": {
+      "category": "dataguard",
+      "severity": "high",
+      "confidence": 0.9,
+      "threshold": { "dg_log_gap_warning": 5 },
+      "title": "主备库归档日志序差距过大",
+      "summary": "主库已归档日志的最大 sequence 与备库已应用日志之间存在明显差距，说明备库落后于主库。",
+      "recommendation": "排查备库应用进程与 FAL 传输，确认归档日志已完整送达备库并成功应用。",
+      "evidence_refs": ["tables/主备库日志序差距.tsv"]
+    },
+    "ORA.DG.EVENT_ERROR": {
+      "category": "dataguard",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "近 24 小时存在 DataGuard 错误事件",
+      "summary": "v$dataguard_status 中近 24 小时存在非零错误码事件，说明 DG 链路发生过异常（即使当前已恢复）。",
+      "recommendation": "结合事件时间点与主备库告警日志定位原因，确认异常已恢复且归档传送、应用均正常。",
+      "evidence_refs": ["tables/最近 DG 事件 (v$dataguard_status).tsv"]
+    },
+    "ORA.SCHEMA.SEGMENT_BLOAT": {
+      "category": "objects",
+      "severity": "medium",
+      "confidence": 0.8,
+      "threshold": { "segment_bloat_mb_warning": 1024 },
+      "title": "存在明显空间膨胀的段",
+      "summary": "段实际占用远大于按统计信息估算的应有大小，存在可回收的空闲空间（多为大量删除后未整理）。",
+      "recommendation": "评估对相关表执行在线重组（ALTER TABLE MOVE / DBMS_REDEFINITION）或 SHRINK SPACE，回收前先备份。",
+      "evidence_refs": ["tables/数据膨胀预估 (DBA_SEGMENTS vs DBA_TABLES).tsv"]
+    },
+    "ORA.CAPACITY.LARGE_SEGMENT": {
+      "category": "capacity",
+      "severity": "low",
+      "confidence": 0.8,
+      "threshold": { "large_segment_gb_warning": 100 },
+      "title": "存在超大表 / 索引段",
+      "summary": "单个表或索引段体积很大，日常维护（DDL、导出、重建、分区改造）的窗口占用与风险都会随之放大。",
+      "recommendation": "评估对大段做分区化改造、按时间归档历史数据，并把重建 / 导出安排在低峰窗口。",
+      "evidence_refs": ["tables/大表段 TOP20（按大小排序）.tsv", "tables/大索引段 TOP20.tsv"]
+    },
+    "ORA.SECURITY.PASSWORD_PROFILE": {
+      "category": "security",
+      "severity": "medium",
+      "confidence": 0.9,
+      "title": "口令 Profile 策略偏弱",
+      "summary": "存在未启用口令复杂度校验（PASSWORD_VERIFY_FUNCTION 为空）、或口令永不过期 / 失败次数不受限的 Profile，口令被暴力破解或长期不变更的风险上升。",
+      "recommendation": "为在用 Profile 配置 PASSWORD_VERIFY_FUNCTION 校验函数，并设置有限的 FAILED_LOGIN_ATTEMPTS 与 PASSWORD_LIFE_TIME。",
+      "evidence_refs": ["tables/密码配置文件参数.tsv"]
+    },
+    "ORA.SYSTEM.HUGEPAGES": {
+      "category": "system",
+      "severity": "medium",
+      "confidence": 0.85,
+      "threshold": { "hugepage_free_ratio_warning": 0.5 },
+      "title": "大页配置不符合 Oracle 建议",
+      "summary": "透明大页（THP）未关闭时内核会异步合并内存页，容易造成 Oracle 大内存进程的分配抖动；而 HugePages 是 Oracle SGA 推荐使用的静态大页 —— 与 MySQL 只要求关闭 THP 不同，Oracle 还要把 SGA 放进 HugePages。",
+      "recommendation": "把透明大页设为 never；按 SGA 大小计算并配置 vm.nr_hugepages，重启实例后确认 HugePages_Free 接近 0（表示已被 SGA 用掉）。",
+      "evidence_refs": ["tables/hugepages.tsv"]
     }
   }
 }
