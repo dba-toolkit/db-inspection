@@ -8,7 +8,6 @@ section wording stays here while the report contract remains stable.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
 from inspection_core import (
@@ -297,11 +296,9 @@ class MySQLPresentationBuilder:
         return result
 
     @staticmethod
-    def _raw_key_value_rows(path: Path) -> list[dict[str, str]]:
-        if not path.exists():
-            return []
+    def _raw_key_value_rows(lines: list[str]) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
-        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for raw in lines:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -315,11 +312,9 @@ class MySQLPresentationBuilder:
         return rows
 
     @staticmethod
-    def _colon_key_values(path: Path) -> dict[str, str]:
-        if not path.exists():
-            return {}
+    def _colon_key_values(lines: list[str]) -> dict[str, str]:
         values: dict[str, str] = {}
-        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for raw in lines:
             if ":" not in raw:
                 continue
             name, value = raw.split(":", 1)
@@ -327,16 +322,14 @@ class MySQLPresentationBuilder:
         return values
 
     @staticmethod
-    def _mount_rows(path: Path) -> list[dict[str, str]]:
+    def _mount_rows(lines: list[str]) -> list[dict[str, str]]:
         # 判据来自公共层（inspection_core.system_checks）：本地维护的黑名单
         # 曾在 hugetlbfs 上漏过一次，/dev/hugepages 因此被当成"真实块设备挂载"
         # 写进报告。仍是黑名单而非白名单——白名单会把 nfs/cifs 一并藏掉，
         # 而"数据目录落在网络文件系统"正是要报的风险。
-        if not path.exists():
-            return []
         rows: list[dict[str, str]] = []
         pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
-        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for raw in lines:
             matched = pattern.match(raw.strip())
             if not matched:
                 continue
@@ -352,25 +345,18 @@ class MySQLPresentationBuilder:
         return rows
 
     @staticmethod
-    def _dmesg_error_rows(path: Path, limit: int = 20) -> list[dict[str, str]]:
-        if not path.exists():
-            return []
-        lines = [
-            line.strip()
-            for line in path.read_text(encoding="utf-8", errors="replace").splitlines()
-            if line.strip()
-        ]
-        return [{"内核错误日志": line} for line in lines[:limit]]
+    def _dmesg_error_rows(lines: list[str], limit: int = 20) -> list[dict[str, str]]:
+        content = [line.strip() for line in lines if line.strip()]
+        return [{"内核错误日志": line} for line in content[:limit]]
 
     @staticmethod
     def _kernel_recommendation(ctx: "PackageContext") -> str:
         """Check OS kernel parameters for database-specific recommendations."""
-        path = ctx.root / "tables/kernel_parameters.tsv"
-        if not path.exists():
-            return ""
+        # 批 14：路径由 `ctx.raw_lines` 解析，呈现层不再拼 `ctx.root / "tables" / …`
+        # （目录不写死 —— 见 inspection_core.models.PackageContext.raw_lines）。
         # kernel_parameters.tsv is a key-value TSV: name \t value
         kernel: dict[str, str] = {}
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in ctx.raw_lines("kernel_parameters.tsv"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
@@ -660,7 +646,7 @@ class MySQLPresentationBuilder:
             backup_conclusion = "采集包未包含可验证的最近备份成功记录与恢复演练证据，因此不能判定备份有效。"
             backup_evidence = ["未采集到 evidence/backup_*.txt"]
 
-        lscpu = self._colon_key_values(ctx.root / "evidence/lscpu.txt")
+        lscpu = self._colon_key_values(ctx.raw_lines("lscpu.txt"))
         # 磁盘介质（HDD/SSD）：数据目录落在哪块盘上，决定 io_capacity、IO 延迟这类
         # 结论怎么落点——机械盘上 await 偏高是常态，SSD 上同样数字才是真问题。
         # 采集端已用 lsblk 记录 ROTA，但落盘的是空格对齐表格（见
@@ -725,9 +711,9 @@ class MySQLPresentationBuilder:
         if not excluded_fs_count:
             # 旧产物没有 excluded_filesystems 键，退回按行数差反推剔除数量。
             excluded_fs_count = max(len(capacity.get("filesystems", [])) - len(fs_rows), 0)
-        kernel_rows = self._raw_key_value_rows(ctx.root / "tables/kernel_parameters.tsv")
-        mount_rows = self._mount_rows(ctx.root / "evidence/mounts.txt")
-        dmesg_rows = self._dmesg_error_rows(ctx.root / "evidence/dmesg_errors.txt")
+        kernel_rows = self._raw_key_value_rows(ctx.raw_lines("kernel_parameters.tsv"))
+        mount_rows = self._mount_rows(ctx.raw_lines("mounts.txt"))
+        dmesg_rows = self._dmesg_error_rows(ctx.raw_lines("dmesg_errors.txt"))
         realtime = metrics.get("system_realtime", {})
         resource_rows = [
             {
