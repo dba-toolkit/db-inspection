@@ -553,8 +553,11 @@ def _build_sections(s: dict[str, Any], perf: dict[str, Any]) -> list[dict[str, A
     vols = s.get("volumes", [])
     if vols:
         s4.append({"title": "存储卷容量", "source": "sys.dm_os_volume_stats", "collection": _coll("存储卷容量"),
-            "display": {"headers": ["挂载点", "卷名", "文件系统", "总量MB", "可用MB", "可用率"],
-                "rows": [[v.get("volume_mount_point"), v.get("logical_volume_name"), v.get("file_system_type"),
+            # 「来源」列不能省：同一挂载点会分别以 DATABASE_FILE / XP_FIXEDDRIVES / BACKUP_MEDIA
+            # 三个来源各出一行，没有这一列会被读成"重复行"。
+            "display": {"headers": ["挂载点", "来源", "卷名", "文件系统", "总量MB", "可用MB", "可用率"],
+                "rows": [[v.get("volume_mount_point"), v.get("source"), v.get("logical_volume_name"),
+                    v.get("file_system_type"),
                     _nm(v.get("total_mb"),0), _nm(v.get("available_mb"),0), f"{_num(v.get('free_pct')):.1f}%"] for v in vols]}})
     lsp = s.get("log_space", [])
     if lsp:
@@ -942,12 +945,16 @@ def _inject_analysis(sections, findings):
         ('backup', '无备份'): ['BACKUP.NO_BACKUP'],
         ('backup', '可疑页面'): ['DB.SUSPECT_PAGES'],
         ('memory', '缓冲池'): ['MEM.CACHE_IMBALANCE'],
-        ('memory', '内存'): ['MEM.SIGNALING','MEM.PRESSURE'],
+        # 只匹配「进程内存状态」这一项。原先写的是 '内存' 子串 —— 它会同时命中同章的
+        # 「内存组件分布」「系统内存状态」，让三项结论逐字相同（都在说"进程内存利用率极高"），
+        # 而这两项在 analysis_text 里本来各有定制文案（讲 clerk 占用 / 整机内存）。
+        ('memory', '进程内存'): ['MEM.SIGNALING','MEM.PRESSURE'],
         ('capacity', '存储卷'): ['STORAGE.FREE_SPACE'],
         ('capacity', '日志'): ['LOG.SPACE'],
         ('capacity', 'VLF'): ['LOG.VLF'],
         ('capacity', '文件'): ['FILE.IO_LATENCY','FILE.PERCENT_GROWTH'],
         ('perf', '性能'): ['PERF.PLE','PERF.MEMORY_GRANTS'],
+        ('waits', '主要等待'): ['PERF.WAIT_TOP'],
         ('waits', '阻塞'): ['PERF.BLOCKING'],
         ('waits', '活动'): ['PERF.LONG_REQUEST'],
         ('waits', '连接'): ['PERF.CONNECTION_FLOOD'],
@@ -992,7 +999,10 @@ def _inject_analysis(sections, findings):
             if not unique:
                 continue
             severities = {ff.get('severity','medium') for ff in unique}
-            status = 'risk' if severities & {'critical','high'} else 'attention' if 'medium' in severities else 'normal'
+            # 三档：high/critical -> risk；medium **或 low** -> attention。
+            # 曾经把「只剩 low」判成 normal，于是「数据库清单」出现状态=正常、结论=三条风险
+            # 并排的自相矛盾 —— 命中的全是 low 档也是问题，只是轻，不能写"正常"。
+            status = 'risk' if severities & {'critical','high'} else 'attention' if severities & {'medium','low'} else 'normal'
             # 一个检查项命中多条规则时，各条的依据与建议会拼进同一格。不加主语就会
             # 串行 —— 实测「max server memory=…，物理内存=4095 MB；当前值=5；」里那个
             # "当前值=5" 是 cost threshold 的，读者会读成最大内存配了 5 MB。

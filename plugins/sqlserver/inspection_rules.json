@@ -386,6 +386,14 @@
         "索引碎片（深度）"
       ]
     },
+    "PERF.WAIT_TOP": {
+      "category": "性能与会话",
+      "severity": "low",
+      "title": "存在主导异常等待类型",
+      "required_modules": [
+        "等待统计"
+      ]
+    },
     "SEC.ORPHANED_USER": {
       "category": "安全",
       "severity": "medium",
@@ -538,6 +546,7 @@
     "file_io_warning_ms": 20,
     "file_io_critical_ms": 50,
     "blocking_warning_seconds": 60,
+    "wait_attention_min_ms": 60000,
     "long_request_seconds": 300,
     "tempdb_used_warning_pct": 80,
     "max_sysadmin_logins": 5,

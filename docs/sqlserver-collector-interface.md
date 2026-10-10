@@ -121,7 +121,7 @@ v1.1 的三个"边界"毛病已经处理掉两个：
 | 30 | CPU按数据库分布 | `cpu_by_database` | TOP15 | |
 | 31 | SQL Agent失败作业 | `failed_jobs` | 近 24h run_status=0 | |
 | 32 | SQL Agent作业清单 | `agent_jobs` | 全量 + 上次执行状态 | |
-| 33 | SQL Agent作业步骤 | `job_steps` | msdb.dbo.sysjobsteps TOP300：步骤名 / 子系统 / 失败动作 / 重试 / 上次结果与耗时；**command 前 400 字符**（**v1.3.2 新增**） | |
+| 33 | SQL Agent作业步骤 | `job_steps` | msdb.dbo.sysjobsteps TOP300：步骤名 / 子系统 / 失败动作 / 重试 / 上次结果与耗时；**command 前 400 字符**（**v1.3.2 新增**；有意保留在采集包内作留档、报告不展示 —— 见 §10-7） | |
 | 34 | 高可用状态 | `ha_status` | IsHadrEnabled / AG 数 / 副本数 / AG 库数（单行） | |
 | 35 | Always On | `availability_replicas` | dm_hadr_*；**含 availability_mode / last_redone_time / 延迟秒 / 连接错误** | |
 | 36 | 数据库镜像 | `database_mirroring` | | |
@@ -150,7 +150,7 @@ v1.1 的三个"边界"毛病已经处理掉两个：
 ```
 <OutputDir>/sqlserver_inspection_v1_<ip>_<server>_<port>_<stamp>/
 ├── snapshot.json           ← Python 唯一入口
-├── manifest.json           ← files[] + sha256（最终 3 项：snapshot.json / collector.log / inspection_report.md）
+├── manifest.json           ← schema_version + collector_version + created_at + files[]（**文件名列表，不含哈希**；最终 3 项：snapshot.json / collector.log / inspection_report.md）
 ├── inspection_report.md    ← 脚本自带 Markdown，Python 侧不使用
 ├── collector.log
 └── <同名>.zip              ← 除非 -NoPackage
@@ -158,7 +158,8 @@ v1.1 的三个"边界"毛病已经处理掉两个：
 
 注意四点：
 
-- `manifest.json` **写了两次**（`L1571` 先写 2 项，`L1839` 在 Markdown 生成后追加 `inspection_report.md`）。新增输出文件必须同步加在第二次写入之前，否则 manifest 与实际内容不符。
+- `manifest.json` **写了两次**（`L1570` 先写 2 项，`L1838` 在 Markdown 生成后追加 `inspection_report.md`）。新增输出文件必须同步加在第二次写入之前，否则 manifest 与实际内容不符。
+- ⚠ `manifest.json` 里**只有文件名列表，没有哈希**（`L1570` / `L1839` 的 `files=@(...)`）。想按 manifest 做完整性校验是做不到的 —— 需要校验就得先给采集端补 sha256；在此之前下游只能登记 `not_evaluated`（`report_adapter` 的完整性状态就是这么写的，不要当成缺陷去"修"成 ok）。
 - **未指定 `-OutputDir` 时默认写到 `%TEMP%\sqlserver_inspection`**（`L143-147`），与脚本自身位置无关；建目录失败再退到当前目录并 `Write-Warning`（见 §9-⑩）。**这是刻意的，不要改回"脚本同目录"**——原因见 §9-⑩ 与 gap-plan §F-21（AGENTS.md「采集脚本不得依赖自身所在目录」）。
 - **跑完会把最终产物路径单独打一遍**（`L1854-1860`，v1.3.5 新增）。默认目录在 RDP / 多会话机器上会带 `\2\` `\3\` 段，现场翻 AppData 很费劲；想让它落到顺手的位置就加 `-OutputDir`，例如 `-OutputDir "$env:USERPROFILE\Desktop"`（`-Help` 里有同一条示例）。⚠ `OUTPUT_DIR=` / `OUTPUT_PACKAGE=` 两行是**机器可读**的，新增的人类提示排在其后，**不要改变这两行的相对位置与格式**。
 - 目录名里的 IP 来自 `dm_exec_connections.local_net_address`，**本地连接时为 NULL**，脚本会用 `Get-NetIPAddress` 兜底（取 InterfaceMetric 最小的非回环 IPv4）—— 多网卡机器上可能取到心跳/管理网卡。
@@ -409,7 +410,7 @@ v1.3.3 修完 StrictMode 之后脚本能跑完了，但真机首跑（2026-09-10
 4. **新增采集项五件事一起做**：写 SQL → 决定"未启用/不支持"时返回什么（不能是写死 NULL）→ 更新本文档 §4 清单 → 更新 §3 键类型表 → **在 `presentation.py` 里真的读它**（AGENTS.md：采了却没人读的字段要么补分析、要么从采集端移除）。
 5. **二进制列必须在 SQL 侧转换。** `query_hash` / `query_plan_hash` 在 `sys.dm_exec_query_stats` 里是 `binary(8)`，ADO.NET 读出来是 `byte[]`，`ConvertTo-Json` 会写成 `[0,0,...]` 数字数组 —— 已统一转成 `CONVERT(varchar(18), col, 1)` 的十六进制串。
 6. **注释与代码同改。** 本项目注释密度低，那 79 行注释会被当成"已核实记录"来读 —— **撒谎的注释比没注释更坏**。
-7. **隐私边界**：`snapshot.json` 默认包含 6 个模块的 `sql_text`（`blocking` / `active_requests` / 4 个 top_queries），**v1.3.2 起**再含 `job_steps.command_preview`（作业步骤命令），全部**可能含明文口令、连接串、业务 SQL**。`-ExcludeSqlText` 是唯一开关（7 个字段一起抹）；原始包与基线输出**未经确认不得上传或外发**（AGENTS.md 硬规则）。
+7. **隐私边界**：`snapshot.json` 默认包含 6 个模块的 `sql_text`（`blocking` / `active_requests` / 4 个 top_queries），**v1.3.2 起**再含 `job_steps.command_preview`（作业步骤命令），全部**可能含明文口令、连接串、业务 SQL**。`-ExcludeSqlText` 是唯一开关（7 个字段一起抹）；原始包与基线输出**未经确认不得上传或外发**（AGENTS.md 硬规则）。其中 `job_steps.command_preview` 属**有意保留采集、报告不展示**：它是排查作业失败时对照用的留档证据，`presentation.py` 有意不渲染，避免把可能含明文口令的命令行带进交付报告 —— **不是**「采了没人读」的漏项，审计时不要当缺口补展示。
 8. **bit 列的 JSON 序列化禁止 `-eq [DBNull]::Value`，必须用 `-is [System.DBNull]`。**
    PowerShell 的 `-eq` 会按**左操作数**类型强制转换右操作数，`$true -eq [DBNull]::Value` 结果是 `$true`——
    后果是**所有「值为真」的 bit 列被静默序列化成 `null`**，脚本不报错、包照常产出，只有下游判据集体失效。

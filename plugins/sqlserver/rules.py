@@ -64,6 +64,49 @@ def _elapsed_seconds(now: datetime, then: datetime | None) -> float | None:
     return (now - then).total_seconds()
 
 
+# 值得关注的等待类型前缀：这些类型累计偏高通常指向真实资源瓶颈。
+# 不收录 CXPACKET / SOS_SCHEDULER_YIELD / PREEMPTIVE_* / HADR_* / SLEEP_* /
+# DIRTY_PAGE_* / MEMORY_ALLOCATION_EXT 等「正常运维或高并发下天然偏高」的类型 ——
+# 对它们报线索等于制造噪声：实测健康实例里 SOS_WORK_DISPATCHER 累计占比超过 60%。
+_WAIT_ATTENTION_PREFIXES = (
+    "PAGEIOLATCH_",
+    "IO_COMPLETION",
+    "WRITELOG",
+    "RESOURCE_SEMAPHORE",
+    "THREADPOOL",
+    "LCK_M_",
+    "ASYNC_NETWORK_IO",
+)
+
+# 按前缀给出「这说明什么 / 怎么复核」两句，供 PERF.WAIT_TOP 的 impact 与 recommendation 使用。
+_WAIT_HINTS: tuple[tuple[str, str, str], ...] = (
+    ("PAGEIOLATCH_", "数据页读取在 I/O 路径上排队。",
+     "结合该时段的磁盘延迟与热点查询复核；评估索引覆盖与存储性能，不要仅靠加大内存掩盖。"),
+    ("IO_COMPLETION", "文件系统 I/O 请求完成偏慢，多为存储层排队。",
+     "结合存储监控复核队列深度与延迟，区分读写路径并排查热点文件。"),
+    ("WRITELOG", "日志写入成为瓶颈，常见于日志与数据同盘或提交过于频繁。",
+     "核对日志文件所在卷的延迟与写放大，必要时分离日志盘；减少小事务逐条提交。"),
+    ("RESOURCE_SEMAPHORE", "查询在等待内存授权，说明内存授予不足或并发大查询偏多。",
+     "复核内存授予等待与最大内存配置，优先治理并发大查询与糟糕的基数估算。"),
+    ("THREADPOOL", "工作线程耗尽，实例无法及时调度新请求。",
+     "排查占满线程的阻塞或长请求，定位并处理异常会话后再评估最大工作线程配置。"),
+    ("LCK_M_", "存在锁等待，并发事务相互阻塞。",
+     "定位阻塞链源头事务并缩短其持锁时间；补充有效索引，检查应用提交逻辑。"),
+    ("ASYNC_NETWORK_IO", "会话在等待客户端取走结果集，通常是客户端逐行处理或网络延迟。",
+     "检查客户端取数方式与网络质量，避免在服务端返回超大结果集。"),
+)
+
+
+def _wait_hint(wait_type: str) -> tuple[str, str]:
+    """把等待类型映射到「影响 + 建议」；白名单外的类型给中性措辞。"""
+    upper = str(wait_type).upper()
+    for prefix, impact, advice in _WAIT_HINTS:
+        if upper.startswith(prefix):
+            return impact, advice
+    return ("该等待类型累计偏高，需结合业务时段与实例运行时长复核。",
+            "结合等待类型性质与业务窗口复核；必要时用 DBCC SQLPERF 清零后复采对比。")
+
+
 class RuleEngine:
     def __init__(self, config: dict[str, Any], now: datetime):
         self.t = config.get("thresholds", {})
@@ -645,6 +688,43 @@ class RuleEngine:
                 self.add("PERF.MEMORY_GRANTS", "性能与内存", "存在等待内存授权的查询", "high", "Memory Manager",
                          f"采样最大 Memory Grants Pending={grants:.0f}", "查询可能排队或溢写 tempdb。",
                          "检查大内存授权查询、统计信息和并发度，并评估实例内存配置。")
+        self._wait_attention(s)
+
+    def _wait_attention(self, s: dict[str, Any]) -> None:
+        """等待统计：识别累计偏高的「异常等待类型」，给出线索（低风险，不硬判故障）。
+
+        `wait_stats` 是唯一一个「采了、有文案、却没有任何判据」的模块 —— 采集端专门用
+        ignored_wait_types 过滤掉 27 个良性类型，说明本来打算判，只是下游没接上。
+        本判据只做两件事：认类型（白名单）、认累计量（绝对门槛），产出线索而非定级。
+        门槛用于滤掉健康实例的零头：实测健康实例的 LCK_M_X / PAGEIOLATCH_SH
+        只累计到 3.6s / 2.4s，不该被当成问题。
+        """
+        floor = _num(self.t.get("wait_attention_min_ms", 60000)) or 0
+        hits = [
+            w for w in (s.get("wait_stats") or [])
+            if (_num(w.get("wait_time_ms")) or 0) >= floor
+            and any(str(w.get("wait_type") or "").upper().startswith(p)
+                    for p in _WAIT_ATTENTION_PREFIXES)
+        ]
+        if not hits:
+            return
+        hits.sort(key=lambda r: -(_num(r.get("wait_time_ms")) or 0))
+        top = hits[0]
+        wait_type = str(top.get("wait_type") or "")
+        impact, advice = _wait_hint(wait_type)
+        others = "、".join(
+            f"{w.get('wait_type')} {(_num(w.get('wait_time_ms')) or 0):,.0f} ms"
+            for w in hits[1:4]
+        )
+        self.add(
+            "PERF.WAIT_TOP", "性能与会话", "存在主导异常等待类型", "low", wait_type,
+            f"{wait_type}：累计等待={(_num(top.get('wait_time_ms')) or 0):,.0f} ms、"
+            f"{(_num(top.get('waiting_tasks_count')) or 0):,.0f} 次、"
+            f"平均={(_num(top.get('avg_wait_ms')) or 0):,.1f} ms"
+            + (f"；同类偏高：{others}" if others else ""),
+            impact,
+            advice,
+        )
 
     def tempdb(self, s: dict[str, Any]) -> None:
         t = s.get("tempdb", {})
