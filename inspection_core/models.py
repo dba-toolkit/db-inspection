@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 
 
+#: 非表格式证据文件（`.txt` / key-value `.tsv`）在包内可能出现的目录，按此顺序查找。
+#: ★ 批 6 / N-8 曾把 4 个「列对齐文本」（`free` / `df` / `df -i` / `lsblk`）从 `tables/`
+#:   挪到 `evidence/`；呈现层当时把目录写死，移动后**静默少一节内容**、没有任何测试会红。
+#:   所以目录名只在本模块出现一次，调用方一律按**契约文件名**取（`PackageContext.raw_lines`）。
+_RAW_FILE_DIRS: tuple[str, ...] = ("tables", "evidence")
+
+
 @dataclass
 class Finding:
     """One triggered inspection finding suitable for reporting."""
@@ -108,3 +115,28 @@ class PackageContext:
     def instance_id(self) -> str:
         identity = self.snapshot.get("instance_identity", {})
         return str(identity.get("server_uuid") or identity.get("instance_tag") or self.source.stem)
+
+    def raw_lines(self, name: str) -> list[str]:
+        """按**契约文件名**在包内查找并返回其**原始行**；找不到返回 `[]`。
+
+        只用于 `.txt` / key-value `.tsv` 这类**非表格式**证据文件（`lscpu.txt`、
+        `mounts.txt`、`dmesg_errors.txt`、`os_release.txt`、`time_status.txt`、
+        `kernel_parameters.tsv` …）。**表格式数据**（`tables/*.psv`）请走 `tables` 字典，
+        两者不要混用。
+
+        ★ 为什么不让调用方拼 `root / "evidence" / name`：这些文件的**所在目录**在历次采集器
+        改造中移动过（N-8 把 4 个对齐文本从 `tables/` 挪到 `evidence/`）。路径写死的后果是
+        **静默**的 —— 文件读不到就返回空，报告少一节内容，规则层不报、测试不红。
+        所以查找目录集中在 `_RAW_FILE_DIRS`，调用方只认文件名。
+
+        顺序即 `_RAW_FILE_DIRS`，命中第一个存在的文件即返回；同名文件不会在两个目录并存
+        （`tables/` 只放表格式数据，`evidence/` 只放原文证据）。
+        """
+        for sub in _RAW_FILE_DIRS:
+            path = self.root / sub / name
+            if path.is_file():
+                try:
+                    return path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    return []
+        return []

@@ -15,6 +15,8 @@ from inspection_core.word_engine import (
     COLOR_LOW,
     COLOR_MEDIUM,
     COLOR_TEXT,
+    ChartDefinition,
+    SectionChartProfile,
     WordReportEngine,
 )
 from plugins.mysql.word_report import MYSQL_WORD_PROFILE, MySQLWordReportGenerator
@@ -203,6 +205,75 @@ class WordEngineTests(unittest.TestCase):
             self.assertNotIn("+0800", generated_time + collection_time)
             self.assertFalse(any(row[:2] == ["动作", "要求"] for row in all_rows))
             self.assertTrue(any("无记录" in cell for row in all_rows for cell in row))
+
+
+class ChartSkippingTests(unittest.TestCase):
+    """声明了图、却一张都没产出时，报告必须留一行原因（批 12）。
+
+    早先 `render_section_charts` 在过滤后集合为空时直接 `return False` ——
+    连"趋势图"小节都不出现、也不留任何说明。读者因此分不清"这一章设计上就没有图"
+    与"本该有图但没画出来"。与「未采集 ≠ 0」同源：**没有 ≠ 不知道**。
+    """
+
+    def _generator(self) -> MySQLWordReportGenerator:
+        return MySQLWordReportGenerator(REPORT_MODEL, Path(tempfile.gettempdir()) / "chart-skip.docx")
+
+    @staticmethod
+    def _profile(*chart_ids: str) -> SectionChartProfile:
+        return SectionChartProfile(
+            model_field="system_analysis",
+            charts=tuple(ChartDefinition(chart_id, f"{chart_id} 图题") for chart_id in chart_ids),
+        )
+
+    def test_note_names_every_declared_caption_and_translates_the_reason(self) -> None:
+        note = self._generator()._missing_charts_note(
+            self._profile("SYSTEM_CPU", "SYSTEM_MEMORY"),
+            {"SYSTEM_CPU": {"status": "skipped", "reason": "insufficient_data_points"}},
+        )
+        self.assertIn("2", note)
+        self.assertIn("SYSTEM_CPU 图题", note)
+        self.assertIn("SYSTEM_MEMORY 图题", note)
+        self.assertIn("采样点不足", note)
+        self.assertNotIn("insufficient_data_points", note)
+
+    def test_unknown_reason_is_passed_through_verbatim(self) -> None:
+        # 不吞信息：没登记过的代码原样带出，别让新原因被静默抹平。
+        note = self._generator()._missing_charts_note(
+            self._profile("SYSTEM_CPU"),
+            {"SYSTEM_CPU": {"status": "skipped", "reason": "brand_new_code"}},
+        )
+        self.assertIn("brand_new_code", note)
+
+    def test_note_without_any_record_explains_generically(self) -> None:
+        note = self._generator()._missing_charts_note(self._profile("SYSTEM_CPU"), {})
+        self.assertIn("采样窗口", note)
+
+    def test_declared_section_without_charts_renders_a_note_not_a_heading(self) -> None:
+        model = read_json(REPORT_MODEL)
+        model["mysql_performance"]["charts"] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "model.json"
+            write_json(model_path, model)
+            output = Path(temporary) / "report.docx"
+            MySQLWordReportGenerator(
+                model_path, output,
+                author="王劲松", reviewer="邓秋爽", logo_path=LOGO,
+                company=MYSQL_WORD_PROFILE.default_company, layout="legacy",
+            ).build()
+            generated = Document(output)
+            paragraphs = [paragraph.text for paragraph in generated.paragraphs]
+            # 只数**正文**小节标题；目录页也会列同样的"N.M 趋势图"，不能混进来。
+            chart_headings = [
+                paragraph.text for paragraph in generated.paragraphs
+                if (paragraph.style.name if paragraph.style is not None else "") == "Heading 2"
+                and "趋势图" in paragraph.text
+            ]
+        joined = "\n".join(paragraphs)
+        self.assertIn("图表未生成", joined)
+        self.assertIn("本次一份也没产出", joined)
+        self.assertIn("连接与运行线程趋势", joined)
+        # 另一章（系统性能）的图照常渲染 —— 只剩它一个"趋势图"小节。
+        self.assertEqual(len(chart_headings), 1)
 
 
 class SummaryColoringTests(unittest.TestCase):

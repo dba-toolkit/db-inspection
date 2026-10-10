@@ -1216,6 +1216,32 @@ class WordReportEngine:
         if notes:
             self.note_box("拓扑口径校正", "".join(notes), accent=COLOR_TEXT)
 
+    # 图未产出时给读者的原因。采集/渲染层交上来的是**代码串**
+    # （insufficient_data_points / matplotlib_not_installed …），直接印进报告
+    # 读者看不懂；这里翻成话，**未知代码原样带出** —— 不吞信息。
+    CHART_SKIP_REASONS = {
+        "insufficient_data_points": "采样点不足",
+        "no_renderer_available": "没有可用的绘图后端",
+        "matplotlib_not_installed": "绘图后端不可用（matplotlib 未安装）",
+    }
+
+    def _missing_charts_note(self, chart_profile: SectionChartProfile,
+                             charts: dict[str, dict[str, Any]]) -> str:
+        captions = "、".join(definition.caption for definition in chart_profile.charts)
+        reasons: list[str] = []
+        for record in charts.values():
+            if record.get("status") == "generated":
+                continue
+            reason = str(record.get("reason") or "").strip()
+            if not reason:
+                continue
+            readable = self.CHART_SKIP_REASONS.get(reason, reason)
+            if readable not in reasons:
+                reasons.append(readable)
+        detail = "；".join(reasons) if reasons else "采样点不足，或该指标在采样窗口内无变化"
+        return (f"本章设计有 {len(chart_profile.charts)} 张趋势图（{captions}），"
+                f"本次一份也没产出：{detail}。")
+
     def render_section_charts(self, section_id: str, main_number: int,
                               subsection_number: int) -> bool:
         chart_profile = self.profile.section_charts.get(section_id)
@@ -1228,6 +1254,11 @@ class WordReportEngine:
             if charts.get(definition.chart_id, {}).get("status") == "generated"
         ]
         if not generated:
+            # 声明了图却一张都没产出 —— **不能静默**（与「未采集 ≠ 0」同源）。
+            # 早先这里直接 return False，读者分不清"这一章设计上就没有图"和
+            # "本该有图但没画出来"。不改小节号（不渲染"趋势图"标题），只留一行原因。
+            self.note_box("图表未生成", self._missing_charts_note(chart_profile, charts),
+                          accent=COLOR_TEXT)
             return False
         self.heading(f"{main_number}.{subsection_number} 趋势图", 2)
         for index, (chart_id, caption, chart) in enumerate(generated, 1):
