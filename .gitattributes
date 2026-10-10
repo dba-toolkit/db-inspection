@@ -1,0 +1,17 @@
+# ===== 行尾策略：仓库与检出统一 LF =====
+#
+# 背景（2026-10-10 排查）：
+#   曾出现 docs/PROJECT_MAP.md 每次改动都被 git 算成"全文件重写"
+#   （2805 增 / 2174 删），而真实内容变化只有 631 行。
+#   根因不是行尾本身，而是正文里混入了两个控制字节
+#   （`\1` 被写成 0x01、`\r` 被写成游离 0x0D），git 因此把整个文件判为非文本，
+#   进而跳过 EOL 归一化。字节已修正，本文件是防复发的显式声明。
+#
+# 口径：
+#   * 仓库与工作树统一 LF。本项目产物主要面向 Linux
+#     （inspection/*.sh 采集脚本在 Linux 上执行，CRLF 会让 shebang 失效）；
+#     Windows 侧的 inspection/*.ps1 亦按纯 LF 维护（见 PROJECT_MAP）。
+#   * text=auto 让 git 自动识别二进制（*.png / *.docx / *.gz 等）并跳过转换。
+#   * 注意：正文（含 Markdown 代码块里的命令示例）不得含控制字符 ——
+#     双引号 echo / printf 会吃掉 `\1`、`\r` 这类转义，单引号 here-string 才安全。
+* text=auto eol=lf
