@@ -223,6 +223,33 @@ def status_text(value: Any) -> str:
     return mapping.get(raw.lower(), raw)
 
 
+# ★ 状态词的**唯一来源**：professional 布局的 `display_status()` 与两处「数据缺口」表
+#   都从这一份取。此前缺口表各自手写了一份 6 键字典（professional / legacy 各一份），
+#   于是 `not_enabled` / `skipped` / `unsupported` / `missing` 落不进那 6 个键 ——
+#   **原样印出英文枚举**（Oracle 2.0 包实测 §16.2 出现 `not_enabled` ×3、`skipped` ×2）。
+#   这类漏键不抛异常、不报错、测试也不红：四库基线里缺口状态恰好只有
+#   `external_evidence_required`，而它在那份手写字典里，所以一直是绿的。
+#   与批 19 规则项 `unavailable` 泄漏**同源** —— 呈现层映射漏一个键 = 交付物里出现英文。
+#   `insufficient_history` / `external_evidence_required` 是缺口表专有词，并进来才不会退化。
+STATUS_DISPLAY = {
+    "ok": "正常", "complete": "完整", "usable": "可用", "unusable": "不可用",
+    "success": "成功", "failed": "失败", "partial": "部分可用",
+    "empty": "无记录", "not_applicable": "不适用", "not_evaluated": "未判断",
+    "skipped": "已跳过", "unsupported": "不支持", "permission_denied": "权限不足",
+    "timeout": "超时", "error": "失败", "not_enabled": "未启用",
+    "unavailable": "未采集", "missing": "未采集",
+    "insufficient_history": "历史不足", "external_evidence_required": "需要外部证据",
+    "attention": "关注", "normal": "正常", "risk": "风险",
+    "triggered": "触发", "passed": "通过",
+}
+
+
+def gap_status_text(value: Any) -> str:
+    """「数据缺口」表的状态列。与 `display_status()` 同一份词表，只此一处。"""
+    raw = text(value)
+    return STATUS_DISPLAY.get(raw.lower(), raw)
+
+
 def clean_limitation(value: Any) -> str:
     raw = str(value)
     if "system.filesystems" in raw:
@@ -515,16 +542,11 @@ class WordReportEngine:
         if self.layout == "legacy":
             return status_text(value)
         raw = text(value)
-        mapping = {
-            "ok": "正常", "complete": "完整", "usable": "可用", "unusable": "不可用",
-            "success": "成功", "failed": "失败", "partial": "部分可用",
-            "empty": "无记录", "not_applicable": "不适用", "not_evaluated": "未判断",
-            "skipped": "已跳过", "unsupported": "不支持", "permission_denied": "权限不足",
-            "timeout": "超时", "error": "失败", "not_enabled": "未启用",
-            "attention": "关注", "normal": "正常", "risk": "风险",
-            "triggered": "触发", "passed": "通过",
-        }
-        return mapping.get(raw.lower(), raw)
+        # ★ 批 19：词表提到模块级 `STATUS_DISPLAY`（与缺口表共用一份）。此前这里是
+        #   就地写死的一份 mapping，缺 `unavailable` ⇒ 规则项「没采到」时**原样印出英文**
+        #   `unavailable`；缺 `missing` / `insufficient_history` / `external_evidence_required`
+        #   ⇒ 缺口表另抄一份、越抄越偏。呈现层的错不抛异常、测试也不红，只能靠这份映射兜住。
+        return STATUS_DISPLAY.get(raw.lower(), raw)
 
     def heading(self, value: str, level: int = 1) -> Any:
         return self.doc.add_heading(value, level=level)
@@ -1737,14 +1759,11 @@ class WordReportEngine:
         subsection = 2
         if gaps:
             self.heading(f"{main_number}.{subsection} 数据缺口", 2)
-            gap_status_cn = {
-                "partial": "部分可用", "insufficient_history": "历史不足",
-                "external_evidence_required": "需要外部证据", "permission_denied": "权限不足",
-                "timeout": "超时", "error": "失败",
-            }
+            # ★ 批 19：原先是就地手写的 6 键字典，`not_enabled` / `skipped` 等落不进键
+            #   ⇒ 状态列原样印英文。改为与 `display_status()` 共用 `STATUS_DISPLAY`。
             self.data_table([{
                 "采集项": gap.get("item_id"),
-                "状态": gap_status_cn.get(str(gap.get("status")), gap.get("status")),
+                "状态": gap_status_text(gap.get("status")),
                 "原因": gap.get("reason"),
                 "补充建议": gap.get("recommended_action"),
             } for gap in gaps])
@@ -1866,18 +1885,13 @@ class WordReportEngine:
             )
         if gaps:
             self.heading(f"{main_number}.2 数据缺口", 2)
-            gap_status_cn = {
-                "partial": "部分可用",
-                "insufficient_history": "历史不足",
-                "external_evidence_required": "需要外部证据",
-                "permission_denied": "权限不足",
-                "timeout": "超时",
-                "error": "失败",
-            }
+            # ★ 批 19：同 professional —— 并进模块级 `STATUS_DISPLAY` 单一来源。
+            #   此处原字典的 6 个键在新词表里取值逐字相同（含 `external_evidence_required`
+            #   →「需要外部证据」），MySQL 的 legacy 冻结 hash 因此逐字节不变。
             self.data_table([
                 {
                     "采集项": gap.get("item_id"),
-                    "状态": gap_status_cn.get(str(gap.get("status")), gap.get("status")),
+                    "状态": gap_status_text(gap.get("status")),
                     "原因": gap.get("reason"),
                     "补充建议": gap.get("recommended_action"),
                 }

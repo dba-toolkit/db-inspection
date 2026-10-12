@@ -467,11 +467,18 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     def _item(title: str, item_id: str, rows: list[dict[str, Any]] | None = None,
                analysis: dict[str, Any] | None = None) -> dict[str, Any]:
         col = _status(item_id)
+        # ★ **规则项也要印真实采集状态**：`_status()` 只查 `quality.non_ok_items`，而那本账
+        #   ① 只记失败态（`ok`/`empty` 都不进）、② 按**采集项** id 索引 ⇒ 规则 id 永远查不到，
+        #   于是底层表是「查了没有」(`empty`) 还是「根本没采」(`unavailable`)，
+        #   报告一律印成「正常」（批 19 的 C 项）。
+        #   判据身上带着 `source_status`（随 `RuleEvaluation` 出来），是唯一不会与采集实况
+        #   脱钩的来源：规则读什么表、那张表采没采到，写在同一个地方。
+        judged = str((_eval_by_rule.get(item_id) or {}).get("source_status") or "")
         return {
             "title": title,
             "source": f"Oracle 采集包 — {item_id}",
             "collection": {
-                "status": col.get("status", "ok"),
+                "status": judged or col.get("status", "ok"),
                 "row_count": len(rows) if rows else None,
                 "reason": col.get("reason", ""),
             },
@@ -789,18 +796,27 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                                rows=display_asm,
                                analysis=_analysis("ORA.STORAGE.ASM")))
 
-    fra_rows = ctx.find_table("FRA", "闪回区", "快速恢复区")
-    if fra_rows:
-        display_fra: list[dict[str, Any]] = []
-        for row in fra_rows[:10]:
-            display_fra.append({
-                "名称": row.get("NAME", ""),
-                "大小(MB)": row.get("SPACE_LIMIT") or row.get("SIZE_MB", ""),
-                "使用率(%)": row.get("PERCENT_SPACE_USED") or row.get("PCT", ""),
-            })
-        sc_items.append(_item("快速恢复区(FRA)", "ORA.STORAGE.FRA",
-                               rows=display_fra,
-                               analysis=_analysis("ORA.STORAGE.FRA")))
+    # ★ 批 19：这里从前是 `ctx.find_table("FRA", "闪回区", "快速恢复区")` —— `find_table` 的
+    #   **子串兜底**先把 "FRA" 命中了 `快速恢复区（FRA）参数`（只有 `NAME`/`VALUE` 两列）⇒
+    #   「名称」列印出 `db_recovery_file_dest`，「大小/使用率」两列恒空：一张**参数表**被当成
+    #   使用率表展示（读者只会以为"FRA 没用量"）。取数与列名都按真正的使用率表来：
+    #   `V$RECOVERY_FILE_DEST` → `LIMIT_GB|USED_GB|PCT_USED|RECLAIMABLE_GB|NUMBER_OF_FILES`
+    #   （ASM 版无 `PCT_USED`，由规则层用 used/limit 折算，见 `oracle_rules._fra_percent`）。
+    fra_usage = ctx.table_fetch("oracle.flashback.area_usage", "闪回区使用情况")
+    fra_asm = ctx.table_fetch("oracle.archive.fra_asm", "ASM 快速恢复区使用情况")
+    display_fra: list[dict[str, Any]] = []
+    for row in [*fra_usage.rows, *fra_asm.rows][:10]:
+        display_fra.append({
+            "文件类型": _cell(row, "FILE_TYPE", "NAME"),
+            "上限(GB)": _cell(row, "LIMIT_GB"),
+            "已用(GB)": _cell(row, "USED_GB"),
+            "使用率(%)": _cell(row, "PCT_USED"),
+            "可回收(GB)": _cell(row, "RECLAIMABLE_GB"),
+            "文件数": _cell(row, "NUMBER_OF_FILES"),
+        })
+    sc_items.append(_listed("快速恢复区(FRA)", "oracle.flashback.area_usage",
+                            display_fra, alias="闪回区使用情况",
+                            analysis=_analysis("ORA.STORAGE.FRA")))
 
     # ── Autoextend display ──
     ae_rows = ctx.tables.get("数据文件自动扩展余量", [])
