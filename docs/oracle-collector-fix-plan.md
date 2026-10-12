@@ -1746,6 +1746,141 @@ DataGuard 的 5 项从这里开始展示，把"高可用"写进章名才名实�
 
 ---
 
+## 批 16：`control_files` 折行链 —— 「一行一记录」契约（采集层 + 解析层 + 展示层）✅ 已完成（2026-10-12）
+
+**范围**：`inspection/oracle_inspection.sh`（列宽声明 / 一个分隔符）+ `plugins/oracle/package_adapter.py`（解析层）
++ `plugins/oracle/presentation.py`（展示层）+ 守门 `tools/check_oracle_psv_widths.py` + 测试 + 基线。
+本章把批 15「有意未做」表里的第一条（`control_files` 折行）做掉 —— 它横跨**三层**，
+是「报了个看起来像数据问题的现象、修完却看不出变化」的典型。
+
+### 病（用户原话）
+
+> 5.1 control_files 折行 —— 那是 SQL\*Plus 按 80 列宽断的，不是真有两个文件；属取数层，
+> 动手前得先确认"是采集时折的还是展示时断的"。
+
+报告里长这样：
+
+```
+control_files | /u01/app/oracle/oradata/ZYDB/control01.ctl, /u01/app/oracle/oradata/ZYDB/control
+```
+
+读起来像**两个控制文件、第二个叫 `control`**。
+
+### 先取证再动手：「采集时折的」还是「展示时断的」？
+
+拆真实包字节（`tables/oracle.basic.parameters.psv`，10-10 包）：
+
+```
+[4] 94  'control_files|/u01/app/oracle/oradata/ZYDB/control01.ctl, /u01/app/oracle/oradata/ZYDB/control'
+[5]  7  '|02.ctl'
+```
+
+第 4 行停在 `…/control`、第 5 行是残段 `|02.ctl` ⇒ **采集时就断了**，包内已经是两行
+（`COLUMN value FORMAT a80` 折的）。结论决定动手位置：**取数层为主、解析层兜存量**。
+
+### 根因四层
+
+| 层 | 病灶 |
+|---|---|
+| ① 采集 | SQL 是 `SUBSTR(value, 1, 400) value`，而 `COLUMN value FORMAT a80` ⇒ 差值 320 字符被 sqlplus 折行 |
+| ② 采集 | 3 处 `WORD_WRAPPED` 是**按词**折行，残段无法用「无分隔符续接」还原（会粘字） |
+| ③ 采集 | `LISTAGG(name, ' \| ')` 的分隔符与 `SET COLSEP '\|'` 撞；2.0 的 `psv_normalize` 还会把 ` \| ` 压成 `\|`（1.4 不压空白，所以一直没暴露） |
+| ④ 展示 | 值列写死 `[:80]`，**正好也切在第 80 个字符** ⇒ ①②③ 全修好，报告里**一个字符都不变** |
+
+★ 第 ④ 层是本批最贵的发现：修完 ①②③、重出报告、肉眼核对 —— **看起来完全没修**。
+两处截断都落在第 80 个字符上，截图与改前一致。
+**「改完看不出变化」要先怀疑还有第二处同形截断，别急着怀疑自己没生效**；判"修没修好"**看数据、不看截图**。
+
+### 四处改动
+
+1. **采集层：列宽按「≥ SQL 截断长度」重设，并撤掉按词折行**（`ora_sql_to_md` 的 `COLUMN` 声明区）
+   —— `value`/`VALUE` `a80→a500`（SQL 是 `SUBSTR(value,1,400)`）、`description`/`DESCRIPTION` `a200`、
+   `message`/`MESSAGE` `a500`、`message_text` `a500`、`finding_name` 去掉 `WORD_WRAPPED`，
+   新增 `COLUMN additional_info FORMAT a120`（SQL 侧正好截 120）。
+   **`WORD_WRAPPED` 全撤（3 处）**，让"断词折行"成为唯一模式，回并才有定义。
+2. **采集层：`LISTAGG` 分隔符改 `'; '`**（`oracle.validation.controlfile_multiplex`）—— 别再与 COLSEP 撞。
+3. **解析层：`_rejoin_wrapped_rows` 兜底存量包**（`package_adapter`）—— 判据是**结构化**的：
+   2.0 会话设了 `SET NULL '-'` ⇒ 空单元格根本不存在 ⇒ 「首字段为空」只能是折行残段。
+   ★ 见下节，这个前提**只对 2.0 成立**。
+4. **展示层两处**：`5.1` 值列去掉 `[:80]`（这是让前三条「看得见」的那一刀）；
+   `11.8 控制文件冗余` 的键名对齐 —— 旧代码读 `NAME`/`VALUE`，而该表的真实列是
+   `CONTROLFILE_COUNT`/`CONTROLFILE_PATHS` ⇒ 整表两个格子恒空（与批 15 P0-3 同家族：
+   **展示层读的键名必须与解析层产出一致**）。
+
+### ★★ 一个真实踩过的坑：前提写错，就会把数据并进表头
+
+第一版把回并写成「**分隔符是 `|`** 就回并」（1.4 的 `.tsv` 与 2.0 的 `.psv` 都是 `|`）。
+刷 08-10 基线时立刻暴露：
+
+| 表 | 回并前 | 回并后 | 后果 |
+|---|---|---|---|
+| `控制文件.tsv` | 3 行 | **1 行** | 表头 `STATUS \|NAME` 把两行数据吸进去 ⇒ 报告里 `控制文件路径` **由 2 行塌成 0 行**（`csv.DictReader` 不再有数据行） |
+| `控制文件序列号.tsv` | 3 行 | 1 行 | 同上 |
+| `最近 SQL 错误 (近24h).tsv` | 15 行 | 14 行 | 把相邻两条告警并成一条 |
+
+原因：**1.4 没有 `SET NULL '-'` 保证** —— 它的第一列空白是 **NULL 落在定宽列里**，
+下面这两行是**真实数据行**，不是残段：
+
+```
+STATUS |NAME
+       |/u01/app/oracle/oradata/ZYDB/control01.ctl
+       |/u01/app/oracle/oradata/ZYDB/control02.ctl
+```
+
+⇒ **判据的前提是「采集器版本保证空单元格不存在」，不是「分隔符是 `|`」**。
+修法：开关由 `_iter_table_specs` 按**版本**给出（1.4 关 / 2.0 开）——
+全仓库**唯一**把「版本」翻译成「能不能回并」的地方；`parse_delimited(repair_wrap=…)` **默认关**
+（忘了传参的代价是「折行没修」= 报告里看得见，而不是「数据被静默吃掉」）。
+
+### 机械守门：`tools/check_oracle_psv_widths.py`（四类判据）
+
+| # | 判据 | 动机 |
+|---|---|---|
+| ① | `SUBSTR(…,1,N) <别名>` 必须有 `COLUMN <别名> FORMAT aM` 且 `M ≥ N` | 本批主病；未声明也算违规（宽度交由 sqlplus 从表达式推导、不可控） |
+| ② | SQL 字面量里不许含 `\|` | COLSEP 是 `\|`；**用引号状态机**取字面量，不能用朴素正则 |
+| ③ | 不许 `COLUMN … WORD_WRAPPED` | 按词折行的残段无法回并 |
+| ④ | **同名别名宽度必须唯一** | ★ **负控制实测抓出来的漏洞**（见下） |
+
+★ 判①②两处**误报**是修出来的，并各配了一条「误伤」用例钉住：
+
+- 朴素正则 `'[^']*\|[^']*'` 会从**前一个字面量的收尾引号**匹配到**后一个字面量的起始引号**
+  （命中 `' ELSE x \|\| '`）⇒ 6 处假阳性；改成**引号状态机**（含 `''` 转义）。
+- 注释里提到 `WORD_WRAPPED` 不算违规 ⇒ 判③ 锚定 `^\s*COLUMN\b`。
+
+★ 判④ 的来历：负控制里「把采集层 `COLUMN value FORMAT a500` 改回 `a80`」**仍然全绿**。
+查因：判① 的宽度表按「同名取**最大值**」，而脚本里 `value`/`VALUE` **各声明一条**
+（sqlplus 列名大小写不敏感，两类都写是常规做法）⇒ `max(500, 80) = 500`，改窄被抹平。
+补上「同名宽度必须唯一」后才真实变红。**全脚本 45 条声明 / 26 个去重别名，零冲突 ⇒ 这条零误报。**
+—— 这正是「绿测试不等于有效测试」的又一次现场复现。
+
+### 验证
+
+- 新增 `tests/test_oracle_psv_wrapping.py`（**26 用例 / 4 类**：尺子自证 12 / 回并用例 8 / 端到端 4 / 版本开关 2）
+  + `tests/test_oracle_report_quality.py::InitParameterValueDisplayTests`（展示层不截断）。
+- **尺子自证**：把故意违规的源码喂给**同一个** `check_script`，必须抓到（含两条误伤反例）。
+- **负控制** `_work/_b16_negctl.py` **13/13 真实变红**（批 15 的 8 条一并复跑，确认老守门没被本批改动带坏），
+  逐字节复原 + sha256 校验。
+- **影响面实测**：10-10 包 103 张表里回并只动 **1 张 1 行**（正是 `parameters.psv` 的 `|02.ctl`）；
+  08-10 包 98 张表里 2.0 语义下同样只动 1 张。
+- **基线**：`expected_summary` **逐项不变**（health 23 / rules 42 / triggered 11 / passed 24 /
+  not_evaluated 7 / risk_register 11 / items 76 / sections 9），10 张 PNG **零差异**，
+  `llm_input.json` **零差异**；新旧产物逐项 diff 后**只剩两处** —— `control_files` 值 80→86 字符、
+  11.8 两个空格子变成 `控制文件数 2` / `路径 …`。
+- **实测（10-10 包）**：5.1 的 `control_files` 在 docx 单元格里是完整 86 字符（`…/control02.ctl`）；
+  11.8 由空表 → `控制文件数 2` / `路径 /u01/…/control01.ctl`；业务指标不变（items 77 / findings 12 / charts 9 / score 20）。
+- 回归：全量 `pytest` = **5 failed / 428 passed / 168 subtests**（5 个 FAIL 仍是 `tests/test_mysql_*`
+  源包不在仓库），**无新增失败**。
+
+### 有意未做
+
+| 批次 | 内容 |
+|---|---|
+| **批 14b（候选）** | 把取数收口推到 **PostgreSQL**（`plugins/postgresql/presentation.py` 9 处）—— 共享访问点已就位，纯机械替换 |
+| **Top SQL 另两个维度** | 包内还有 `oracle.topsql.logical_reads` / `physical_reads`（各 20 行），按同一 `render_bar_spec` 追加即可 |
+| **`最近 SQL 错误` 的 60 字符截断** | 展示层 `MESSAGE_TEXT[:60]`。本批未动：它是**告警消息预览**（不是路径/标识），且截断后另有 `PROBLEM_KEY` 兜底；要改应连"加省略号"一起做 |
+
+---
+
 ## 0.5 实测复核：真实采集包逐条验证（2026-10-09）
 
 **复核对象**：`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`  

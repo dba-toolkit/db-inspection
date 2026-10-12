@@ -2885,4 +2885,44 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
     「未提供补充依据」**66 → 4**；「本项没有可展示的结构化记录。」**22 → 0**。
 - **未做**：5.1 `control_files` 的**折行**（SQL\*Plus 按 80 列宽折行，不是两个真文件）—— 属**取数层**；
   PG 取数收口仍是批 14b；Top SQL 另两个维度未出图。
+  ★ `control_files` 折行**已由批 16 做掉**，见 §22.63。
 - 详见 `docs/oracle-collector-fix-plan.md`「批 15」章与 `docs/oracle-collector-interface.md` §11.17。
+
+### 22.63 Oracle `control_files` 折行链 —— 「一行一记录」契约（采集层 + 解析层 + 展示层）
+
+**范围**：`inspection/oracle_inspection.sh`（`COLUMN` 宽度 + 一个 `LISTAGG` 分隔符）+
+`plugins/oracle/{package_adapter,presentation}.py` + 守门 `tools/check_oracle_psv_widths.py` + 测试 + 基线。
+把 §22.62 里「未做」的 `control_files` 折行做掉。
+
+- **病**：5.1 报告里 `control_files | /u01/…/control01.ctl, /u01/…/control` —— 读起来像
+  **两个控制文件、第二个叫 `control`**。用户先要求"确认是采集时折的还是展示时断的"。
+- **取证结论 = 采集时折的**：拆包字节 `parameters.psv` 第 4 行 94 字符停在 `…/control`、第 5 行是残段
+  `|02.ctl` ⇒ 包内已是两行（`COLUMN value FORMAT a80` 折的）。
+- **根因四层**：① 采集 `SUBSTR(value,1,400)` 而宽度声明 `a80`；② `WORD_WRAPPED` 按词折、残段无法回并；
+  ③ `LISTAGG(name,' | ')` 与 `SET COLSEP '|'` 撞（2.0 的 `psv_normalize` 还把 ` | ` 压成 `|`）；
+  ④ 展示层值列 `[:80]` **正好也切在第 80 个字符** ⇒ ①②③ 修完报告**一个字符都不变**。
+- **改动**：① 列宽 `≥` SQL 截断长度（`value` a500 / `description` a200 / `message*` a500 / 新增
+  `additional_info a120`）+ **全撤** `WORD_WRAPPED`（3 处）；② `LISTAGG` 分隔符改 `'; '`；
+  ③ 解析层 `_rejoin_wrapped_rows` 兜底存量包；④ 展示层去 `[:80]` + 修正 11.8 键名
+  （旧读 `NAME`/`VALUE`，真实列是 `CONTROLFILE_COUNT`/`CONTROLFILE_PATHS` ⇒ 两个格子恒空）。
+- **★★ 一个真实踩过的坑**：回并第一版按「**分隔符**是 `|` 就回并」写，刷 08-10 基线立刻暴露 ——
+  **1.4 没有 `SET NULL '-'` 保证**，`控制文件.tsv` 第一列空白是 NULL 落在定宽列里、是**真实数据行**，
+  开回并后表头把两行数据吸走 ⇒ 报告里 `控制文件路径` **由 2 行塌成 0 行**（另有两张表同样被误并）。
+  修法：开关按**采集器版本**由 `_iter_table_specs` 单点给出（1.4 关 / 2.0 开），
+  `parse_delimited(repair_wrap=…)` **默认关**（fail-safe：代价是"折行没修"而不是"数据被吃掉"）。
+  **判据的前提是「版本保证空单元格不存在」，不是「分隔符是 `|`」。**
+- **守门**：`tools/check_oracle_psv_widths.py` 四类判据（宽度失配 / 竖线字面量 / `WORD_WRAPPED` /
+  **同名别名宽度冲突**）。判①②的**误报**（朴素正则跨字面量、注释里提 `WORD_WRAPPED`）各配一条「误伤」用例；
+  判④ 是**负控制实测抓出来的漏洞** —— 判① 按「同名取最大值」比较，而 `value`/`VALUE` 各声明一条 ⇒
+  `max(500,80)=500`，把 `a500` 改回 `a80` **仍然全绿**；补「同名宽度必须唯一」后才变红
+  （全脚本 45 条声明 / 26 个去重别名，零冲突 ⇒ 零误报）。
+- **验证**：新增 `tests/test_oracle_psv_wrapping.py`（**26 用例 / 4 类**）+
+  `test_oracle_report_quality.py::InitParameterValueDisplayTests`；
+  **负控制 13/13 真实变红**（含批 15 的 8 条复跑）；影响面实测：10-10 包 103 张表里回并只动 **1 张 1 行**。
+  **基线 `expected_summary` 逐项不变**、10 张 PNG **零差异**、`llm_input.json` 零差异；
+  新旧产物逐项 diff 后**只剩两处**（值 80→86 字符、11.8 两个空格子变成真数据）。
+  回归 **5 failed / 428 passed / 168 subtests**（5 个 FAIL 仍是 `tests/test_mysql_*` 源包不在仓库）。
+- **未做**：PG 取数收口（批 14b）；Top SQL `logical_reads`/`physical_reads` 两个维度；
+  `最近 SQL 错误` 的 `MESSAGE_TEXT[:60]` 预览截断（告警消息预览，另有 `PROBLEM_KEY` 兜底）。
+- 详见 `docs/oracle-collector-fix-plan.md`「批 16」章与 `docs/oracle-collector-interface.md` §11.18。
+
