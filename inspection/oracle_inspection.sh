@@ -820,8 +820,11 @@ ora_value_ok() { [ "$(cat "$(ora_value_flag_file)" 2>/dev/null)" = "1" ]; }
 #     且每个字段按 `COLUMN … FORMAT aNN` 右填充 —— 填充是**空格与 TAB 混合**，列宽不固定。
 #   本函数做三件事：① 去空行；② 去掉纯横线分隔行（长度>4 才算，避免误删单列值为 `-` 的数据行）；
 #   ③ 把竖线两侧的填充空白全部剥掉 → 下游 `awk -F'|'` 直接可用，无需再 strip。
-#   ⚠ 已知边界：值内部若含 `|` 会被当分隔符；`WORD_WRAPPED` 长值可能折行。两者都已在
-#     interface §6.3 记为已知限制（因此 SQL 的 SELECT 列表里不要出现裸 `|`）。
+#   ⚠ 已知边界：值内部若含 `|` 会被当分隔符 —— 已由「SQL 字面量不得含竖线」守门杜绝
+#     （`tools/check_oracle_psv_widths.py`；2.0 会连两侧空白一起压掉，`a | b` → `a|b`，
+#     第二个值被静默丢进 csv 的 None 列；1.4 不压空白所以一直看不出来）。
+#     折行则由「宽度 ≥ SQL 截断长度 + 全脚本无 `WORD_WRAPPED`」结构性消除，
+#     存量包由解析层 `package_adapter._rejoin_wrapped_rows` 兜底回并。
 psv_normalize() {
     sed -e 's/\r$//' "$1" 2>/dev/null \
       | sed -e 's/[[:space:]]*|[[:space:]]*/|/g' -e 's/[[:space:]]*$//' \
@@ -882,15 +885,24 @@ SET COLSEP '|'
 -- ★ OF-02：分隔符选竖线而非 TAB —— sqlplus 无法输出裸 TAB，这是绕开限制的
 --   近似方案（错在**命名**，不在分隔符选择本身）。文件名后缀随之改为 .psv。
 -- 限制宽列显示宽度，避免 VARCHAR2(4000) 列撑爆输出
--- 注意：v\$parameter.value 已用 SUBSTR() 截断；v\$pgastat/gv\$sysstat.value(NUMBER) SQL内用 COLUMN 覆盖
+-- ★★ 宽度必须 **≥ SQL 侧对该列的截断长度**，否则 sqlplus 会把它**折行**——
+--    折行后 .psv 里就多出一条「首字段为空」的残段（实测 control_files 107 字符
+--    被 a80 断成两行，残段 |02.ctl 被当成一行新参数）。
+--    判据：SUBSTR(...,1,N) 对应的 COLUMN <列名> FORMAT aM 必须 **M >= N**；
+--    守门 = tools/check_oracle_psv_widths.py（失配即报错）。
+-- ★★ **一律不写 WORD_WRAPPED**：它是**按词**折行，折点落在词间 ⇒ 残段与上一行
+--    无法用「无分隔符拼接」还原（会粘字）。去掉后 sqlplus 只剩**断词折行**一种模式，
+--    解析层 package_adapter._rejoin_wrapped_rows 才能安全兜底。
+--    ⚠ 本段在**未加引号的 heredoc 内**：禁止反引号，$ 一律写 \$。
+--    注意：v\$parameter.value 已用 SUBSTR() 截断；v\$pgastat/gv\$sysstat.value(NUMBER) SQL内用 COLUMN 覆盖
 COLUMN name         FORMAT a50
 COLUMN NAME         FORMAT a50
-COLUMN value        FORMAT a80
-COLUMN VALUE        FORMAT a80
-COLUMN description  FORMAT a80
-COLUMN DESCRIPTION  FORMAT a80
-COLUMN message      FORMAT a120 WORD_WRAPPED
-COLUMN MESSAGE      FORMAT a120 WORD_WRAPPED
+COLUMN value        FORMAT a500
+COLUMN VALUE        FORMAT a500
+COLUMN description  FORMAT a200
+COLUMN DESCRIPTION  FORMAT a200
+COLUMN message      FORMAT a500
+COLUMN MESSAGE      FORMAT a500
 COLUMN host_name    FORMAT a30
 COLUMN HOST_NAME    FORMAT a30
 COLUMN parameter    FORMAT a42
@@ -899,7 +911,8 @@ COLUMN destination  FORMAT a70
 COLUMN member       FORMAT a100
 COLUMN file_name    FORMAT a100
 COLUMN path         FORMAT a80
-COLUMN message_text FORMAT a120 WORD_WRAPPED
+COLUMN message_text FORMAT a500
+COLUMN additional_info FORMAT a120
 COLUMN obj_name     FORMAT a50
 COLUMN username         FORMAT a30
 COLUMN USERNAME         FORMAT a30
@@ -923,8 +936,8 @@ COLUMN baseline_name    FORMAT a40
 COLUMN BASELINE_NAME    FORMAT a40
 COLUMN task_name        FORMAT a50
 COLUMN TASK_NAME        FORMAT a50
-COLUMN finding_name     FORMAT a80 WORD_WRAPPED
-COLUMN FINDING_NAME     FORMAT a80 WORD_WRAPPED
+COLUMN finding_name     FORMAT a80
+COLUMN FINDING_NAME     FORMAT a80
 COLUMN impact_type      FORMAT a30
 COLUMN IMPACT_TYPE      FORMAT a30
 COLUMN impact           FORMAT 999999999999990.00
@@ -3595,8 +3608,12 @@ GROUP BY status, device_type
 ORDER BY status, device_type;"
 
     ora_sql_to_md "oracle.validation.controlfile_multiplex" "控制文件多路复用" "
+-- ★ 分隔符**不得用竖线**：COLSEP 就是 |，值里再出现 | 会被下游当成列边界
+--   （2.0 的 psv_normalize 还会把两侧空白压掉，`a | b` 直接变成 `a|b`）
+--   ⇒ 第二个控制文件路径被静默丢进 csv 的 None 列。1.4 没压空白所以看不出来。
+--   守门 = tools/check_oracle_psv_widths.py 的「SQL 字面量不得含竖线」。
 SELECT COUNT(*) controlfile_count,
-       LISTAGG(name, ' | ') WITHIN GROUP (ORDER BY name) controlfile_paths
+       LISTAGG(name, '; ') WITHIN GROUP (ORDER BY name) controlfile_paths
 FROM v\$controlfile;"
 
     ora_sql_to_md "oracle.validation.redo_multiplex" "Redo 日志多路复用检查" "
