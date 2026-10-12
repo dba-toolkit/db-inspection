@@ -1,7 +1,7 @@
 # oracle_inspection.sh 改造清单
 
 - 对象：`inspection/oracle_inspection.sh`（原 3586 行 / 87 个函数 / 注释密度 **4.7%**）
-- **当前状态**：批 **0–7 全部落地**（采集脚本，`inspection/oracle_inspection.sh` **4610 行 / 105 个函数 / 注释密度 14.4%**，`COLLECTOR_VERSION` = `SNAPSHOT_SCHEMA_VERSION` = `PACKAGE_VERSION` = **2.0**，批 5–7 均**无新采集项**、版本号不动）；批 **8 / 10 / 11 / 12 / 12b / 13 / 14 在 Python 侧**（采集脚本零改动）：批 8（2026-10-10）让 `plugins/oracle/package_adapter.py` **真正消费 2.0 包**（`collector_version` 分叉 + `.psv` + 1.4→2.0 查找键桥接）；批 10（2026-10-10）把**分析层 / 报告层对齐 MySQL**（补齐「待客户确认事项」+ 修正章节动线）；批 11（2026-10-10）**规则补口** —— 补齐 DataGuard / 对象治理 / 口令 Profile / 大页四个"采了有数据、零判据"的域（规则包 **34 → 42**），并整体刷新 Oracle 基线；批 12（2026-10-10）**图表收口** —— 图的「声明集合 = 可产出集合」（单一来源 `ORACLE_CHART_IDS` + `oracle_txn_rate` 上架 + 共享引擎不再静默 `return False`）；批 13（2026-10-10）**展示补口** —— 把「采了有数据、一个字不进报告」的四个域（AWR 段膨胀/高水位/索引使用/统计缺失、DataGuard、审计画像、undo/temp/共享池）接进报告（检查项 **52 → 76**，章节数不变）；批 14（2026-10-10）**取数口径统一** —— 呈现层不再自拼包内路径，非表格式证据文件一律走共享访问点 `PackageContext.raw_lines`（Oracle 6 处 + MySQL 5 处；规范化比对**零字节变化**，基线未动）。批 12b（2026-10-12）**图表补口** —— 补三张「包内有数据、报告里没有图」的图（表空间使用率 Top-N 条形 / Top SQL 执行时间 Top-N 条形 / 每日归档量趋势折线），并把**条形渲染入口下沉公共层** `render_bar_spec`（纯新增、四库基线零影响）；图 **8 → 10**。
+- **当前状态**：批 **0–7 全部落地**（采集脚本，`inspection/oracle_inspection.sh` **4610 行 / 105 个函数 / 注释密度 14.4%**，`COLLECTOR_VERSION` = `SNAPSHOT_SCHEMA_VERSION` = `PACKAGE_VERSION` = **2.0**，批 5–7 均**无新采集项**、版本号不动）；批 **8 / 10 / 11 / 12 / 12b / 13 / 14 在 Python 侧**（采集脚本零改动）：批 8（2026-10-10）让 `plugins/oracle/package_adapter.py` **真正消费 2.0 包**（`collector_version` 分叉 + `.psv` + 1.4→2.0 查找键桥接）；批 10（2026-10-10）把**分析层 / 报告层对齐 MySQL**（补齐「待客户确认事项」+ 修正章节动线）；批 11（2026-10-10）**规则补口** —— 补齐 DataGuard / 对象治理 / 口令 Profile / 大页四个"采了有数据、零判据"的域（规则包 **34 → 42**），并整体刷新 Oracle 基线；批 12（2026-10-10）**图表收口** —— 图的「声明集合 = 可产出集合」（单一来源 `ORACLE_CHART_IDS` + `oracle_txn_rate` 上架 + 共享引擎不再静默 `return False`）；批 13（2026-10-10）**展示补口** —— 把「采了有数据、一个字不进报告」的四个域（AWR 段膨胀/高水位/索引使用/统计缺失、DataGuard、审计画像、undo/temp/共享池）接进报告（检查项 **52 → 76**，章节数不变）；批 14（2026-10-10）**取数口径统一** —— 呈现层不再自拼包内路径，非表格式证据文件一律走共享访问点 `PackageContext.raw_lines`（Oracle 6 处 + MySQL 5 处；规范化比对**零字节变化**，基线未动）。批 12b（2026-10-12）**图表补口** —— 补三张「包内有数据、报告里没有图」的图（表空间使用率 Top-N 条形 / Top SQL 执行时间 Top-N 条形 / 每日归档量趋势折线），并把**条形渲染入口下沉公共层** `render_bar_spec`（纯新增、四库基线零影响）；图 **8 → 10**。批 15（2026-10-12）**报告质量修复** —— 用户拿真实报告（`192.168.100.80_db01`）与**同客户 MySQL 报告**逐条比对后挑出的六处：伪文件系统不进容量判据（P0-1，光驱 `iso9660` 是只读介质、恒定 100% 满 ⇒ 真值 33%）、**表空间图与表 6.1 / 规则层同口径**（P0-2，`USED_MB ÷ MAX_MB`）、4.5 键名对齐 `parse_df_pt`（P0-3）、规则**通过**项也带实测值（P1-2，全文「未提供补充依据」**66 → 4**）、性能表一张只留一种行形（P1-3）、规则项正文不再印通用占位（P1-4，落在**共享引擎** `inspection_core/word_engine.py`、四库同享）。业务结果**不变**（健康分 23 / 规则 42 / 风险 11 / 章节 9 / 检查项 76 / 图 10），图里**只有** `oracle_tablespace_usage.png` 变了（正是 P0-2）。
 - **批 8（2026-10-10）不在采集脚本里**：转 **Python 侧** —— `plugins/oracle/package_adapter.py` 此前对所有 `tables/*.tsv` 一律按 `|` 解析，**且完全忽略 `tables/*.psv`** ⇒ 2.0 包只读出 5 张垃圾表，34 条规则里 **16 条 `not_evaluated`**。本批按 `collector_version` 分叉 + 重建 1.4→2.0 的查找键桥接，实测 `not_evaluated` **16 → 2**（余下 2 条是"无 ASM / FRA 未配置"的环境事实）。**collector 侧自此无遗留代码项。**
 - `_work/_pkg2_check_report.md` / `_work/_pkg3_check_report.md` = 两轮体检报告（15 条 + 6 条发现 + 批次建议）；验收脚本 `_work/_b1_make_verify.py` → `_work/_verify_b1.sh`（**T1–T26，PASS=139 / FAIL=0**），另有第四道静态守门 `_work/_scan_record_status.py`。
 - **仍需现场确认**：① N-4 用同型号实例复采（ORA-00904 消失）；② OF-19 中断路径构造一次；③ 批 7 的复采核对（见「批 7」章节末尾）。
@@ -1636,6 +1636,114 @@ DataGuard 的 5 项从这里开始展示，把"高可用"写进章名才名实�
 
 ---
 
+## 批 15：报告质量修复 —— 拿真实报告逐条核对（Python 侧）✅ 已完成（2026-10-12）
+
+**范围**：只动 Python（`plugins/oracle/{oracle_rules,package_adapter,presentation,charts,report_adapter}.py`
++ 共享引擎 `inspection_core/word_engine.py` + 测试 + 基线），`inspection/oracle_inspection.sh` **零改动**
+（数据早就采到了，错的是**读法 / 口径 / 文案**）。
+
+### 病与判据
+
+本批起点**不是读代码猜**，是用户拿生成的 `192.168.100.80_db01_Oracle数据库巡检报告.docx` **逐条挑错**，
+再拿一份**同客户的 MySQL 报告**（`192.168.1.20-db02-MySQL数据库巡检报告.docx`，脱敏名）当参照系比对。
+六处全是**客户一眼能看出不对**的：
+
+| # | 现象（报告里原样长这样） | 真因 |
+|---|---|---|
+| P0-1 | 「文件系统使用率过高 最高文件系统使用率：**100.0%**」 | 规则层遍历**全部** `df` 行取最大值 —— 光驱 `/dev/sr0 iso9660` 是**只读介质**，恒定 100% 满且 0 可用；真值（`/`）只有 **33%**。`tmpfs`/`devtmpfs`/`proc`/`sysfs` 更**没有容量概念** |
+| P0-2 | 图 6-1「表空间使用率排行」SYSTEM **99.98%**（标红），表 6.1 里同一表空间 **3.39%** | 图取 `PCT_USED`（分母 = **已分配** `ALLOC_MB`），表与规则层取 `USED_MB ÷ MAX_MB`（分母 = **最大可扩**）。**同一份报告、同一个对象、两个数**，客户只会先信更吓人的那个 |
+| P0-3 | 4.5「文件系统使用情况」9 行表，除使用率外**三列全空** | 展示层读 `MOUNTPOINT`/`FILESYSTEM`/`AVAILABLE`，而 `parse_df_pt` 产出的是 `Mounted on`/`Filesystem`/`Available` —— **只有 `USE%` 恰好撞对** |
+| P1-2 | 章末「依据与建议」列 **66 处**「未提供补充依据」 | `RuleEvaluation` 只有**触发**才把 `facts` 存进 `Finding`，**通过**项的证据被丢弃 |
+| P1-3 | 7.1 性能表**每行都缺两个格子**、填成「未采集」 | 7.1 只画「平均值 + 最大值」的**速率**行，却把 Buffer Cache 命中率 / 磁盘排序**比例**行混进同一张表；渲染层按行的**键并集**出列 |
+| P1-4 | 规则判定项（"CPU 压力评估""无效对象""物理坏块"…）正文只有「本项没有可展示的结构化记录。」 | 这些项**本就没有明细表**，其全部产出就是一条判定结论。落回通用空数据文案 ⇒ 读者把「这是规则项」读成「采集失败 / 数据缺失」 |
+
+★ 三处**同源**病灶一并收口：
+① 3.8「挂载参数」把 39 行 `mount` 全列出来（proc/tmpfs/cgroup/光驱），**真正的持久化挂载点只有 2 行**被淹掉
+（MySQL 侧早已过滤 —— **四库只有 Oracle 漏了**）；
+② `df -PT` 容量列是 **1024-blocks（KB）裸数字**直接印进"可用空间"；
+③ 表 6.1「已使用(MB)」用 `if used_val` 判空 ⇒ 真 0 被当成空白格（与「未采集 ≠ 0」相悖）。
+
+### 六条机制性改动
+
+1. **P0-1 伪文件系统不进容量判据**（`oracle_rules._check_filesystem_usage`）：
+   过滤判据用**公共层** `inspection_core.system_checks.is_persistent_fstype`（**MySQL 早就在用**），
+   键名归一用新增的 `package_adapter.filesystem_type(row)`（**与产生键名的 `parse_df_pt` 同一文件**）。
+   ★ **不在规则层再写一份黑名单** —— 规则层写一份、展示层写一份，两边迟早分叉。
+   口径串里带上「**已排除 N 个 tmpfs/devtmpfs/光驱等非持久化挂载点**」，让客户**能自证**
+   （否则看到"最高 33%"会问"我 `df` 有 9 行，凭什么只算这个"）。
+2. **P0-2 表空间图改口径**（`charts._tablespace_chart`）：图 × 表 6.1 × 规则层**三处同一算式**
+   `USED_MB ÷ MAX_MB`；`MAX_MB` 缺失（老包）才退回 `PCT_USED`。图题改「表空间**容量**使用率」、
+   x 轴标签写明「已用率（已使用 ÷ 最大可扩，%）」—— 口径写进图里，读者不用翻源码。
+3. **P0-3 4.5 键名对齐**（`presentation`）：读 `Mounted on`/`Filesystem`/`Available`（旧拼法留作兜底），
+   补「类型」列，新增 `_kb_human()` 把 KB 换算成 `64.30 GB`。同一处还加了 **`elif fs_rows:` 分支**：
+   **全被过滤掉也要出项**（写 `not_applicable` + 一句说明），让"整机只有 tmpfs/光驱"与"这章漏采了"
+   在报告里**长得不一样** —— 否则一项突然消失，读者只会当成少了一节内容。
+4. **P1-2 规则"通过"也带实测值**：`RuleEvaluation` 新增 `facts: list[str]`（`to_dict` 一并输出），
+   `_evaluate` 无论触发与否都留证据；`presentation._analysis` 的 `passed` 分支把它透出。
+   同时把**「查了、确认没有」与「没采到」在章末小结里分开** —— `report_adapter._normalize_analysis`
+   新增 `collection_status == "empty"` 分支（结论「已检查，本次未发现相关记录。」+ 依据
+   「已按本项口径查询，本次无匹配记录。」），不再与 `not_evaluated` 一起压成「未采集到结构化记录」
+   （**同一件事两种说法，读者只会认为报告自相矛盾**）。事实项补依据：展示层 `note` 优先
+   （如「已排除 7 个非持久化挂载点」），否则用结构化记录条数。
+5. **P1-3 一张表只留一种行形**（`presentation`）：7.1 只留速率行（平均值 + 最大值），
+   Buffer Cache 命中率 / 磁盘排序比例落到**各自的规则项**做单值行（`_ratio_row()`）。
+6. **P1-4 规则项正文给结论**（**共享引擎** `inspection_core/word_engine.py::render_inspection_item`）：
+   空数据分支先看 `item.analysis.conclusion` —— 有结论且当前布局**不内联分析**（professional 会把
+   完整分析后置到章末小结）时，正文落 `note_box("分析结论", …)`；legacy 布局紧随其后就渲染完整
+   分析块，正文**不再重复**。★ 这条**四库共用**（MySQL/PG/SQL Server 同样病灶），
+   数据齐全时**零字节影响** —— 由控制变量自证钉住（见下）。
+
+### 验证
+
+- **回归**：全量 `pytest` = **5 failed / 401 passed / 168 subtests**（5 个 FAIL 仍是 `tests/test_mysql_*`
+  的 **MySQL 源包缺失**长期问题，**无新增**；上一批 370 passed → 本批 401，含新增 17 用例与实际差异）。
+- **实测两份真实包**（用 `cli.py` → `generate_report.py` 端点跑再读回 DOCX 文本）：
+  - 4.5 由**空表**变 **2 行真数据**（`/` **33%**、可用 **64.30 GB**）+ 「已排除 …」脚注；
+  - 3.8 挂载参数由 **39 行 → 2 行** + 「已排除 37 个 …」脚注；
+  - 「未提供补充依据」**66 → 4**；「本项没有可展示的结构化记录。」**22 → 0**；
+    「已检查，本次未发现相关记录。」**9 处**（「查了没有」与「没采到」自此分开）；
+  - 图 6-1 SYSTEM 由 **99.98% → 3.39%**，与表 6.1 一致。
+- ★ **控制变量自证**（`_work/_b15_ctrl_hash.py`）：把引擎那一段**逐字改回旧形态**、`report_model` **一字不动**
+  重渲染，MySQL legacy 文档 hash **精确回到冻结值 `D34B7A1B…`**；新形态 = `CB8653E5…`。
+  ★ **两次渲染必须在独立子进程里跑** —— `word_engine` 一旦被 import 就驻留内存，同进程改文件无效
+  （第一次复现就踩了：两次 hash 一模一样）。`finally` 逐字节复原 + sha256 断言。
+- **负控制** `_work/_b15_negctl.py` **8/8 全部真实变红**（规则层不再过滤 / 展示层改回旧键名 /
+  图表改回 `PCT_USED` / `RuleEvaluation` 不透出 facts / 比例行塞回速率表 / 引擎回落通用占位 /
+  把「查了没有」压回 `not_evaluated` / 事实项不补依据），逐字节复原 + sha256 校验。
+- **基线**（`_work/_b15_refresh_baseline.py`）：`expected_summary` **逐项不变**
+  （`health 23` / `rules 42` / `triggered 11` / `passed 24` / `not_evaluated 7` / `risk_register 11` /
+  `items 76` / `sections 9` / `severity_counts`）—— 「口径 / 文案修复、**不触发新判据**」的强证据；
+  10 张 PNG 里**只有** `oracle_tablespace_usage.png` 变了（正是 P0-2），其余 9 张**逐字节不变**。
+  `source_implementation.*` **刻意不重写**。
+- **守门测试**：新增 `tests/test_oracle_report_quality.py` **15 用例 / 7 个测试类**
+  （`FilesystemRuleTests` / `MountRowsTests` / `FilesystemDisplayTests` / `TablespaceChartTests` /
+  `RuleEvidenceTests` / `PerformanceTableShapeTests` / `EmptyStateAdapterTests`，用合成 `FakeContext` +
+  monkeypatch 抓 `render_bar_spec` 的 spec）；`tests/test_word_engine.py` 新增 `RowsLessRuleItemTests`
+  **2 用例**（professional 正文给「分析结论」、legacy 不重复）并**更新控制变量 hash 冻结值**；
+  `tests/test_oracle_plugin.py::test_missing_evidence_is_not_normalized_to_passed` 期望值随
+  「empty / not_evaluated 分叉」同步（`normal` **49 → 57** / `not_evaluated` **17 → 9**）。
+
+### 踩到的坑
+
+1. ★ **`_mount_rows` 改签名会打穿"四库解析器同形"的守门**。为了拿到"排除数"，初版把
+   `_mount_rows` 改成返回 `(rows, excluded)` ⇒ `tests/test_raw_file_access.py` 的
+   `assertEqual(_mount_rows([...]), 1)` 立刻变 `2 != 1`。修法：**保留 `_mount_rows` 只回 `list`**
+   （与 MySQL 侧同名函数同形），排除数由新的 `_persistent_mounts` 提供 —— **要加返回值时先想
+   "这个函数名有没有被跨库同形守门盯着"**。
+2. ★ **`if x` 与「未采集 ≠ 0」**：表 6.1 的 `if alloc_val` / `if used_val` 把**真 0** 也吞成空白。
+   判空一律用 `is not None`。
+3. **`word_engine` 的模块缓存**（见上「控制变量自证」）—— 子进程隔离是这类自证的前提。
+
+### 有意未做（留给下一批）
+
+| 批次 | 内容 |
+|---|---|
+| **`control_files` 折行** | 5.1 里 `control_files` 显示成两行（`…/control01.ctl, /u01/…/control` / `- 02.ctl`）—— 那是 **SQL\*Plus 按 80 列宽折行**，不是真有两个文件。**本批未修**（属**取数层**：要么调 `SET LINESIZE`/`COLSEP`，要么在展示层按 `ctl` 后缀重接续行）。★ 先确认"它到底是采集时折的行、还是展示时断的"再动手 |
+| **批 14b（候选）** | 把取数收口推到 **PostgreSQL**（`presentation.py` 9 处）—— 共享访问点已就位，纯机械替换 |
+| **Top SQL 另两个维度** | 包内还有 `oracle.topsql.logical_reads` / `physical_reads`（各 20 行），本批只画了「执行时间」一张；要再出图时按同一 `render_bar_spec` 追加即可 |
+
+---
+
 ## 0.5 实测复核：真实采集包逐条验证（2026-10-09）
 
 **复核对象**：`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`  
@@ -1754,6 +1862,7 @@ sanitize_filename "生成AWR性能报告"     -> "AWR"         (item_id 变成 "
 - ✅ **批 12 已完成（2026-10-10，Python 侧图表层；采集脚本零改动）** —— 承接 `_work/oracle-analysis-gap-review.md` §2.1/§2.4，修的是「图的**声明集合 ≠ 可产出集合**」这一对**静默**缺陷：`charts.py` 能产 9 张、`word_report.py` 只声明 8 张，两个方向都错 —— `oracle_txn_rate` **画出来没人声明（生成即丢弃）**、`oracle_physical_io` **声明了却可能一张不出**，而且 `word_engine.render_section_charts` 在过滤后集合为空时**静默 `return False`**（连"趋势图"小节都不出现、也不留说明，读者分不清"本章本就没有图"和"本该有图没画出来"）。落地四件事：① **单一来源** `ORACLE_CHART_IDS`（顺序即上图次序），`_figure()` 改按 chart_id 命名 PNG；② `word_report` 两个章节的 `ChartDefinition` **全部由 id 清单派生**（图题留在报告层）；③ 声明了图却一张都没产出 ⇒ **留一行原因**（不改小节号、不渲染空的"趋势图"标题），原因代码串由 `CHART_SKIP_REASONS` 翻成人话、**未登记代码原样带出**；④ 产出侧防呆：未注册 chart_id **当场 `ValueError`**。★ 第③条落在 `inspection_core/word_engine.py`，**四库共用**（MySQL/PG/SQL Server 同样病灶），数据齐全时**零字节影响**（MySQL 基线文档的规范化 XML hash 测试原样通过可证）。★ 两条最容易做错：**① "单一来源"必须真派生**，不是两边各写一份碰巧相等（漏一个正是 `oracle_txn_rate` 的病因，静态读代码与报告都看不出来）；**② 数据不足导致不产出 ≠ 从声明里删掉**，否则单机空闲库上 `oracle_txn_rate` 会被"修"成永久不存在。实测真实 1.4 包 ZYDB：**8 张图逐字节不变、正文 729 段逐段相同**（唯一差异是封面"生成时间"戳）—— 本包 `user_commits` 采样窗口内恒为 64 ⇒ 提交速率 0 ⇒ `oracle_txn_rate` 本就未产出，**这批在该包上是严格无操作**；两条新行为改由**合成数据**用例钉住，不依赖数据巧合。新增守门 `tests/test_oracle_chart_coverage.py`（7 用例）+ `tests/test_word_engine.py::ChartSkippingTests`（4 用例）；负控制 `_work/_b12_negctl.py` **4/4 全部真实变红**（声明侧漏 id / 恢复静默 / 清空原因翻译 / 摘掉产出守门），`finally` 逐字节复原 + sha256 校验，复原后 25 passed。**有意留到下一批**：§2.3 的 3 张"有数据没画"的图（表空间 Top-N 条形 / 归档量趋势 / Top SQL Top-N）—— 需要**新图型**（公共层渲染器只有时序折线），且 `oracle.archive.daily_30d` 手上两份包**全空**、补出来**无法用真实数据验证**。详见「批 12」章。
 - ✅ **批 13 已完成（2026-10-10，Python 侧展示层；采集脚本零改动）** —— 承接批 11/12 的口径，修「**采了有数据、一个字不进报告**」：判据 = 采集项在包内**有数据**（`status=ok` / 有行）却在 `plugins/oracle/presentation.py` 里**找不到任何消费者**（**机械可枚举**）。落地 **24 个展示条目**（`oracle.awr` 5 + `oracle.dg` 5 + `oracle.audit` 7 + `undo/temp/共享池` 4 + 其余 3），**检查项 52 → 76**（**9 章不变**）。三条机制性改动：① `_cell()` 容忍 **sqlplus 按列宽截断表头**（`SEGMENT_SPACE_MANAGEMENT`→`SEGMEN`、`ADM`、`COMPRES`、`SIZ`；`row.get(完整列名)` 取不到时**不报错、只静默少一列**）；② `_listed()` 让空 / 未采条目按真实 `collection.status` **分叉文案**（`success_no_data` 与 `not_evaluated` / `permission_denied` **是相反结论**，延续「未采集 ≠ 0」）；③ `_analysis()` 的 `not_evaluated` 分支**透出规则引擎 `reason`**（原先一律印"证据不足，未执行评价。"，把"无备库（未配置 DataGuard）"丢了）。唯一章名改动：`备份与恢复检查` → **`备份、恢复与高可用检查`**（DataGuard 折叠进来后名实相符）。★ 三条坑：**presentation 层条目不带 `item_id`**（由 `report_adapter._extract_item_id` 从 `source` 尾段派生）；判"这项采过没有"**看表键在不在 `ctx.tables`**（**空表也算登记**），`non_ok_items` **只记失败态**；**对着冻结基线断言抓不到实现回归**（章名断言首版只读死文件，负控制第 5 项因此**没变红**，补一条**走实现路径**的用例后才 5/5 全红）。守门 `tests/test_oracle_display_coverage.py` **16 用例 / 9 subtests**（合成 `FakeContext`）；负控制 `_work/_b13_negctl.py` **5/5 真实变红**。基线整体重出：`expected_summary.items` **52 → 76** 是**唯一**业务结果变化（health 23 / rules 42 / triggered 11 / passed 24 / not_evaluated 7 / risk_register 11 / severity_counts **全同**，8 张 PNG 逐字节不变）—— 「纯展示层、**不触发新判据**」的强证据；`source_implementation.*` **刻意不重写**。回归 **5 failed / 353 passed / 168 subtests**。详见「批 13」章。
 - ✅ **批 14 已完成（2026-10-10，Python 侧取数层；采集脚本与基线零改动）** —— 修「**同一份包内文件、两套互不相干的读取实现**」：呈现层此前不走 adapter，自己拼 `root / "evidence/…"` 再自己解析，而 `package_adapter.py` 已经在干同一件事（把 `tables/*.psv` 注册进 `ctx.tables`、还专门回填了 `evidence/filesystems.txt`）⇒ 同一份 `kernel_parameters.tsv` 有**两份解析实现**，改一处忘另一处**没有任何测试会红**。★ 真风险不是「代码不好看」，是**静默少一节内容**：批 6 / N-8 就把 4 个「列对齐文本」从 `tables/` 挪到了 `evidence/`，路径写死的读法移动后**只返回空**——报告少一节、规则层不报、测试不红。落地：① 新增 **`PackageContext.raw_lines(name)`** —— 按**契约文件名**在 `tables/`、`evidence/` 两处查找并返回原始行（缺文件返回 `[]`）；② 目录集中到模块级 `_RAW_FILE_DIRS = ("tables", "evidence")`（**全仓库只此一处**）；③ Oracle **6 处** + MySQL **5 处**调用点改走它，5 + 4 个解析器从「收 `Path`」改成「收 `list[str]`」。★ **「收行」不是「收路径」是有意的**：解析器拿到 `Path` 会直接 `TypeError`（`Path` 不可迭代）⇒「必须走 `ctx.raw_lines`」这个口径**在运行期也成立**，不只写在注释里。★ **PG 还有同一模式 9 处、本批未纳入**（守门只覆盖 Oracle + MySQL）= **待办，不是缺陷**。**等价性证明**（同一 1.4 包重跑 `cli.py` + `generate_report.py`）：8 张 PNG **逐字节相同**、`llm_input.json` **完全相同**、其余 JSON 与 DOCX 规范化后**实质差异 0** ⇒ **Oracle 基线一个字没改**（本批对报告产物严格无操作）。守门 `tests/test_raw_file_access.py` **17 用例**（访问点行为 / 继承而非覆写 / 零 `ctx.root` 拼接 / 契约文件名集合，每条结构断言配**尺子自证**）；负控制 `_work/_b14_negctl.py` **4/4 真实变红**，逐字节复原 + sha256 校验。回归 **5 failed / 370 passed / 168 subtests**（5 个 FAIL 是 MySQL 源包缺失的老问题，无新增）。★ **MySQL 侧没有端到端覆盖**（`test_mysql_*` 因源包不在仓库而失败）—— 本批为该侧补了直接打解析器的用例，但**真实 MySQL 包上的端到端验证仍未做**。详见「批 14」章。
+- ✅ **批 15 已完成（2026-10-12，Python 侧报告质量；采集脚本零改动）** —— 起因是用户**拿生成的 DOCX 逐条挑错** + 拿一份**同客户 MySQL 报告**当参照系比对（不是读代码猜）。六处**客户一眼能看出不对**的：① **P0-1 伪文件系统进容量判据** —— 光驱 `iso9660` 是只读介质、恒定 100% 满且 0 可用，`tmpfs`/`devtmpfs`/`proc`/`sysfs` 更没有容量概念，规则层却遍历**全部** `df` 行取最大值 ⇒ 单机库被判「文件系统使用率过高 100%」，真值（`/`）只有 **33%**；过滤判据统一用**公共层** `is_persistent_fstype`（**MySQL 早就在用，四库只有 Oracle 漏了**），键名归一同源 `package_adapter.filesystem_type`，规则层 / 4.5 文件系统表 / 3.8 挂载参数**三处同源**，口径串带「**已排除 N 个…**」好让客户能自证。② **P0-2 表空间图与表 6.1 同口径** —— 图取 `PCT_USED`（分母 = 已分配 `ALLOC_MB`）、表与规则层取 `USED_MB ÷ MAX_MB`，同一份报告里 SYSTEM 图上是 **99.98%**（标红）、表里是 **3.39%**；改后**三处同一算式**，`MAX_MB` 缺失才退回已分配口径（老包）。③ **P0-3 4.5 键名对齐** `parse_df_pt`（`Mounted on`/`Filesystem`/`Available`，展示层原读 `MOUNTPOINT`/`FILESYSTEM`/`AVAILABLE`，**只有 `USE%` 恰好撞对** ⇒ 9 行表三列全空），补「类型」列 + `_kb_human()` 把 KB 换算成 `64.30 GB`；并加 `elif fs_rows:` 分支 —— **全被过滤掉也要出项**（`not_applicable` + 说明），让"整机只有 tmpfs"与"这章漏采了"长得不一样。④ **P1-2 规则「通过」也带实测值** —— `RuleEvaluation` 新增 `facts` 字段，`_evaluate` 无论触发与否都留证据，`presentation._analysis` 的 `passed` 分支透出；全文「未提供补充依据」**66 → 4**。同时把**「查了、确认没有」与「没采到」在章末小结里分开**（`report_adapter` 新增 `collection_status == "empty"` 分支），事实项补依据（展示层 `note` 优先，否则记录条数）。⑤ **P1-3 一张表只留一种行形** —— 7.1 只留速率行（平均值 + 最大值），命中率 / 比例落到各自规则项做单值行；此前混表后渲染层按行的**键并集**出列 ⇒ 每行缺两格全填「未采集」。⑥ **P1-4 规则项正文给结论**（**共享引擎** `word_engine.render_inspection_item`）—— 无明细表的规则项原先正文只印「本项没有可展示的结构化记录。」，读者把「规则项」读成「采集失败」；现 professional 正文落一行「分析结论 <该规则结论>」，legacy 紧随其后渲染完整分析块、正文不再重复（**四库共用**，MySQL legacy 文档 hash 随之变化，已做控制变量自证）。附带修 6.1「已使用(MB)」真 0 不再显示成空白（`if x` → `is not None`）。**验证**：新增 `tests/test_oracle_report_quality.py`（**15 用例 / 7 类**）+ `test_word_engine.py::RowsLessRuleItemTests`（2 用例）+ `test_oracle_plugin.py` 期望值随 empty/not_evaluated 分叉同步（`normal` 49→57 / `not_evaluated` 17→9）；负控制 `_work/_b15_negctl.py` **8/8 真实变红**；控制变量自证 **`CB8653E5…`（新）/ `D34B7A1B…`（旧）两条都命中**（★ 两次渲染必须在**独立子进程**里跑 —— `word_engine` 一旦 import 就驻留内存，同进程改文件无效）；基线 `expected_summary` **逐项不变**、10 张 PNG **只有 `oracle_tablespace_usage.png` 变**（正是 P0-2）；回归 **5 failed / 401 passed / 168 subtests**（5 个 FAIL 仍是 MySQL 源包缺失，无新增）。★ **有意未做**：5.1 `control_files` 的**折行**（SQL\*Plus 按 80 列宽折行，不是两个真文件）—— 属**取数层**，留待下一批。详见「批 15」章。
 
 ---
 

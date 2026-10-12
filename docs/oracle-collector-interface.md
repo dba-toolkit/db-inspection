@@ -1074,3 +1074,28 @@ bash -n inspection/oracle_inspection.sh    # 语法
 > `report_adapter` 侧没有 ⇒ caption 静默退化成 id。**收口到与 id 同源**才是终点。
 > 凡见 `X.get(key, key)` 这种"取不到就落回 key"的写法，先问"这个 key 会不会新增"。
 
+
+### 11.17 批 15 改造后的增量（2026-10-12，**Python 侧报告质量**；契约本身一字未改）
+
+本轮**不动采集包**：`status` 取值、目录树、`tables/*.psv` 列名**全部不变**。
+修的是**下游怎么读这些数据**（口径 / 键名 / 文案）。有两条**下游会直接看到差别**，记在此：
+
+| 你应当知道的 | 说明 |
+|---|---|
+| **★ 伪文件系统一律不进容量类判据** | 判据 = 公共层 `inspection_core.system_checks.is_persistent_fstype()`。光驱（`iso9660`/`squashfs`/`udf`）、`tmpfs`/`devtmpfs`、`proc`/`sysfs`/`cgroup`、`overlay`、FUSE 都不算。Oracle 此前**只在规则层漏了这一过滤**（MySQL 早就在用）⇒ 单机库因光驱被判「文件系统使用率过高 100%」。**你若自己写消费者，请用同一个函数，不要自建黑名单** |
+| **`df -PT` 行的键名是 `Mounted on` / `Filesystem` / `Available` / `Type` / `USE%`** | 由 `package_adapter.parse_df_pt` 产出（空格而非下划线）。展示层曾按 `MOUNTPOINT`/`FILESYSTEM`/`AVAILABLE` 取值 ⇒ **只有 `USE%` 恰好撞对**，另外三列恒空。**消费 `ctx.tables["filesystems"]` 时按这组键名取**（旧拼法仅作 1.4 老包兜底） |
+| **`Available` 的单位是 1024-blocks（KB）** | 不是字节、不是 MB。展示层新增 `_kb_human()` 换算（`format_bytes(n * 1024)`）。**别把裸数字当 MB 用** |
+| **表空间"使用率"只有一个口径** | `USED_MB ÷ MAX_MB`（分母 = **最大可扩**）。`PCT_USED` 的分母是**已分配** `ALLOC_MB`，**不是**同一个数 —— 图 6-1 原先用 `PCT_USED`，与表 6.1 / 规则层对不上（SYSTEM 99.98% vs 3.39%）。图已改口径；`MAX_MB` 缺失（老包）才退回 `PCT_USED` |
+| **规则"通过"项也带 `facts`** | `RuleEvaluation` 新增字段 `facts: list[str]`，`to_dict()` 一并输出（**无论规则触发与否**）。下游若自己渲染"依据"，读它，不要再去猜 |
+| **`collection.status == "empty"` ⇒ 结论「未发现」，不是「未采集」** | `report_adapter._normalize_analysis` 据此把「查了、确认没有」与「没采到」**分开**：前者 `status=normal` + 「已检查，本次未发现相关记录。」，后者仍是 `not_evaluated`。★ 两者是**相反结论**，别再一起压成"未采集到结构化记录" |
+| **`display.note` 会进章末小结的"依据"列** | 事实项无自身依据时，`report_adapter` 用 `display.note`（如「已排除 37 个 proc/tmpfs/cgroup/光驱等非持久化挂载点」）兜底，否则用「共 N 条结构化记录」。**你要加脚注就写 `display.note`**，别另造一个键 |
+| **`word_engine` 空数据分支优先看 `analysis.conclusion`** | 无明细表的**规则项**（"CPU 压力评估"/"无效对象"…）在 professional 布局正文落一行「分析结论 …」；legacy 布局紧随其后渲染完整分析块、正文不重复。**这条是共享引擎（四库共用）**，数据齐全时零字节影响（控制变量自证） |
+
+> ★ **本批的元教训（两条）**：
+> ① **`if x` 碰上有意义的 0 就会撒谎** —— 表 6.1 的 `if used_val` 把 `USED_MB=0` 判成空白格，
+> 与「未采集 ≠ 0」相悖。判空一律写 `is not None`。
+> ② **"消除重复"不等于"消除分叉"** —— 同一条判据（持久化文件系统）若在规则层与展示层各写一份，
+> 短期一致、长期必分叉。**归一到"谁产生键名谁提供取键函数"**（`filesystem_type` 与 `parse_df_pt` 同文件）
+> 才是终点，与 §11.16 的图题表同源。
+
+

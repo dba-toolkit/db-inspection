@@ -2836,3 +2836,53 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   **静默滤掉**，变异①照常绿；改为「排除 OS 图后取全量再比对」才暴露（延续 §22.59 的教训）。
 - **未做**：Top SQL 另有 `logical_reads` / `physical_reads` 两个维度（各 20 行）未出图；PG 取数收口仍是批 14b。
 
+### 22.62 Oracle 报告质量修复 —— 拿真实报告逐条核对（Python 侧）
+
+**范围**：只动 Python（`plugins/oracle/{oracle_rules,package_adapter,presentation,charts,report_adapter}.py`
++ 共享引擎 `inspection_core/word_engine.py` + 测试 + 基线），`inspection/oracle_inspection.sh` **零改动**
+（数据早就采到了，错的是**读法 / 口径 / 文案**）。
+
+- **病**：用户拿生成的《192.168.100.80_db01_Oracle数据库巡检报告.docx》**逐条挑错**，并拿一份
+  **同客户 MySQL 报告**（`192.168.1.20-db02-MySQL数据库巡检报告.docx`（脱敏名））当参照系。六处**客户一眼能看出不对**的：
+  - **P0-1 伪文件系统进容量判据**：光驱 `/dev/sr0 iso9660` 是只读介质、恒定 100% 满且 0 可用，
+    `tmpfs`/`devtmpfs`/`proc`/`sysfs` 更无容量概念；规则层却遍历**全部** `df` 行取最大值
+    ⇒ 单机库被判「文件系统使用率过高 100%」，而真值（`/`）只有 **33%**。
+  - **P0-2 表空间图与表 6.1 不同口径**：图取 `PCT_USED`（分母 = **已分配** `ALLOC_MB`），
+    表与规则层取 `USED_MB ÷ MAX_MB`（分母 = **最大可扩**）⇒ 同一份报告里 SYSTEM 图上是 **99.98%**（标红）、表里是 **3.39%**。
+  - **P0-3 4.5 键名不匹配**：展示层读 `MOUNTPOINT`/`FILESYSTEM`/`AVAILABLE`，`parse_df_pt` 产出的是
+    `Mounted on`/`Filesystem`/`Available` ⇒ **只有 `USE%` 恰好撞对**，9 行表里三列全空。
+  - **P1-2 通过项丢证据**：`RuleEvaluation` 只有**触发**才把 `facts` 存进 `Finding`
+    ⇒ 章末「依据与建议」列 **66 处**「未提供补充依据」。
+  - **P1-3 两种行形混一表**：7.1 只画「平均值 + 最大值」的速率行，却把命中率/比例行混进去；
+    渲染层按行的**键并集**出列 ⇒ 每行缺两格全填「未采集」。
+  - **P1-4 规则项正文印通用占位**：无明细表的规则判定项（"CPU 压力评估"/"无效对象"…）正文只印
+    「本项没有可展示的结构化记录。」⇒ 读者把「规则项」读成「采集失败」。
+- **六条机制性改动**：
+  - **①** 过滤判据统一到**公共层** `is_persistent_fstype`（MySQL 早就在用，**四库只有 Oracle 漏了**），
+    键名归一新增 `package_adapter.filesystem_type()`（**与产生键名的 `parse_df_pt` 同文件**）；
+    规则层 / 4.5 文件系统表 / 3.8 挂载参数**三处同源**，口径串带「**已排除 N 个…**」好让客户能自证。
+  - **②** 表空间图改 `USED_MB ÷ MAX_MB`（图 × 表 × 规则层三处同一算式），`MAX_MB` 缺失才退回
+    `PCT_USED`；图题改「表空间**容量**使用率」、x 轴标签写明算式。
+  - **③** 4.5 对齐键名 + 补「类型」列 + `_kb_human()`（KB → `64.30 GB`）；新增 `elif fs_rows:` 分支
+    —— **全被过滤掉也要出项**（`not_applicable` + 说明），让"整机只有 tmpfs"与"这章漏采了"长得不一样。
+  - **④** `RuleEvaluation` 新增 `facts` 字段（触发与否都留），`presentation._analysis` 的 `passed`
+    分支透出；`report_adapter` 新增 `collection_status == "empty"` 分支把**「查了没有」与「没采到」分开**；
+    事实项用 `display.note` 兜底补依据。
+  - **⑤** 7.1 只留速率行，命中率 / 比例落到各自规则项做单值行（`_ratio_row()`）。
+  - **⑥** 共享引擎空数据分支优先看 `analysis.conclusion`（professional 正文给一行「分析结论」、
+    legacy 不重复）—— **四库共用**，数据齐全时零字节影响，由控制变量自证钉住。
+- **验证**：新增 `tests/test_oracle_report_quality.py`（**15 用例 / 7 类**）+
+  `test_word_engine.py::RowsLessRuleItemTests`（2 用例）+ `test_oracle_plugin.py` 计数随分叉同步
+  （`normal` 49→57 / `not_evaluated` 17→9）。
+  - **负控制** `_work/_b15_negctl.py` **8/8 真实变红**，逐字节复原 + sha256 校验。
+  - ★ **控制变量自证** `_work/_b15_ctrl_hash.py`：引擎改动是**唯一**变量 —— 旧形态（逐字改回）重渲染
+    hash 精确回到冻结值 `D34B7A1B…`、新形态 `CB8653E5…`（★ 两次渲染必须**独立子进程** ——
+    `word_engine` 一旦 import 就驻留内存，同进程改文件**无效**，第一次复现就踩了）。
+  - **基线**：`expected_summary` **逐项不变**（health 23 / rules 42 / triggered 11 / passed 24 /
+    not_evaluated 7 / risk_register 11 / items 76 / sections 9 / severity_counts），10 张 PNG
+    **只有** `oracle_tablespace_usage.png` 变了（正是 P0-2）；回归 **5 failed / 401 passed / 168 subtests**。
+  - **实测**：4.5 由空表 → 2 行真数据（`/` 33% / 可用 64.30 GB）；3.8 由 39 行 → 2 行；
+    「未提供补充依据」**66 → 4**；「本项没有可展示的结构化记录。」**22 → 0**。
+- **未做**：5.1 `control_files` 的**折行**（SQL\*Plus 按 80 列宽折行，不是两个真文件）—— 属**取数层**；
+  PG 取数收口仍是批 14b；Top SQL 另两个维度未出图。
+- 详见 `docs/oracle-collector-fix-plan.md`「批 15」章与 `docs/oracle-collector-interface.md` §11.17。
