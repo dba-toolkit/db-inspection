@@ -355,5 +355,82 @@ class InitParameterValueDisplayTests(unittest.TestCase):
         self.assertTrue(rows[0]["值"].endswith("control02.ctl"))
 
 
+class KernelParameterHeaderTests(unittest.TestCase):
+    """批 17：`kernel_parameters.tsv` 的**首行是表头**（`path<TAB>value`），不是参数。
+
+    病：采集侧 N-20（批 7）给这个文件补了表头，理由是「`tables/*.tsv` 都是真 TSV 表格、
+    首行即列名行」；但**消费端没跟着改** —— `_key_value_rows` 把首行也当参数收下，
+    报告里于是多出一行「path | value」，读起来像一个真内核参数。
+
+    ★ 判据为什么写成「序列相等」而不是「不含 path」：`path` 这个词在别处也会出现
+    （挂载路径、文件路径），只有把整列拉出来逐项对账才不会被同名字符串蒙过去。
+    """
+
+    def _params(self, lines: list[str]) -> list[str]:
+        item = build({}, raw={"kernel_parameters.tsv": lines})["system.kernel"]
+        return [str(r["参数"]) for r in item["display"]["rows"]]
+
+    def test_header_row_is_not_rendered_as_a_parameter(self) -> None:
+        self.assertEqual(
+            self._params(["path\tvalue", "vm.swappiness\t10", "fs.file-max\t6815744"]),
+            ["vm.swappiness", "fs.file-max"],
+        )
+
+    def test_file_without_a_header_is_unaffected(self) -> None:
+        """防误伤：MySQL / PG 采集器写的是无表头形态，首行就是真参数，不许被吞。"""
+        self.assertEqual(
+            self._params(["vm.swappiness\t10", "fs.file-max\t6815744"]),
+            ["vm.swappiness", "fs.file-max"],
+        )
+
+    def test_only_the_first_row_can_be_a_header(self) -> None:
+        """防误伤：表头判定只在**首条已解析行**上做一次，后面的行一律照收。"""
+        self.assertEqual(
+            self._params(["path\tvalue", "vm.stat_interval\t1", "custom\tvalue"]),
+            ["vm.stat_interval", "custom"],
+        )
+
+
+class MissingEvidenceValueTests(unittest.TestCase):
+    """批 17：**没采到**不许渲染成 `-`。
+
+    `-` 的语义是「字段存在但为空」，`未采集` 是「这一项根本没拿到证据」。两者混用以后，
+    1.4 采集包的 `主机信息` 会变成 4 行 `-`，读者只能猜「是采集失败还是本来就空」——
+    这正是"未采集 ≠ 0/空"这条老判据在**展示层**的落点。
+
+    病根不在引擎（`text(None)` 本来就给 `未采集`），而在调用点写的 `env.get("x", "")` /
+    `lscpu.get("y", "")` —— `""` 把「没有」伪装成了「空」。
+    """
+
+    def _values(self, item_id: str, raw: dict[str, list[str]] | None = None) -> dict[str, Any]:
+        rows = build({}, raw=raw or {})[item_id]["display"]["rows"]
+        return {str(r["检查项"]): r["采集值"] for r in rows}
+
+    def test_uncollected_host_fields_say_未采集(self) -> None:
+        values = self._values("system.host")
+        for name in ("操作系统", "CPU 型号", "CPU 核数", "NUMA 节点"):
+            self.assertEqual(values[name], "未采集", name)
+
+    def test_uncollected_time_fields_say_未采集(self) -> None:
+        values = self._values("system.time")
+        self.assertEqual(values["本地时间"], "未采集")
+        self.assertEqual(values["时区"], "未采集")
+
+    def test_collected_fields_keep_their_real_values(self) -> None:
+        """防误伤：`or None` 不许把真值一起吞掉。"""
+        values = self._values("system.host", raw={
+            "lscpu.txt": [
+                "Model name: Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz",
+                "CPU(s): 96",
+                "NUMA node(s): 2",
+            ],
+            "os_release.txt": ['PRETTY_NAME="Red Hat Enterprise Linux 8.6 (Ootpa)"'],
+        })
+        self.assertEqual(values["操作系统"], "Red Hat Enterprise Linux 8.6 (Ootpa)")
+        self.assertEqual(values["CPU 型号"], "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz")
+        self.assertEqual(values["CPU 核数"], "96")
+        self.assertEqual(values["NUMA 节点"], "2")
+
+
 if __name__ == "__main__":
     unittest.main()
