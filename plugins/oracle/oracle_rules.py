@@ -17,11 +17,12 @@ from typing import Any
 from dataclasses import dataclass, field
 
 from .metrics import safe_float, safe_int
-from .package_adapter import OraclePackageContext as PackageContext
+from .package_adapter import OraclePackageContext as PackageContext, filesystem_type
 from .presentation import Finding
 from inspection_core.system_checks import (
     CANONICAL_RULE_IDS,
     DEFAULT_THRESHOLDS,
+    is_persistent_fstype,
     os_pressure_report,
 )
 
@@ -49,6 +50,11 @@ class RuleEvaluation:
     reason: str = ""
     finding_id: str | None = None
     evidence_refs: list[str] = field(default_factory=list)
+    # 规则**未触发**时，实测值原本被丢弃：触发才有 Finding、Finding 里才带 facts，
+    # 于是"通过"的规则在报告里只剩一句"检查通过，未发现异常"，依据列全落成
+    # 「未提供补充依据」。这里把调用方传入的 facts 一并留下来 —— 展示层据此给
+    # 通过项写出实测值（如「最高文件系统使用率：33.0%」），而不是让读者猜。
+    facts: list[str] = field(default_factory=list)
     confidence: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -61,6 +67,7 @@ class RuleEvaluation:
             "reason": self.reason,
             "finding_id": self.finding_id,
             "evidence_refs": self.evidence_refs,
+            "facts": self.facts,
             "confidence": self.confidence,
         }
 
@@ -213,6 +220,8 @@ class OracleRuleEngine:
             rule_id=rule_id, category=category, status=status, reason=reason,
             severity_if_triggered=severity, finding_id=finding_id,
             evidence_refs=evidence, confidence=confidence,
+            # 未触发也留证据：展示层用它给"通过"项写出实测值。
+            facts=list(facts or []),
         ))
 
     # ------------------------------------------------------------------
@@ -272,17 +281,29 @@ class OracleRuleEngine:
     def _check_filesystem_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
         rule = CANONICAL_RULE_IDS["filesystem_usage"]
         local = metrics.get("scope", {}).get("database_target_is_local", False)
-        fs_rows = ctx.tables.get("filesystems", [])
+        all_rows = ctx.tables.get("filesystems", [])
+        # 容量判据只看**持久化**文件系统。光驱（iso9660/squashfs/udf）是只读介质、
+        # 恒定 100% 满且 0 可用，tmpfs/devtmpfs/proc/sysfs 根本没有"容量"概念 ——
+        # 把它们算进最大值只会制造客户既无法确认也无法处置的"风险"（真踩过：一份
+        # 单机库报告因为光驱被判「文件系统使用率过高 100%」）。
+        # 判据与展示层、MySQL 侧**同源**（inspection_core.system_checks.is_persistent_fstype），
+        # 不在这里再维护一份黑名单 —— 此处写一份、展示层写一份，两边迟早不一致。
+        fs_rows = [row for row in all_rows if is_persistent_fstype(filesystem_type(row))]
+        excluded = len(all_rows) - len(fs_rows)
         max_pct = 0.0
         for row in fs_rows:
             pct = safe_float(row.get("USE%")) or safe_float(row.get("used_pct")) or 0
             max_pct = max(max_pct, pct)
         t = DEFAULT_THRESHOLDS["filesystem_usage_critical"]
+        fact = f"最高文件系统使用率：{max_pct:.1f}%"
+        if excluded:
+            # 口径要能自证：客户看到"最高 33%"会问"我 fs 表里有 9 行，凭什么只算这个"。
+            fact += f"（已排除 {excluded} 个 tmpfs/devtmpfs/光驱等非持久化挂载点）"
         self._evaluate(
             rule, local, bool(fs_rows),
             max_pct >= t,
-            "检查所有已成功读取的文件系统",
-            [f"最高文件系统使用率：{max_pct:.1f}%"] if fs_rows else [],
+            "检查所有已成功读取的持久化文件系统",
+            [fact] if fs_rows else [],
         )
 
     def _check_tablespace_usage(self, metrics: dict[str, Any]) -> None:
@@ -301,7 +322,9 @@ class OracleRuleEngine:
             rule, True, pct is not None,
             triggered,
             f"{source_label} {pct:.1f}%，超过{'严重' if promote else '告警'}阈值" if triggered else f"{source_label} {pct:.1f}%，正常" if pct is not None else "无数据",
-            [f"max_{'capacity' if source_label=='容量使用率' else 'used'}_pct={pct}"] if pct is not None else [],
+            # 实测值进报告「依据」列，写成人能读的：`max_capacity_pct=3.387451171875`
+            # 那种原始浮点既占地方又要读者自己换算。
+            [f"{source_label} {pct:.1f}%"] if pct is not None else [],
             severity_override=promote,
         )
 
@@ -313,7 +336,7 @@ class OracleRuleEngine:
             rule, True, pct is not None,
             pct is not None and pct >= t,
             f"ASM 最大使用率 {pct:.1f}%" if pct else "无 ASM",
-            [f"max_used_pct={pct}"] if pct is not None else [],
+            [f"ASM 最大使用率 {pct:.1f}%"] if pct is not None else [],
         )
 
     def _check_fra_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:

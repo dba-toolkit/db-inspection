@@ -230,6 +230,23 @@ def parse_df_pt(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+def filesystem_type(row: Any) -> Any:
+    """取文件系统行的**类型**列，做键名归一。
+
+    `df -PT` 的解析结果（`parse_df_pt`）用 ``Type``；1.4 老包 / 别名表可能换成别的
+    拼法。键名归一放在这里（和产生键名的 `parse_df_pt` 同一个文件），是因为规则层
+    （`oracle_rules._check_filesystem_usage`）与展示层（`presentation`）都要按同一个
+    判据过滤伪文件系统 —— 两边各写一份键名清单，迟早会分叉。
+    """
+    if not isinstance(row, dict):
+        return ""
+    for key in ("Type", "FSTYPE", "type", "fstype", "文件系统类型", "类型"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
 class OraclePackageAdapter:
     """识别并加载 Oracle 结构化采集包（1.4 与 2.0 两套 `tables/` 语义）。"""
 

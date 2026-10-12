@@ -18,6 +18,11 @@ REPORT_SCHEMA = "2.0"
 
 FACT_CONCLUSION = "已采集并展示本项巡检事实，不单独形成风险判断。"
 NO_RECORD_CONCLUSION = "未采集到结构化记录，本项不作通过结论。"
+# 「查了、确认没有」(success_no_data) 与「没采到」(not_evaluated) 是**相反结论**，
+# 不能让它们在章末小结里长得一样：正文按采集状态写了"已检查，本次未发现相关记录。"，
+# 小结却写"未采集到结构化记录"，同一件事两种说法，读者只会认为报告自相矛盾。
+EMPTY_CONCLUSION = "已检查，本次未发现相关记录。"
+EMPTY_EVIDENCE = "已按本项口径查询，本次无匹配记录。"
 
 from .charts import ORACLE_CHART_CAPTIONS, OS_CHART_CAPTIONS
 
@@ -59,18 +64,37 @@ def _extract_item_id(source: Any, section_id: str, index: int) -> str:
 def _normalize_analysis(item: dict[str, Any]) -> dict[str, Any]:
     analysis = dict(item.get("analysis") or {})
     status = str(analysis.get("status") or "").strip()
-    rows = (item.get("display") or {}).get("rows") or []
+    display = item.get("display") or {}
+    rows = display.get("rows") or []
     if status == "":
+        collection_status = str((item.get("collection") or {}).get("status") or "").strip()
         if rows:
             analysis["status"] = "normal"
             if not str(analysis.get("conclusion") or "").strip():
                 analysis["conclusion"] = FACT_CONCLUSION
+        elif collection_status == "empty":
+            # 查了、确认没有：结论必须是"未发现"，不能压成"未采集"。
+            analysis["status"] = "normal"
+            if not str(analysis.get("conclusion") or "").strip():
+                analysis["conclusion"] = EMPTY_CONCLUSION
+            if not analysis.get("evidence"):
+                analysis["evidence"] = [EMPTY_EVIDENCE]
         else:
             analysis["status"] = "not_evaluated"
             if not str(analysis.get("conclusion") or "").strip():
                 analysis["conclusion"] = NO_RECORD_CONCLUSION
     if not isinstance(analysis.get("evidence"), list):
         analysis["evidence"] = []
+    if not analysis["evidence"]:
+        # 事实项（无规则判定）原来在章末小结里只剩「未提供补充依据」一句：既没说采了
+        # 多少、也没说该看什么，读者无从复核。小结的"依据与建议"列本就是放**可核对的
+        # 量**的（MySQL 同列写的是「CPU 64 Core；内存 251.74 GB」），这里补上：
+        # 展示层备注优先（如「已排除 7 个非持久化挂载点」），否则用结构化记录条数。
+        note = str(display.get("note") or "").strip()
+        if note:
+            analysis["evidence"] = [note]
+        elif rows:
+            analysis["evidence"] = [f"本项为事实展示，共 {len(rows)} 条结构化记录"]
     analysis.setdefault("recommendation", "")
     return analysis
 

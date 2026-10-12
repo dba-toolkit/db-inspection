@@ -9,8 +9,12 @@ import re
 from typing import Any
 
 from .metrics import safe_float
-from .package_adapter import parse_instance_tag
-from inspection_core.system_checks import CANONICAL_RULE_IDS
+from .package_adapter import filesystem_type, parse_instance_tag
+from inspection_core.system_checks import (
+    CANONICAL_RULE_IDS,
+    format_bytes,
+    is_persistent_fstype,
+)
 
 
 VERSION = "2.0.0"
@@ -199,21 +203,52 @@ def _key_value_rows(lines: list[str]) -> list[dict[str, str]]:
     return rows
 
 
-def _mount_rows(lines: list[str]) -> list[dict[str, str]]:
-    """解析 `mount` 原文（`设备 on 挂载点 type 类型 (选项)`）。"""
+def _persistent_mounts(lines: list[str]) -> tuple[list[dict[str, str]], int]:
+    """解析 `mount` 原文（`设备 on 挂载点 type 类型 (选项)`），返回 (持久化挂载点, 排除数)。
+
+    判据来自公共层（`inspection_core.system_checks.is_persistent_fstype`）：proc/sysfs/
+    tmpfs/cgroup/光驱等既不是"挂载参数"也不承载数据，列出来只会把真正的持久化挂载点
+    淹掉（本实例 39 行里只有 2 行是持久化的）。MySQL 侧用的是同一个判据。
+    """
     rows: list[dict[str, str]] = []
+    excluded = 0
     pattern = re.compile(r"^(.*?) on (.*?) type (.*?) \((.*)\)$")
     for raw in lines:
         matched = pattern.match(raw.strip())
         if not matched:
             continue
+        fstype = matched.group(3).strip()
+        if not is_persistent_fstype(fstype):
+            excluded += 1
+            continue
         rows.append({
             "设备": matched.group(1).strip(),
             "挂载点": matched.group(2).strip(),
-            "类型": matched.group(3).strip(),
+            "类型": fstype,
             "挂载选项": matched.group(4).strip(),
         })
-    return rows
+    return rows, excluded
+
+
+def _mount_rows(lines: list[str]) -> list[dict[str, str]]:
+    """只要行的入口 —— **与 MySQL 侧同名函数同形**（只回 list）。
+
+    `tests/test_raw_file_access.py` 用的就是这条"四库解析器签名一致"的判据。需要
+    排除数时用 `_persistent_mounts`，不要在这里改返回类型。
+    """
+    return _persistent_mounts(lines)[0]
+
+
+def _kb_human(value: Any) -> str:
+    """`df -PT` 的容量列单位是 1024-blocks（KB）→ 转成人类可读（`64.10 GB`）。
+
+    展示层此前直接把裸 KB 数字印进"可用空间"列，同时又因为键名不匹配取不到值 ——
+    两件事叠在一起，客户看到的是空列。这里一次把两件都解决。
+    """
+    number = safe_float(value)
+    if number is None:
+        return ""
+    return format_bytes(number * 1024) or ""
 
 
 def _dmesg_rows(lines: list[str], limit: int = 20) -> list[dict[str, str]]:
@@ -306,7 +341,7 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     lscpu = _colon_map(ctx.raw_lines("lscpu.txt"))
     time_info = _kv_map(ctx.raw_lines("time_status.txt"))
     kernel_rows = _key_value_rows(ctx.raw_lines("kernel_parameters.tsv"))
-    mount_rows = _mount_rows(ctx.raw_lines("mounts.txt"))
+    mount_rows, mount_excluded = _persistent_mounts(ctx.raw_lines("mounts.txt"))
     dmesg_rows = _dmesg_rows(ctx.raw_lines("dmesg_errors.txt"))
     os_name = env.get("os") or env.get("distribution") or ""
     for line in ctx.raw_lines("os_release.txt"):
@@ -348,7 +383,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                 "recommendation": f.get("recommendation", ""),
             }
         elif ev_status == "passed":
-            return {"status": "normal", "conclusion": "检查通过，未发现异常。", "evidence": [], "recommendation": ""}
+            # ★「通过」不等于「无话可说」：规则调用方是带着实测值来的（如
+            #   `最高文件系统使用率：33.0%`），此前只有触发才把 facts 存进 Finding，
+            #   通过项的证据被丢掉 → 报告的依据列全落成「未提供补充依据」，
+            #   读者无从判断"通过"是基于什么。现在把评测自带的 facts 透出来。
+            facts = [str(value).strip() for value in (ev.get("facts") or []) if str(value).strip()]
+            return {"status": "normal", "conclusion": "检查通过，未发现异常。",
+                    "evidence": facts, "recommendation": ""}
         elif ev_status == "not_applicable":
             return {"status": "not_applicable", "conclusion": "当前架构不适用此项检查。", "evidence": [], "recommendation": ""}
         elif ev_status:  # has evaluation but not triggered/passed/applicable
@@ -455,6 +496,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     is_rac = int(env.get("is_rac", 0)) == 1
     is_cdb = int(env.get("is_cdb", 0)) == 1
     has_asm = int(env.get("has_asm", 0)) == 1
+    # 挂载参数只列**持久化**挂载点，排除数写进 note —— 客户看到行数从 39 掉到 2 会问
+    # "是不是漏采了"，注一句就把"过滤"和"缺失"区分开了（与 MySQL 同一判据/同款脚注）。
+    mount_item = _data_item("挂载参数", "system.mounts", mount_rows)
+    if mount_rows and mount_excluded:
+        mount_item["display"]["note"] = (
+            f"已排除 {mount_excluded} 个 proc/tmpfs/cgroup/光驱等非持久化挂载点"
+        )
     se_items: list[dict[str, Any]] = [
         _item("主机信息", "system.host", [
             _val_row("主机名", s_hostname or env.get("host", ""), "采集目标主机"),
@@ -484,7 +532,7 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
             _val_row("时区", time_info.get("timezone", ""), ""),
         ]),
         _data_item("关键内核参数", "system.kernel", kernel_rows),
-        _data_item("挂载参数", "system.mounts", mount_rows),
+        mount_item,
         _data_item("内核错误摘要", "system.dmesg_errors", dmesg_rows),
     ]
     # ── DB config info (informational display) ──
@@ -554,18 +602,46 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                                analysis=_analysis(_RULE_MEMORY_PRESSURE)))
 
     # ── Filesystem data layer ──
+    # 键名必须与 `package_adapter.parse_df_pt` 的产出对齐：`Mounted on` / `Filesystem` /
+    # `Available`。展示层此前读的是 MOUNTPOINT / FILESYSTEM / AVAILABLE，只有 `USE%`
+    # 恰好撞对 —— 结果是 9 行表格里"挂载点/文件系统/可用空间"三列全空、只剩一列使用率。
+    # 旧拼法保留作兜底（1.4 老包 / 别名表）。
     fs_rows = ctx.tables.get("filesystems", [])
     display_fs: list[dict[str, Any]] = []
-    if fs_rows:
-        for row in fs_rows[:20]:
-            display_fs.append({
-                "挂载点": row.get("MOUNTPOINT") or row.get("mountpoint", ""),
-                "文件系统": row.get("FILESYSTEM") or row.get("filesystem", ""),
-                "使用率": row.get("USE%") or row.get("used_pct", ""),
-                "可用空间": row.get("AVAILABLE") or row.get("available", ""),
-            })
+    fs_excluded = 0
+    for row in fs_rows:
+        if not is_persistent_fstype(filesystem_type(row)):
+            fs_excluded += 1
+            continue
+        raw_used = row.get("USE%")
+        if raw_used in (None, ""):
+            raw_used = row.get("used_pct")
+        used = str(raw_used).strip().rstrip("%") if raw_used not in (None, "") else ""
+        display_fs.append({
+            "文件系统": row.get("Filesystem") or row.get("FILESYSTEM") or row.get("filesystem", ""),
+            "类型": filesystem_type(row),
+            "挂载点": row.get("Mounted on") or row.get("MOUNTPOINT") or row.get("mountpoint", ""),
+            "使用率": f"{used}%" if used else "",
+            "可用空间": _kb_human(row.get("Available") if row.get("Available") not in (None, "") else row.get("AVAILABLE")),
+        })
     if display_fs:
-        sp_items.append(_item("文件系统使用情况", "oracle.filesystems", rows=display_fs))
+        fs_item = _item("文件系统使用情况", "oracle.filesystems", rows=display_fs)
+        if fs_excluded:
+            fs_item["display"]["note"] = (
+                f"已排除 {fs_excluded} 个 tmpfs/devtmpfs/光驱等非持久化挂载点"
+            )
+        sp_items.append(fs_item)
+    elif fs_rows:
+        # 全被过滤掉也要出项 —— 让"整机只有 tmpfs/光驱"与"这章漏采了"在报告里长得不一样，
+        # 否则一项突然消失，读的人只会当成少了一节内容。规则层同口径（不适用，不告警）。
+        sp_items.append(_item(
+            "文件系统使用情况", "oracle.filesystems", rows=[],
+            analysis={
+                "status": "not_applicable",
+                "conclusion": f"本次采集到的 {len(fs_rows)} 个挂载点均为 tmpfs/devtmpfs/光驱等非持久化文件系统，无容量可评价。",
+                "evidence": [], "recommendation": "",
+            },
+        ))
     sp_items.append(_item("文件系统分析", _RULE_FILESYSTEM_USAGE,
                            analysis=_analysis(_RULE_FILESYSTEM_USAGE)))
 
@@ -583,9 +659,11 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         pct_val = f"{used_val / pct_base * 100:.2f}" if used_val is not None and pct_base and pct_base > 0 else ""
         display_ts.append({
             "表空间": row.get("TABLESPACE_NAME") or row.get("TABLESPACE", ""),
-            "已分配(MB)": f"{alloc_val:.0f}" if alloc_val else "",
-            "最大可扩(MB)": f"{max_val:.0f}" if max_val else "",
-            "已使用(MB)": f"{used_val:.0f}" if used_val else "",
+            # `if alloc_val` 会把**真的 0** 当成空白格（TEMP 表空间 USED_MB=0 时"已使用"
+            # 列显示不出 0），与「未采集 ≠ 0」相悖：0 是采集到的确定值，空白才是缺失。
+            "已分配(MB)": f"{alloc_val:.0f}" if alloc_val is not None else "",
+            "最大可扩(MB)": f"{max_val:.0f}" if max_val is not None else "",
+            "已使用(MB)": f"{used_val:.0f}" if used_val is not None else "",
             "使用率(%)": pct_val,
         })
     sc_items: list[dict[str, Any]] = [
@@ -793,15 +871,14 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
             "平均值": "%.2f" % (ora.get('redo_bytes_per_sec', {}).get('average', 0) / 1024 / 1024) if ora.get('redo_bytes_per_sec', {}).get('average') else "-",
             "最大值": "%.2f" % (ora.get('redo_bytes_per_sec', {}).get('max', 0) / 1024 / 1024) if ora.get('redo_bytes_per_sec', {}).get('max') else "-",
         },
-        {
-            "指标": "Buffer Cache 命中率",
-            "值": f"{ora.get('buffer_cache_hit_pct', '-')}%" if ora.get('buffer_cache_hit_pct') is not None else "未采集",
-        },
-        {
-            "指标": "磁盘排序比例",
-            "值": f"{ora.get('sort_disk_ratio_pct', '-')}%" if ora.get('sort_disk_ratio_pct') is not None else "未采集",
-        },
     ]
+    # ★ 命中率/比例**不能**和上面的速率同表：速率是"平均值+最大值"两列，命中率只有
+    #   一个"值"。混在一张表里，渲染层按行的键并集出列，于是每一行都缺两个格子、
+    #   全部填成「未采集」—— 读者会以为一半指标没采到，其实只是行形不同。
+    #   命中率/比例落到各自的规则项里做单行表（7.2 / 7.4），一张表只留一种行形。
+    def _ratio_row(name: str, value: Any) -> list[dict[str, Any]]:
+        shown = f"{value}%" if value is not None else ""
+        return [{"指标": name, "值": shown}] if shown else []
     # ── Library Cache + Wait Events + Top SQL + IO hotfile displays ──
     lc_rows = ctx.tables.get("Library Cache 命中率", [])
     display_lc: list[dict[str, Any]] = []
@@ -861,11 +938,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     op_items: list[dict[str, Any]] = [
         _item("Oracle 性能指标", "oracle.performance", perf_rows),
         _item("Buffer Cache 命中率", "ORA.PERFORMANCE.BUFFER_CACHE",
+               rows=_ratio_row("Buffer Cache 命中率", ora.get('buffer_cache_hit_pct')),
                analysis=_analysis("ORA.PERFORMANCE.BUFFER_CACHE")),
         _item("Library Cache 命中率", "ORA.PERFORMANCE.LIBRARY_CACHE",
                rows=display_lc,
                analysis=_analysis("ORA.PERFORMANCE.LIBRARY_CACHE")),
         _item("磁盘排序比例", "ORA.PERFORMANCE.SORT_DISK",
+               rows=_ratio_row("磁盘排序比例", ora.get('sort_disk_ratio_pct')),
                analysis=_analysis("ORA.PERFORMANCE.SORT_DISK")),
         _item("数据库等待事件", "ORA.PERFORMANCE.WAIT_EVENTS",
                rows=display_wait,

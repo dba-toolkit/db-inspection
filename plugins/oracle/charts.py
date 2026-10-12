@@ -251,23 +251,33 @@ class OracleChartProvider:
         items: list[tuple[str, float]] = []
         for row in rows:
             name = _text(row, "TABLESPACE_NAME")
-            used = _number(row, "PCT_USED")
-            if not name or used is None:
+            # ★ 口径必须与**同一份报告的表 6.1** 和**规则层**一致：都按
+            #   「已使用 ÷ 最大可扩(MAX_MB)」。此前图取的是 `PCT_USED`
+            #   （已使用 ÷ 已分配 ALLOC_MB），于是 SYSTEM 表空间在图里 99.98% 被标红、
+            #   在表里却是 3.39% —— 同一次巡检、同一个表空间、两个数，客户只会
+            #   先信那个更吓人的。MAX_MB 缺失时才退回 ALLOC 口径（老包）。
+            used = _number(row, "USED_MB")
+            max_mb = _number(row, "MAX_MB")
+            if used is not None and max_mb and max_mb > 0:
+                pct = used / max_mb * 100
+            else:
+                pct = _number(row, "PCT_USED")
+            if not name or pct is None:
                 continue
-            items.append((name, used))
+            items.append((name, pct))
         items.sort(key=lambda pair: pair[1], reverse=True)
         items = items[:_TOP_N]
         if not items:
             return []
         spec = {
             "chart_id": "oracle_tablespace_usage",
-            "title": f"表空间使用率 TOP{len(items)}",
+            "title": f"表空间容量使用率 TOP{len(items)}",
             "categories": [name for name, _ in items],
             "values": [value for _, value in items],
             "value_suffix": "%",
             "xmax": 100.0,
             "alert_threshold": 90.0,
-            "xlabel": "已用率（%）",
+            "xlabel": "已用率（已使用 ÷ 最大可扩，%）",
             "filename": "oracle_tablespace_usage.png",
             "source_scope": "table_snapshot",
         }
