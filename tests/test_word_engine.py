@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -494,6 +496,78 @@ class RowsLessRuleItemTests(unittest.TestCase):
         body = self._paragraph_text(self._render("legacy"))
         self.assertNotIn("本项没有可展示的结构化记录。", body)
         self.assertIn("未采集到挂载参数。", body)
+
+
+class CollectionStatusVocabularyTests(unittest.TestCase):
+    """批 19：状态词只允许有**一份**词表，且不许把英文枚举印进交付物。
+
+    真实缺陷：附录两处「数据缺口」表各自手写了一份 6 键字典，`not_enabled` / `skipped` /
+    `unsupported` 落不进那 6 个键 ⇒ Oracle 2.0 报告 §16.2 的**状态列原样印出英文**。
+    它不报错、不抛异常，而四库基线里的缺口状态恰好只有 `external_evidence_required`
+    （在那 6 个键里）⇒ 测试一直是绿的。同源缺陷：规则项「这一项没采到」的规范状态
+    `unavailable` 也曾不在词表里。
+    """
+
+    @staticmethod
+    def _engine(layout: str = "professional") -> MySQLWordReportGenerator:
+        return MySQLWordReportGenerator(
+            REPORT_MODEL, Path(tempfile.gettempdir()) / "vocabulary.docx", layout=layout
+        )
+
+    def test_gap_status_and_display_status_share_one_vocabulary(self) -> None:
+        """「口径同源」做成断言：缺口表的状态列与 `display_status()` 必须同一个映射。"""
+        from inspection_core.word_engine import STATUS_DISPLAY, gap_status_text
+
+        for raw, expected in STATUS_DISPLAY.items():
+            self.assertEqual(gap_status_text(raw), expected, raw)
+            self.assertEqual(gap_status_text(raw.upper()), expected, raw)
+        # 未知状态原样带出（不吞信息），两种入口行为一致
+        self.assertEqual(gap_status_text("brand_new_status"), "brand_new_status")
+
+    def test_no_known_status_renders_with_ascii_letters(self) -> None:
+        """**枚举不许漏出英文**：四个库 + 规则层能产出的每一个状态，渲染后都必须无 ASCII 字母。"""
+        from inspection_core.word_engine import STATUS_DISPLAY
+        from plugins.oracle.package_adapter import _DATA_STATES, _NO_DATA_STATES
+
+        engine = self._engine()
+        candidates = (
+            set(STATUS_DISPLAY)
+            | set(_DATA_STATES)
+            | set(_NO_DATA_STATES)
+            | {"insufficient_history", "external_evidence_required", "missing"}
+        )
+        leaks = {
+            status: engine.display_status(status)
+            for status in sorted(candidates)
+            if re.search(r"[A-Za-z]", engine.display_status(status))
+        }
+        self.assertEqual(leaks, {}, f"这些状态原样印出英文：{leaks}")
+
+    def test_gap_table_never_prints_a_raw_status_into_the_document(self) -> None:
+        """端到端：往真模型里塞一条 `not_enabled` 缺口，渲染结果里必须只有中文。"""
+        model = json.loads(json.dumps(read_json(REPORT_MODEL)))  # 深拷贝，不动基线文件
+        model["collection_gaps"] = [
+            {"item_id": "system.chronyc_sources", "status": "not_enabled",
+             "reason": "探针不可用", "recommended_action": "修复采集条件后重采"},
+            {"item_id": "system.ifconfig", "status": "skipped",
+             "reason": "互斥回退", "recommended_action": "无需处理"},
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "report_model.json"
+            write_json(model_path, model)
+            for layout in ("professional", "legacy"):
+                output = Path(temporary) / f"gaps-{layout}.docx"
+                MySQLWordReportGenerator(model_path, output, layout=layout).build()
+                cells = {
+                    cell.text
+                    for table in Document(output).tables
+                    for row in table.rows
+                    for cell in row.cells
+                }
+                self.assertIn("未启用", cells, layout)
+                self.assertIn("已跳过", cells, layout)
+                for status in ("not_enabled", "skipped"):
+                    self.assertNotIn(status, cells, f"{layout} 布局把 {status} 原样印出来了")
 
 
 if __name__ == "__main__":

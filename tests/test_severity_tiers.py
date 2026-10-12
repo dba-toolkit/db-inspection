@@ -21,14 +21,29 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from plugins.oracle.package_adapter import TableFetch
+
 ROOT = Path(__file__).resolve().parents[1]
 
 ORACLE_PACK = ROOT / "plugins/oracle/inspection_rules_oracle.json"
 
 
 def _ctx(tables: dict | None = None) -> SimpleNamespace:
-    """最小 PackageContext 替身：被测的几条规则只用到 ``ctx.tables``。"""
-    return SimpleNamespace(tables=tables or {})
+    """最小 PackageContext 替身：``tables`` + ``table_fetch``。
+
+    ★ 批 19 起规则层用 ``ctx.table_fetch(...)`` 取数（顺手把**采集侧状态**带进判据），
+    替身必须把这个方法真实现出来 —— 缺了它测试会直接 AttributeError，而不是
+    "少判了一种情况"（后者会让守门测试静默失效）。替身里的表一律当"已采集到"。
+    """
+    data = tables or {}
+
+    def table_fetch(*names: str) -> TableFetch:
+        for name in names:
+            if name in data:
+                return TableFetch(data[name], name, "ok")
+        return TableFetch()
+
+    return SimpleNamespace(tables=data, table_fetch=table_fetch)
 
 
 class OracleSeverityOverrideTests(unittest.TestCase):

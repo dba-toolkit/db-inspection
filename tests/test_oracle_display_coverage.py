@@ -18,7 +18,10 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from inspection_core import PackageContext
+from plugins.oracle.package_adapter import (
+    OraclePackageContext as PackageContextForOracle,
+    TableFetch,
+)
 from plugins.oracle.presentation import _cell, build_inspection_sections
 from plugins.oracle.report_adapter import adapt_report_model
 
@@ -129,7 +132,12 @@ SAMPLE_ROWS: dict[str, dict[str, str]] = {
 class FakeContext:
     """最小 ctx：只提供 presentation 需要的属性。
 
-    `tables` 键用 **2.0 的 item_id**；`find_table` 同时支持精确与子串（与真实适配器同语义）。
+    `tables` 键用 **2.0 的 item_id**；`find_table` / `table_fetch` **委托真实适配器**
+    （批 19 起规则层与展示层都靠 `table_fetch` 同时拿「行」与「采集侧状态」）。
+    ★ 早先这里自己抄了一份 `find_table` 的子串兜底 —— 那是**替身里又写了一遍被测逻辑**：
+      真适配器的兜底规则一改，替身不会跟着改，测试照样绿。现在只剩「把表塞进去」这一件事。
+    ★ 少实现一个方法只会炸 `AttributeError`，而**不会**变成"少判了一种情况"——
+      后者会让测试骗人，所以替身必须把真方法实现出来（哪怕只是转发）。
     """
 
     def __init__(self, tables: dict[str, list[dict[str, Any]]],
@@ -149,7 +157,9 @@ class FakeContext:
         # 批 14：presentation 取非表格式证据文件（lscpu / mounts / dmesg / kernel_parameters …）
         # 一律走 `ctx.raw_lines`，不再自己拼 `root / "evidence" / …`。FakeContext 委托**真实实现**
         # ——这里 root 指向不存在的目录，故与真实行为一致地返回空，不复制一套解析规则。
-        self._real = PackageContext(
+        # 批 19：`raw_lines` 用基类即可，但 `find_table` / `table_fetch` 必须有 —— 后者只存在于
+        # Oracle 适配器上（它还要一并给出「采集侧状态」），故这里换成真适配器。
+        self._real = PackageContextForOracle(
             source=self.root,
             root=self.root,
             snapshot=self.snapshot,
@@ -157,20 +167,19 @@ class FakeContext:
             manifest={},
             integrity={},
         )
+        # 真实适配器只在 `load()` 里填 tables / table_state；这里手工喂同一对映射，
+        # 之后所有取数都走真代码，别名、状态、命中名一起被测。
+        self._real.tables.update(tables)
+        self._real.table_state.update(statuses or {})
 
     def raw_lines(self, name: str) -> list[str]:
         return self._real.raw_lines(name)
 
     def find_table(self, *names: str) -> list[dict[str, str]]:
-        for name in names:
-            if name in self.tables and self.tables[name]:
-                return self.tables[name]
-        for name in names:
-            lowered = name.lower()
-            for key in self.tables:
-                if (name in key or lowered in key.lower()) and self.tables[key]:
-                    return self.tables[key]
-        return []
+        return self._real.find_table(*names)
+
+    def table_fetch(self, *names: str) -> TableFetch:
+        return self._real.table_fetch(*names)
 
 
 def _source_id(item: dict[str, Any]) -> str:

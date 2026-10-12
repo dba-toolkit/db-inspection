@@ -37,6 +37,7 @@ import plugins.oracle.charts as oracle_charts
 from inspection_core import PackageContext
 from plugins.oracle.charts import OracleChartProvider
 from plugins.oracle.oracle_rules import OracleRuleEngine
+from plugins.oracle.package_adapter import TableFetch
 from plugins.oracle.presentation import (
     _mount_rows,
     _persistent_mounts,
@@ -90,6 +91,18 @@ class FakeContext:
                     return self.tables[key]
         return []
 
+    def table_fetch(self, *names: str) -> TableFetch:
+        """精确取数（**不含** `find_table` 的子串兜底）。
+
+        ★ 替身必须把真方法实现出来：批 19 起规则层靠它同时拿到「行」与「采集侧状态」，
+        替身缺这个方法只会炸 AttributeError，而不是"少判了一种情况"——后者会让测试骗人。
+        这里的状态一律给 `ok`（替身里的表都当"已采集到"）。
+        """
+        for name in names:
+            if name in self.tables:
+                return TableFetch(self.tables[name], name, "ok")
+        return TableFetch()
+
 
 def _source_id(item: dict[str, Any]) -> str:
     raw = str(item.get("source") or "").strip()
@@ -115,7 +128,7 @@ class FilesystemRuleTests(unittest.TestCase):
     @staticmethod
     def _evaluate(rows: list[dict[str, str]]):
         engine = OracleRuleEngine()
-        ctx = SimpleNamespace(tables={"filesystems": rows})
+        ctx = FakeContext({"filesystems": rows})
         engine._check_filesystem_usage(ctx, {"scope": {"database_target_is_local": True}})
         return engine._evaluations[0]
 
@@ -244,7 +257,7 @@ class RuleEvidenceTests(unittest.TestCase):
 
     def test_passed_rule_carries_its_measured_facts(self) -> None:
         engine = OracleRuleEngine()
-        ctx = SimpleNamespace(tables={"filesystems": [CDROM_ROW, ROOT_ROW]})
+        ctx = FakeContext({"filesystems": [CDROM_ROW, ROOT_ROW]})
         engine._check_filesystem_usage(ctx, {"scope": {"database_target_is_local": True}})
         evaluation = engine._evaluations[0].to_dict()
         self.assertEqual(evaluation["status"], "passed")

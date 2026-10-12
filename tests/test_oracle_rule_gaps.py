@@ -60,10 +60,22 @@ class OracleRuleGapTests(unittest.TestCase):
         self.assertEqual(ev["ORA.DG.TRANSPORT_ERROR"].status, "not_evaluated")
 
     def test_dg_lag_without_a_standby_is_not_evaluated(self) -> None:
-        """★ 无备库时视图为空 —— 不能落 passed（那等于宣称"延迟正常"）。"""
-        _, ev = self._run("_check_dg_lag", ctx({}), {})
+        """★ 无备库时视图为空 —— 不能落 passed（那等于宣称"延迟正常"）。
+
+        ★ 批 19 追加后半段：「表在包里但 0 行」与「表根本没在包里」是**相反结论**，
+          两句话必须不一样。原先这条只用 `ctx({})`（什么表都没有）断言含"未配置"——
+          那正是把「没采到」当成「没配置」。现在两种输入各断言一次。
+        """
+        # ① 视图查了、确认没有备库 ⇒ 可以下"未配置 DataGuard"的结论
+        _, ev = self._run("_check_dg_lag", ctx({"oracle.dg.protection_mode": []}), {})
         self.assertEqual(ev["ORA.DG.APPLY_LAG"].status, "not_evaluated")
         self.assertIn("未配置", ev["ORA.DG.APPLY_LAG"].reason)
+
+        # ② 表不在包里（没采到）⇒ 只能说证据不足，**不许**说"未配置"
+        _, ev = self._run("_check_dg_lag", ctx({}), {})
+        self.assertEqual(ev["ORA.DG.APPLY_LAG"].status, "not_evaluated")
+        self.assertIn("未采集到", ev["ORA.DG.APPLY_LAG"].reason)
+        self.assertNotIn("未配置", ev["ORA.DG.APPLY_LAG"].reason)
 
     def test_dg_lag_reads_the_threshold(self) -> None:
         rows = [{"NAME": "transport lag", "VALUE": "+00 00:20:00"}]  # 1200s
