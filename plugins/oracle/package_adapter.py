@@ -117,12 +117,87 @@ def _load_collection_status(status_dir: Path) -> dict[str, Any]:
     return {"items": items}
 
 
-def parse_delimited(path: Path, delimiter: str = "\t") -> list[dict[str, str]]:
+def _rejoin_wrapped_rows(lines: list[str], delimiter: str) -> list[str]:
+    """回并 sqlplus 的**折行续行**（**只对 2.0 的 `.psv` 成立**，调用方用 `repair_wrap=True` opt-in）。
+
+    ★★ 判据为什么在 2.0 上成立（结构化，不是启发式）：2.0 采集会话里设了 `SET NULL '-'`
+    —— 真 NULL 会打成 `-`，**空单元格根本不存在**。实测 10-10 包 103 张表里只有 1 行
+    首字段为空（`oracle.basic.parameters.psv` 的 `|02.ctl`），正是折行残段：
+    `control_files` 的值被 `COLUMN value FORMAT a80` 断成两行，残段被当成了第二条参数。
+
+    ⚠⚠ **1.4 的 `.tsv` 上这条判据不成立，必须关掉**（08-10 包实测，代价很实在）：1.4 的
+    `控制文件.tsv` 是
+        `STATUS |NAME` / `       |…/control01.ctl` / `       |…/control02.ctl`
+    —— 第一列空白是 **NULL 落在定宽列里**，那两行是**真实数据行**。开回并会把两行数据
+    并进**表头**（表从 2 行塌成 0 行，报告里 `控制文件路径` 整项变空）。1.4 另有
+    `控制文件序列号.tsv`（3→1 行）、`最近 SQL 错误 (近24h).tsv`（15→14 行）同样被误并。
+    ⇒ **判据的前提是「采集器版本保证空单元格不存在」，不是「分隔符是 `|`」** ——
+    所以它由 `_iter_table_specs` 按版本给出，不按分隔符猜。
+
+    拼回规则：**不加分隔符**。采集侧已把 `WORD_WRAPPED` 全部撤掉（见
+    `inspection/oracle_inspection.sh::ora_sql_to_md` 的注释），折行只剩**断词**一种，
+    残段就是被打断 token 的后半截，直接续接即可。
+
+    保守边界（对不上就**原样保留**，宁可让异常露出来，也不猜）：
+      · 首字段非空 → 正常行；
+      · 没有上一行 / `lead` 越出上一行的列数 / 上一行那一格是空的 → 不并。
+
+    形状要点（真实产物的形状，别按"残段只有一列"想）：折行那一列之后**还没打印的列**
+    会跟在残段后面 —— 例如
+        `undo_retention|<被折断的值前半` / `|值后半|FALSE|MODIFIED`
+    所以残段的字段数**可以多于**上一行；续接那一列、其余列按"空位才填"补进去。
+
+    ⚠ 已知边界：折点若恰好落在**空格**上，行尾空格已被 `psv_normalize` 剥掉，
+    续接会少一个空格。走向上由采集侧的「宽度 ≥ SQL 截断长度」消除；
+    本函数只作**存量包**的兜底。
+    """
+    if delimiter != "|":
+        return lines
+    merged_lines: list[str] = []
+    for line in lines:
+        cells = line.split(delimiter)
+        lead = 0
+        while lead < len(cells) and not cells[lead].strip():
+            lead += 1
+        if lead == 0 or not merged_lines:
+            merged_lines.append(line)
+            continue
+        previous = merged_lines[-1].split(delimiter)
+        if lead >= len(previous) or not previous[lead].strip():
+            merged_lines.append(line)
+            continue
+        merged = list(previous)
+        for index in range(lead, len(cells)):
+            cell = cells[index].strip()
+            if not cell:
+                continue
+            if index == lead:
+                # 折行那一列：sqlplus 是**断词**折行（采集侧已撤掉 WORD_WRAPPED），直接续接。
+                merged[index] = previous[index] + cell
+            elif index >= len(merged):
+                merged.extend([""] * (index + 1 - len(merged)))
+                merged[index] = cell
+            elif not merged[index].strip():
+                merged[index] = cell
+            # else：上一行该列已有值 —— 保守起见保留，不覆盖。
+        merged_lines[-1] = delimiter.join(merged)
+    return merged_lines
+
+
+def parse_delimited(path: Path, delimiter: str = "\t", *,
+                    repair_wrap: bool = False) -> list[dict[str, str]]:
     """Oracle 表格解析：跳过 sqlplus 分隔线 / 占位行，并去除键/值两侧空白。
 
     `#` 开头的行一律丢弃 —— 这同时覆盖了批 5 起 `.psv` 的两种占位形态
     （`# oracle-inspection psv-empty …` / `… psv-unavailable …`）：**占位返回空表**，
     "查了没有" 与 "没采到" 的区别去 `status/*.tsv` 的 `status` 列看，不在表格里。
+
+    `repair_wrap=True` 时追加一步**折行续行回并**（见 `_rejoin_wrapped_rows`）。
+    ★ **默认关**，不是懒省事：这条回并的判据是「采集器保证空单元格不存在」，
+    **只有 2.0 的 `.psv` 成立**；1.4 的 `.tsv` 上开它会**把真实数据行并进表头**
+    （08-10 包实测：`控制文件.tsv` 3 行塌成 1 行）。默认关 ⇒ 忘了传参的代价是
+    「折行没修」（报告里看得见），不是「数据被静默吃掉」。
+    版本 → 是否回并的对应关系由 `_iter_table_specs` 单点给出。
     """
     if not path.exists() or path.stat().st_size == 0:
         return []
@@ -137,6 +212,8 @@ def parse_delimited(path: Path, delimiter: str = "\t") -> list[dict[str, str]]:
             lines.append(stripped)
     if not lines:
         return []
+    if repair_wrap:
+        lines = _rejoin_wrapped_rows(lines, delimiter)
     reader = csv.DictReader(lines, delimiter=delimiter)
     result: list[dict[str, str]] = []
     for row in reader:
@@ -180,17 +257,24 @@ def collector_major(snapshot: dict[str, Any]) -> str:
     return raw.split(".", 1)[0].strip()
 
 
-def _iter_table_specs(tables_dir: Path, major: str) -> list[tuple[Path, str]]:
-    """按采集器主版本返回 `(文件, 分隔符)` 清单。"""
-    specs: list[tuple[Path, str]] = []
+def _iter_table_specs(tables_dir: Path, major: str) -> list[tuple[Path, str, bool]]:
+    """按采集器主版本返回 `(文件, 分隔符, 是否回并折行)` 清单。
+
+    ★ 第三项是**版本属性**，不是分隔符属性：只有 2.0 会话设了 `SET NULL '-'`
+    （空单元格不存在），回并折行才安全；1.4 的第一列空白是 NULL 落在定宽列里、
+    是**真实数据行**（详见 `_rejoin_wrapped_rows` 的 docstring）。这是全仓库唯一
+    把「版本」翻译成「能不能回并」的地方。
+    """
+    specs: list[tuple[Path, str, bool]] = []
     if major == LEGACY_COLLECTOR_MAJOR:
-        # 1.4：`tables/<中文标题>.tsv`，sqlplus 定宽表（`SET COLSEP '|'`）
-        specs = [(path, "|") for path in sorted(tables_dir.glob("*.tsv"))]
+        # 1.4：`tables/<中文标题>.tsv`，sqlplus 定宽表（`SET COLSEP '|'`）。
+        #      无 `SET NULL '-'` 保证 ⇒ 不回并。
+        specs = [(path, "|", False) for path in sorted(tables_dir.glob("*.tsv"))]
     else:
-        # 2.0：`.psv`（SQL 结果，`|`）+ `.tsv`（真 TAB 表）
-        specs = [(path, "|") for path in sorted(tables_dir.glob("*.psv"))]
-        specs += [(path, "\t") for path in sorted(tables_dir.glob("*.tsv"))]
-    return [(path, delimiter) for path, delimiter in specs if path.is_file()]
+        # 2.0：`.psv`（SQL 结果，`|`，**可回并**）+ `.tsv`（真 TAB 表，分隔符不同、天然不触发）
+        specs = [(path, "|", True) for path in sorted(tables_dir.glob("*.psv"))]
+        specs += [(path, "\t", False) for path in sorted(tables_dir.glob("*.tsv"))]
+    return [(path, delimiter, repair) for path, delimiter, repair in specs if path.is_file()]
 
 
 def _short_aliases(*names: str) -> set[str]:
@@ -310,21 +394,21 @@ class OraclePackageAdapter:
             if item_id and output.startswith("tables/"):
                 file_to_item[output[len("tables/"):]] = item_id
 
-        entries: list[tuple[Path, str, str, str]] = []
+        entries: list[tuple[Path, str, bool, str, str]] = []
         tables_dir = root / "tables"
         if tables_dir.is_dir():
-            for path, delimiter in _iter_table_specs(tables_dir, major):
+            for path, delimiter, repair_wrap in _iter_table_specs(tables_dir, major):
                 item_id = file_to_item.get(path.name) or path.stem
-                entries.append((path, delimiter, path.stem, item_id))
+                entries.append((path, delimiter, repair_wrap, path.stem, item_id))
 
         short_counts: Counter[str] = Counter()
-        for _, _, stem, item_id in entries:
+        for _, _, _, stem, item_id in entries:
             short_counts.update(_short_aliases(stem, item_id))
 
         primary: list[tuple[set[str], list[dict[str, str]]]] = []
         aliases: list[tuple[set[str], list[dict[str, str]]]] = []
-        for path, delimiter, stem, item_id in entries:
-            rows = parse_delimited(path, delimiter)
+        for path, delimiter, repair_wrap, stem, item_id in entries:
+            rows = parse_delimited(path, delimiter, repair_wrap=repair_wrap)
             primary.append(({stem, item_id}, rows))
             extra: set[str] = set()
             title = titles.get(item_id)
