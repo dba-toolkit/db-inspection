@@ -7,6 +7,8 @@ import statistics
 from collections.abc import Sequence
 from typing import Any
 
+from .package_adapter import fetch_state
+
 
 def safe_float(value: Any) -> float | None:
     if value is None:
@@ -74,6 +76,12 @@ class OracleMetricProvider:
 
     def derive(self, ctx: Any) -> dict[str, Any]:
         metrics: dict[str, Any] = {}
+        # 「来自 `tables/` 的指标」→ **这项采集侧声明的状态**。
+        # ★ 必须单独记一份：`ctx.tables.get(名字, [])` 在「取数键写错」与「查了 0 行」
+        #   两种情况下都返回 `[]`，指标值双双落成 0/None；规则层据此写「检查通过」，
+        #   而真相可能是**这一项根本没采到**（批 19 的注入实验实测出 3 条恒通过的漏报）。
+        #   规则层拿 `source_status[key]` 才能把两者分开（`empty` 算采集过、`unavailable` 不算）。
+        source_status: dict[str, str] = metrics.setdefault("source_status", {})
 
         cpu_rows = ctx.timeseries.get("system_cpu", [])
         mem_rows = ctx.timeseries.get("system_memory", [])
@@ -160,7 +168,10 @@ class OracleMetricProvider:
             "memory_used_pct": summarize(sar_mem_used),
         }
 
-        tablespace_rows = ctx.find_table("所有表空间容量使用情况", "表空间", "tablespace")
+        tablespace_fetch = ctx.table_fetch(
+            "所有表空间容量使用情况", "oracle.tablespace.usage",
+        )
+        tablespace_rows = tablespace_fetch.rows
         tablespace_usage: list[float] = []
         tablespace_capacity_pct: list[float] = []
         for row in tablespace_rows:
@@ -180,38 +191,48 @@ class OracleMetricProvider:
                 tablespace_capacity_pct.append(used / max_mb * 100)
         metrics["tablespace_max_used_pct"] = max(tablespace_usage) if tablespace_usage else None
         metrics["tablespace_max_capacity_pct"] = max(tablespace_capacity_pct) if tablespace_capacity_pct else None
+        # 两个指标同源于一张表，状态也同一个（键按指标名登记，省得规则层再记一套名字）。
+        source_status["tablespace_max_used_pct"] = fetch_state(tablespace_fetch)
+        source_status["tablespace_max_capacity_pct"] = fetch_state(tablespace_fetch)
 
-        asm_rows = ctx.tables.get("asm_diskgroup_summary", []) or ctx.tables.get("ASM磁盘组使用情况", [])
+        # 取数一律走 `table_fetch`（精确键，**不走子串兜底**）：别名按「2.0 item_id → 1.4 中文标题」
+        # 列全，命中哪个键就有哪个键的真实状态；一个都没命中 ⇒ `unavailable`，规则层写「证据不足」。
+        asm_fetch = ctx.table_fetch("asm_diskgroup_summary", "oracle.asm.diskgroup_summary", "ASM 磁盘组汇总")
         asm_usage: list[float] = []
-        for row in asm_rows:
+        for row in asm_fetch.rows:
             v = safe_float(row.get("USED_PCT")) or safe_float(row.get("PCT")) or safe_float(row.get("%USED"))
             if v is not None:
                 asm_usage.append(v)
         metrics["asm_max_used_pct"] = max(asm_usage) if asm_usage else None
+        source_status["asm_max_used_pct"] = fetch_state(asm_fetch)
 
-        inv_rows = ctx.tables.get("无效对象检查", []) or ctx.tables.get("invalid_objects", [])
-        inv_count = len(inv_rows)
-        for row in inv_rows:
+        inv_fetch = ctx.table_fetch("无效对象检查", "oracle.basic.invalid_objects", "无效对象统计")
+        inv_count = inv_fetch.counted
+        for row in inv_fetch.rows:
             v = safe_int(row.get("COUNT")) or safe_int(row.get("INVALID_COUNT"))
             if v is not None:
                 inv_count = v
                 break
         metrics["invalid_object_count"] = inv_count
+        source_status["invalid_object_count"] = fetch_state(inv_fetch)
 
-        long_txn_rows = ctx.tables.get("长事务检查", []) or ctx.tables.get("long_transactions", [])
-        metrics["long_transaction_count"] = len(long_txn_rows)
+        txn_fetch = ctx.table_fetch("长事务检查", "oracle.session.long_transactions", "长事务（运行超过1小时）")
+        metrics["long_transaction_count"] = txn_fetch.counted
+        source_status["long_transaction_count"] = fetch_state(txn_fetch)
 
-        lock_rows = ctx.tables.get("锁等待链", []) or ctx.tables.get("lock_wait_chain", [])
-        metrics["lock_wait_count"] = len(lock_rows)
+        lock_fetch = ctx.table_fetch("锁等待链", "oracle.session.lock_chain", "锁等待链（阻塞者 → 被阻塞者）")
+        metrics["lock_wait_count"] = lock_fetch.counted
+        source_status["lock_wait_count"] = fetch_state(lock_fetch)
 
-        backup_rows = ctx.tables.get("最近RMAN备份任务状态", []) or ctx.tables.get("rman_backup_status", [])
-        metrics["recent_backup_count"] = len(backup_rows)
+        backup_fetch = ctx.table_fetch("最近RMAN备份任务状态", "oracle.rman.backup_summary", "最近备份集汇总")
+        metrics["recent_backup_count"] = backup_fetch.counted
         has_recent = False
-        for row in backup_rows:
+        for row in backup_fetch.rows:
             status_val = str(row.get("STATUS", "")).upper()
             if status_val in {"COMPLETED", "COMPLETED WITH WARNINGS"}:
                 has_recent = True
         metrics["has_recent_backup"] = has_recent
+        source_status["has_recent_backup"] = fetch_state(backup_fetch)
 
         collector_host = str(ctx.snapshot.get("host", "")).strip()
         is_local = (collector_host == "") or (collector_host in ("127.0.0.1", "localhost", "::1")) or collector_host.startswith("127.")

@@ -17,7 +17,13 @@ from typing import Any
 from dataclasses import dataclass, field
 
 from .metrics import safe_float, safe_int
-from .package_adapter import OraclePackageContext as PackageContext, filesystem_type
+from .package_adapter import (
+    OraclePackageContext as PackageContext,
+    filesystem_type,
+    fetch_state,
+    prefer_state,
+    state_is_collected,
+)
 from .presentation import Finding
 from inspection_core.system_checks import (
     CANONICAL_RULE_IDS,
@@ -56,6 +62,12 @@ class RuleEvaluation:
     # 通过项写出实测值（如「最高文件系统使用率：33.0%」），而不是让读者猜。
     facts: list[str] = field(default_factory=list)
     confidence: float = 1.0
+    # 这条判据的**数据来源**在采集侧的声明状态（`ok`/`empty`/`partial`/`unavailable`…）。
+    # ★ 规则项在报告里也印「采集状态」一行，此前那一行读的是 `quality.non_ok_items`
+    #   （只记失败态、且按**采集项** id 索引）⇒ 规则 id 永远查不到 ⇒ 无论底层表是
+    #   「查了没有」还是「根本没采到」，一律印成「正常」（批 19 的 C 项）。
+    #   状态从判据自己身上带出来，是唯一不会与真实采集情况脱钩的做法。
+    source_status: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -69,7 +81,30 @@ class RuleEvaluation:
             "evidence_refs": self.evidence_refs,
             "facts": self.facts,
             "confidence": self.confidence,
+            "source_status": self.source_status,
         }
+
+
+def _collected(metrics: dict[str, Any], key: str) -> tuple[Any, bool, str]:
+    """取一个「来自采集包表格的指标」→ `(值, 采集过吗, 采集侧状态)`。
+
+    ★ 状态键**缺失一律按「没采到」处理**（fail-safe）：宁可写「证据不足」，不可写「检查通过」。
+      这是批 19 判据 A 的落点 —— 从前 `metrics.get(key, 0)` 在「取数键写错」「这项没采」
+      「查了 0 行」三种情况下都得到 `0`，报告一律写「检查通过」，其中前两种是**漏报**。
+    """
+    state = str((metrics.get("source_status") or {}).get(key) or "")
+    return metrics.get(key, 0), state_is_collected(state), state
+
+
+def _missing_reason(what: str, state: str) -> str:
+    """取数没落地时报告里那句结论 —— **「没采到」与「查了没有」不许长得一样**。
+
+    `empty`（查了、确认 0 行）是**查过了**，只是这次没有记录；`unavailable` 才是没采到。
+    两者被写成同一句话，读者就无法区分「没问题」与「不知道」（批 14 立的规矩，批 19 补上取数层）。
+    """
+    if state_is_collected(state):
+        return f"{what}已检查，本次未发现相关记录"
+    return f"未采集到{what}（采集包内无对应表）"
 
 
 class OracleRuleEngine:
@@ -176,10 +211,15 @@ class OracleRuleEngine:
         triggered: bool,
         reason: str,
         facts: list[str],
+        source_status: str = "",
         confidence_override: float | None = None,
         severity_override: str | None = None,
     ) -> None:
-        """Core evaluation dispatcher — mirrors MySQL _evaluate."""
+        """Core evaluation dispatcher — mirrors MySQL _evaluate.
+
+        `source_status` = 这条判据的**数据来源在采集侧的声明状态**，随 `RuleEvaluation`
+        一路带到报告里（规则项那行「采集状态」）。空串表示「来源不是采集包里的表」。
+        """
         cfg = self._cfg(rule_id)
         category: str = cfg.get("category", rule_id.split(".")[0])
         severity: str = cfg.get("severity", "medium")
@@ -222,6 +262,7 @@ class OracleRuleEngine:
             evidence_refs=evidence, confidence=confidence,
             # 未触发也留证据：展示层用它给"通过"项写出实测值。
             facts=list(facts or []),
+            source_status=source_status,
         ))
 
     # ------------------------------------------------------------------
@@ -257,6 +298,7 @@ class OracleRuleEngine:
             ntp in {"no", "false", "0", "inactive"},
             f"NTP synchronized={ntp or 'unknown'}",
             [f"NTP synchronized：{ntp or 'unknown'}"],
+            "ok" if ntp else "unavailable",
         )
 
     def _check_system_resources(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
@@ -275,13 +317,20 @@ class OracleRuleEngine:
                 verdict["rule_id"], local, verdict["available"], verdict["triggered"],
                 reason_note,
                 [verdict["fact"]] if verdict["fact"] else [],
+                "ok" if verdict["available"] else "unavailable",
                 confidence_override=source["confidence"],
             )
 
     def _check_filesystem_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
         rule = CANONICAL_RULE_IDS["filesystem_usage"]
         local = metrics.get("scope", {}).get("database_target_is_local", False)
-        all_rows = ctx.tables.get("filesystems", [])
+        # `filesystems` 是 1.4 时代的键；2.0 从 `evidence/filesystems.txt` 回填时同时登记
+        # `system.filesystems` / `filesystems`。取数走 `table_fetch`（精确键），
+        # 命中不到就是「这一项没采」（1.4 包实测如此）—— 不拿空表冒充「查了没问题」。
+        fetch = ctx.table_fetch("filesystems", "system.filesystems")
+        all_rows = fetch.rows
+        state = fetch_state(fetch)
+        collected = state_is_collected(state)
         # 容量判据只看**持久化**文件系统。光驱（iso9660/squashfs/udf）是只读介质、
         # 恒定 100% 满且 0 可用，tmpfs/devtmpfs/proc/sysfs 根本没有"容量"概念 ——
         # 把它们算进最大值只会制造客户既无法确认也无法处置的"风险"（真踩过：一份
@@ -300,10 +349,12 @@ class OracleRuleEngine:
             # 口径要能自证：客户看到"最高 33%"会问"我 fs 表里有 9 行，凭什么只算这个"。
             fact += f"（已排除 {excluded} 个 tmpfs/devtmpfs/光驱等非持久化挂载点）"
         self._evaluate(
-            rule, local, bool(fs_rows),
+            rule, local, collected and bool(fs_rows),
             max_pct >= t,
-            "检查所有已成功读取的持久化文件系统",
+            "检查所有已成功读取的持久化文件系统" if collected
+            else _missing_reason("文件系统清单（df -PT）", state),
             [fact] if fs_rows else [],
+            state,
         )
 
     def _check_tablespace_usage(self, metrics: dict[str, Any]) -> None:
@@ -325,64 +376,88 @@ class OracleRuleEngine:
             # 实测值进报告「依据」列，写成人能读的：`max_capacity_pct=3.387451171875`
             # 那种原始浮点既占地方又要读者自己换算。
             [f"{source_label} {pct:.1f}%"] if pct is not None else [],
+            str((metrics.get("source_status") or {}).get("tablespace_max_capacity_pct") or ""),
             severity_override=promote,
         )
 
     def _check_asm_usage(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.STORAGE.ASM"
-        pct = metrics.get("asm_max_used_pct")
+        pct, collected, state = _collected(metrics, "asm_max_used_pct")
         t = self._threshold(rule, "asm_warning_pct", 80)
+        # ★ `if pct` 会把**真的 0%**（磁盘组刚建、还没放数据）吞成"无 ASM" ⇒ 一律 `is not None`。
+        usable = collected and pct is not None
         self._evaluate(
-            rule, True, pct is not None,
-            pct is not None and pct >= t,
-            f"ASM 最大使用率 {pct:.1f}%" if pct else "无 ASM",
-            [f"ASM 最大使用率 {pct:.1f}%"] if pct is not None else [],
+            rule, True, usable,
+            usable and pct >= t,
+            f"ASM 最大使用率 {pct:.1f}%" if usable else _missing_reason("ASM 磁盘组使用情况", state),
+            [f"ASM 最大使用率 {pct:.1f}%"] if usable else [],
+            state,
         )
 
     def _check_fra_usage(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
         rule = "ORA.STORAGE.FRA"
-        fra_rows = ctx.find_table("FRA", "闪回区", "快速恢复区")
-        pct = None
-        for row in fra_rows:
-            pct = safe_float(row.get("PERCENT_SPACE_USED")) or safe_float(row.get("PCT"))
+        # ★ 从前这里是 `ctx.find_table("FRA", "闪回区", "快速恢复区")`：**子串兜底**先把
+        #   "FRA" 匹配到 `快速恢复区（FRA）参数`（只有 NAME/VALUE，没有 PERCENT_SPACE_USED）
+        #   ⇒ 命中了**错的表**，使用率恒 None ⇒ 这条规则在两种包形态上都**永不触发**
+        #   （批 19 注入实测：给真正的使用率表灌 95% 也不触发，即静默漏报）。
+        #   真实落点有两处（普通实例 `V$FLASH_RECOVERY_AREA_USAGE` / ASM 实例
+        #   `V$RECOVERY_AREA_USAGE`），按 2.0 item_id 与 1.4 标题列全。
+        usage_fetch = ctx.table_fetch("oracle.flashback.area_usage", "闪回区使用情况")
+        asm_fetch = ctx.table_fetch("oracle.archive.fra_asm", "ASM 快速恢复区使用情况")
+        state = prefer_state(fetch_state(usage_fetch), fetch_state(asm_fetch))
+        pcts = [value for value in
+                (_fra_percent(row) for row in [*usage_fetch.rows, *asm_fetch.rows])
+                if value is not None]
+        # 多个文件类型各占一行 ⇒ 取**最大**。原实现取"最后一行"，报不报取决于视图返回顺序。
+        pct = max(pcts) if pcts else None
         t = self._threshold(rule, "fra_warning_pct", 80)
+        usable = pct is not None
         self._evaluate(
-            rule, True, pct is not None,
-            pct is not None and pct >= t,
-            f"FRA 使用率 {pct:.1f}%" if pct else "无 FRA 记录",
-            [f"used_pct={pct}"] if pct is not None else [],
+            rule, True, usable,
+            usable and pct >= t,
+            f"FRA 使用率 {pct:.1f}%" if usable else _missing_reason("快速恢复区（FRA）使用情况", state),
+            [f"FRA 使用率 {pct:.1f}%"] if usable else [],
+            state,
         )
 
     def _check_invalid_objects(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.OBJECT.INVALID"
-        count = metrics.get("invalid_object_count", 0)
+        count, collected, state = _collected(metrics, "invalid_object_count")
         self._evaluate(
-            rule, True, True, count > 0,
-            f"发现 {count} 个无效对象" if count else "对象状态正常",
-            [f"invalid_count={count}"],
+            rule, True, collected, count > 0,
+            (f"发现 {count} 个无效对象" if count else "对象状态正常") if collected
+            else _missing_reason("无效对象统计", state),
+            [f"invalid_count={count}"] if collected else [],
+            state,
         )
 
     def _check_long_transactions(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.TXN.LONG"
-        count = metrics.get("long_transaction_count", 0)
+        count, collected, state = _collected(metrics, "long_transaction_count")
         self._evaluate(
-            rule, True, True, count > 0,
-            f"发现 {count} 个长时间事务" if count else "无长事务",
-            [f"count={count}"],
+            rule, True, collected, count > 0,
+            (f"发现 {count} 个长时间事务" if count else "无长事务") if collected
+            else _missing_reason("长事务检查", state),
+            [f"count={count}"] if collected else [],
+            state,
         )
 
     def _check_lock_waiting(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.LOCK.BLOCKING"
-        count = metrics.get("lock_wait_count", 0)
+        count, collected, state = _collected(metrics, "lock_wait_count")
         self._evaluate(
-            rule, True, True, count > 0,
-            f"发现 {count} 组锁等待" if count else "无锁等待",
-            [f"count={count}"],
+            rule, True, collected, count > 0,
+            (f"发现 {count} 组锁等待" if count else "无锁等待") if collected
+            else _missing_reason("锁等待链", state),
+            [f"count={count}"] if collected else [],
+            state,
         )
 
     def _check_archive_mode(self, ctx: PackageContext) -> None:
         rule = "ORA.ARCHIVE.MODE"
-        archive_rows = ctx.find_table("归档模式检查", "归档模式", "archive_mode")
+        fetch = ctx.table_fetch("归档模式检查", "oracle.archive.mode", "archive_mode")
+        archive_rows = fetch.rows
+        state = fetch_state(fetch)
         # Handle both tab-separated and pipe-separated TSV formats.
         # Critical: "NOARCHIVELOG" contains "ARCHIVELOG" as substring — must exclude!
         def _has_archivelog(row) -> bool:
@@ -393,21 +468,26 @@ class OracleRuleEngine:
             return False
         is_archivelog = any(_has_archivelog(r) for r in archive_rows)
         if not archive_rows:
-            is_archivelog = True  # assume OK if not checked
+            # 空表不许直接落成「没开归档」：`available` 已经把它收口到 not_evaluated，
+            # 这里只负责别把 reason 写成一句客户会当真结论的话。
+            is_archivelog = True
         self._evaluate(
-            rule, True, bool(archive_rows),
+            rule, True, state_is_collected(state) and bool(archive_rows),
             not is_archivelog,
             "ARCHIVELOG" if is_archivelog else "NOARCHIVELOG",
             ["LOG_MODE=NOARCHIVELOG"] if not is_archivelog else [],
+            state,
         )
 
     def _check_backup_recent(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.BACKUP.RECENT"
-        has_backup = metrics.get("has_recent_backup", False)
+        has_backup, collected, state = _collected(metrics, "has_recent_backup")
         self._evaluate(
-            rule, True, True, not has_backup,
-            "近 48h 无成功备份" if not has_backup else "备份正常",
+            rule, True, collected, not has_backup,
+            ("备份正常" if has_backup else "近 48h 无成功备份") if collected
+            else _missing_reason("最近备份集汇总", state),
             [],
+            state,
         )
 
     def _check_buffer_cache(self, metrics: dict[str, Any]) -> None:
@@ -434,16 +514,20 @@ class OracleRuleEngine:
 
     def _check_block_corruption(self, ctx: PackageContext) -> None:
         rule = "ORA.DATA.BLOCK_CORRUPTION"
-        rows = ctx.tables.get("数据库坏块记录", []) or ctx.tables.get("block_corruption", [])
+        fetch = ctx.table_fetch("数据库坏块记录", "oracle.validation.corruption", "block_corruption")
+        rows = fetch.rows
         self._evaluate(
-            rule, True, True, len(rows) > 0,
-            f"发现 {len(rows)} 条坏块记录" if rows else "未发现坏块",
-            [f"count={len(rows)}"],
+            rule, True, fetch.available, len(rows) > 0,
+            (f"发现 {len(rows)} 条坏块记录" if rows else "未发现坏块") if fetch.available
+            else _missing_reason("坏块记录（V$DATABASE_BLOCK_CORRUPTION）", fetch_state(fetch)),
+            [f"count={len(rows)}"] if fetch.available else [],
+            fetch_state(fetch),
         )
 
     def _check_datafile_anomalies(self, ctx: PackageContext) -> None:
         rule = "ORA.DATA.FILE_HEADER"
-        rows = ctx.find_table("数据文件头异常", "datafile_header")
+        fetch = ctx.table_fetch("数据文件头异常", "oracle.validation.datafile_header", "datafile_header")
+        rows = fetch.rows
         # Only count rows where STATUS indicates a real problem
         bad_rows = [r for r in rows
                     if str(r.get("STATUS","")).upper().strip() not in ("ONLINE", "", "NORMAL")]
@@ -451,13 +535,17 @@ class OracleRuleEngine:
         self._evaluate(
             rule, True, bool(rows),
             triggered,
-            f"发现 {len(bad_rows)} 个数据文件头异常" if triggered else ("所有文件正常" if rows else "无数据"),
+            f"发现 {len(bad_rows)} 个数据文件头异常" if triggered else (
+                "所有文件正常" if rows else _missing_reason("数据文件头状态", fetch_state(fetch))),
             [f"bad_count={len(bad_rows)}, total={len(rows)}"] if triggered else [],
+            fetch_state(fetch),
         )
 
     def _check_control_redundancy(self, ctx: PackageContext) -> None:
         rule = "ORA.CONTROL.REDUNDANCY"
-        rows = ctx.tables.get("控制文件多路复用", []) or ctx.tables.get("controlfile_redundancy", [])
+        fetch = ctx.table_fetch("控制文件多路复用", "oracle.validation.controlfile_multiplex",
+                                "controlfile_redundancy")
+        rows = fetch.rows
         count = 0
         for row in rows:
             v = safe_int(row.get("CONTROLFILE_COUNT"))
@@ -466,47 +554,67 @@ class OracleRuleEngine:
                 break
         self._evaluate(
             rule, True, count > 0, count < 2,
-            f"控制文件 {count} 份" if count else "未采集",
+            f"控制文件 {count} 份" if count else _missing_reason("控制文件多路复用", fetch_state(fetch)),
             [f"count={count}"],
+            fetch_state(fetch),
         )
 
     def _check_scheduler_failures(self, ctx: PackageContext) -> None:
         rule = "ORA.JOB.FAILURE"
-        rows = ctx.find_table("Scheduler 失败", "Scheduler失败", "scheduler_failures")
+        fetch = ctx.table_fetch("Scheduler 失败作业（近7天）", "oracle.validation.scheduler_failed",
+                                "Scheduler失败", "scheduler_failures")
+        rows = fetch.rows
         self._evaluate(
-            rule, True, True, len(rows) > 0,
-            f"近 7 天 {len(rows)} 个失败作业" if rows else "无失败作业",
-            [f"count={len(rows)}"],
+            rule, True, fetch.available, len(rows) > 0,
+            (f"近 7 天 {len(rows)} 个失败作业" if rows else "无失败作业") if fetch.available
+            else _missing_reason("Scheduler 失败作业", fetch_state(fetch)),
+            [f"count={len(rows)}"] if fetch.available else [],
+            fetch_state(fetch),
         )
 
     def _check_checksum_params(self, ctx: PackageContext) -> None:
         rule = "ORA.DATA.CHECKSUM"
-        rows = ctx.tables.get("块校验与丢失写保护参数", []) or ctx.tables.get("checksum_params", [])
+        fetch = ctx.table_fetch("块校验与丢失写保护参数", "oracle.validation.block_checksum",
+                                "checksum_params")
+        rows = fetch.rows
         bad_params = [r for r in rows if str(r.get("VALUE", "")).upper() in {"OFF", "FALSE", "NONE"}]
         self._evaluate(
-            rule, True, bool(rows), len(bad_params) > 0,
-            f"{len(bad_params)} 个参数未开启" if bad_params else "正常",
+            rule, True, fetch.available, len(bad_params) > 0,
+            (f"{len(bad_params)} 个参数未开启" if bad_params else "正常") if fetch.available
+            else _missing_reason("块校验与丢失写保护参数", fetch_state(fetch)),
             [f"params={[r.get('NAME') for r in bad_params]}"] if bad_params else [],
+            fetch_state(fetch),
         )
 
     def _check_password_expiry(self, ctx: PackageContext) -> None:
         rule = "ORA.SECURITY.PASSWORD_EXPIRY"
-        rows = (ctx.tables.get("用户密码过期预警（账户非OPEN或30天内到期）", [])
-                or ctx.tables.get("用户密码过期预警", [])
-                or ctx.tables.get("password_expiry", []))
+        # ★ 这三个键从前是 `or` 链手写的，而**每一条都可能命中不同版本**：
+        #   2.0 是 `oracle.basic.password_expiry`、1.4 是中文标题文件；键写错时 `or` 链
+        #   静默落到下一条、最后返回 `[]`，与"查了没有"不可分。改走 `table_fetch` 后
+        #   命中哪个键、键的真实状态是什么都是可查的（批 19 的 B 项）。
+        fetch = ctx.table_fetch(
+            "用户密码过期预警（账户非OPEN或30天内到期）", "oracle.basic.password_expiry",
+            "password_expiry",
+        )
+        rows = fetch.rows
         self._evaluate(
-            rule, True, True, len(rows) > 0,
-            f"{len(rows)} 个账户需关注" if rows else "正常",
-            [f"count={len(rows)}"],
+            rule, True, fetch.available, len(rows) > 0,
+            (f"{len(rows)} 个账户需关注" if rows else "正常") if fetch.available
+            else _missing_reason("账户密码过期预警", fetch_state(fetch)),
+            [f"count={len(rows)}"] if fetch.available else [],
+            fetch_state(fetch),
         )
 
     # ── 扩展规则（利用已采集但未使用的 TSV 表） ──
 
     def _check_redo_member(self, ctx: PackageContext) -> None:
         rule = "ORA.CONFIG.REDO_MEMBER"
-        rows = ctx.tables.get("Redo 日志多路复用检查", [])
+        fetch = ctx.table_fetch("Redo 日志多路复用检查", "oracle.validation.redo_multiplex")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无 redo log 多路复用数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("Redo 日志多路复用检查", state), [], state)
             return
         min_members = self._threshold(rule, "redo_member_min", 2)
         below_min = 0
@@ -522,40 +630,49 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"{below_min} 个日志组成员数少于 {min_members}" if triggered else f"所有日志组成员数均不少于 {min_members}",
             [f"groups_below_min_members={below_min}"],
+            state,
         )
 
     def _check_redo_size(self, ctx: PackageContext) -> None:
         rule = "ORA.CONFIG.REDO_SIZE"
-        rows = ctx.tables.get("Redo 日志组信息", [])
+        fetch = ctx.table_fetch("Redo 日志组信息", "oracle.basic.redo_groups")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无 redo log 数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("Redo 日志组信息", state), [], state)
             return
         sizes = [safe_float(r.get("SIZE_MB")) for r in rows if safe_float(r.get("SIZE_MB")) is not None]
         if not sizes:
-            self._evaluate(rule, True, False, False, "无法解析 redo 尺寸", [])
+            self._evaluate(rule, True, False, False, "无法解析 redo 尺寸", [], state)
             return
         min_size = min(sizes)
         t = self._threshold(rule, "redo_size_mb_min", 500)
         triggered = min_size < t
         facts = [f"min_redo_size={min_size:.0f}MB, groups={len(sizes)}"]
-        switch_rows = ctx.tables.get("重做日志切换频率（近24小时）", [])
-        if switch_rows:
-            for row in switch_rows:
-                switches = safe_float(row.get("SWITCHES_PER_HOUR"))
-                if switches is not None and switches > self._threshold(rule, "redo_switch_per_hour_warning", 4):
-                    facts.append(f"switches_per_hour={switches:.1f}")
-                    triggered = True
+        switch_fetch = ctx.table_fetch("重做日志切换频率（近24小时）", "oracle.archive.log_switch_rate")
+        for row in switch_fetch.rows:
+            switches = safe_float(row.get("SWITCHES_PER_HOUR"))
+            if switches is not None and switches > self._threshold(rule, "redo_switch_per_hour_warning", 4):
+                facts.append(f"switches_per_hour={switches:.1f}")
+                triggered = True
         self._evaluate(
             rule, True, True, triggered,
             f"最小 redo {min_size:.0f}MB" + ("，切换频率偏高" if triggered else ""),
             facts,
+            # 数据来源是**两张表**：主判据看日志组尺寸，切换频率是加分项 ⇒ 状态取二者中
+            # 「有内容」的那个（有尺寸就说有数据；只有切换频率有内容也不说没采到）。
+            prefer_state(state, fetch_state(switch_fetch)),
         )
 
     def _check_library_cache(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
         rule = "ORA.PERFORMANCE.LIBRARY_CACHE"
-        rows = ctx.tables.get("Library Cache 命中率", [])
+        fetch = ctx.table_fetch("Library Cache 命中率", "oracle.performance.library_cache_hit")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无 Library Cache 数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("Library Cache 命中率", state), [], state)
             return
         sql_hit = None
         for row in rows:
@@ -563,7 +680,7 @@ class OracleRuleEngine:
                 sql_hit = safe_float(row.get("GETHIT_PCT"))
                 break
         if sql_hit is None:
-            self._evaluate(rule, True, False, False, "无法定位 SQL AREA 命中率", [])
+            self._evaluate(rule, True, False, False, "无法定位 SQL AREA 命中率", [], state)
             return
         t = self._threshold(rule, "library_cache_hit_warning", 95)
         t_crit = self._threshold(rule, "library_cache_hit_critical", 90)
@@ -573,14 +690,18 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"SQL AREA GETHIT_PCT={sql_hit:.1f}%，低于{'严重' if promote else '告警'}阈值" if triggered else f"SQL AREA GETHIT_PCT={sql_hit:.1f}%",
             [f"sql_area_gethit_pct={sql_hit:.1f}"],
+            state,
             severity_override=promote,
         )
 
     def _check_wait_events(self, ctx: PackageContext) -> None:
         rule = "ORA.PERFORMANCE.WAIT_EVENTS"
-        rows = ctx.tables.get("等待事件 TOP10（数据库级）", [])
+        fetch = ctx.table_fetch("等待事件 TOP10（数据库级）", "oracle.performance.wait_top10")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无等待事件数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("等待事件 TOP10（数据库级）", state), [], state)
             return
         total_wait = 0.0
         top_event = ""
@@ -596,13 +717,17 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"累计等待 {total_wait:.0f}s, TOP1: {top_event}" if triggered else f"累计等待 {total_wait:.0f}s，正常",
             [f"total_wait_seconds={total_wait:.1f}", f"top_event={top_event}"],
+            state,
         )
 
     def _check_autoextend(self, ctx: PackageContext) -> None:
         rule = "ORA.CONFIG.AUTOEXTEND"
-        rows = ctx.tables.get("数据文件自动扩展余量", [])
+        fetch = ctx.table_fetch("数据文件自动扩展余量", "oracle.validation.autoextend")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无数据文件自动扩展数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("数据文件自动扩展余量", state), [], state)
             return
         no_auto = 0
         for row in rows:
@@ -615,25 +740,34 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"{no_auto} 个数据文件未开启自动扩展" if triggered else "所有数据文件已开启自动扩展",
             [f"non_autoextend_files={no_auto}"],
+            state,
         )
 
     def _check_dba_count(self, ctx: PackageContext) -> None:
         rule = "ORA.SECURITY.DBA_COUNT"
-        rows = ctx.tables.get("特权用户 (DBA角色)", [])
+        fetch = ctx.table_fetch("特权用户 (DBA角色)", "oracle.audit.privileged_users")
+        rows = fetch.rows
         t = self._threshold(rule, "dba_user_count_warning", 5)
         count = len(rows)
         triggered = count > t
+        # 「DBA 用户 0 个」是**查过了的确定结论**（`empty` 算采集过）⇒ 照旧给 passed；
+        # 只有这一项**没采到**才落 not_evaluated。
         self._evaluate(
-            rule, True, True, triggered,
-            f"{count} 个 DBA 角色用户" + ("，超出建议范围" if triggered else ""),
-            [f"dba_user_count={count}"],
+            rule, True, fetch.available, triggered,
+            (f"{count} 个 DBA 角色用户" + ("，超出建议范围" if triggered else "")) if fetch.available
+            else _missing_reason("特权用户（DBA 角色）", fetch_state(fetch)),
+            [f"dba_user_count={count}"] if fetch.available else [],
+            fetch_state(fetch),
         )
 
     def _check_account_locked(self, ctx: PackageContext) -> None:
         rule = "ORA.SECURITY.ACCOUNT_LOCKED"
-        rows = ctx.tables.get("用户列表", [])
+        fetch = ctx.table_fetch("用户列表", "oracle.basic.users")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无用户列表数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("用户列表", state), [], state)
             return
         locked = [r for r in rows if "LOCKED" in str(r.get("ACCOUNT_STATUS", "")).upper()]
         count = len(locked)
@@ -643,13 +777,17 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"{count} 个锁定账户" + ("，建议清理" if triggered else ""),
             [f"locked_accounts={count}"],
+            state,
         )
 
     def _check_sql_execution(self, ctx: PackageContext) -> None:
         rule = "ORA.PERFORMANCE.SQL_EXECUTION"
-        rows = ctx.tables.get("Top 20 SQL (按执行时间)", [])
+        fetch = ctx.table_fetch("Top 20 SQL (按执行时间)", "oracle.topsql.elapsed_time")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无 Top SQL 数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("Top SQL（按执行时间）", state), [], state)
             return
         max_elapsed = 0.0
         max_sql = ""
@@ -665,34 +803,47 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"最大单 SQL 执行 {max_elapsed:.1f}min, SQL_ID={max_sql}" if triggered else f"SQL 执行时间正常（最大 {max_elapsed:.1f}min）",
             [f"max_elapsed_min={max_elapsed:.1f}", f"sql_id={max_sql}"],
+            state,
         )
 
     def _check_index_unusable(self, ctx: PackageContext) -> None:
         rule = "ORA.DATA.INDEX_UNUSABLE"
-        rows = ctx.tables.get("无效_不可用索引", [])
+        fetch = ctx.table_fetch("无效_不可用索引", "oracle.index.invalid")
+        rows = fetch.rows
+        usable = fetch.available
         self._evaluate(
-            rule, True, True, len(rows) > 0,
-            f"发现 {len(rows)} 个不可用索引" if rows else "索引状态正常",
-            [f"unusable_count={len(rows)}"],
+            rule, True, usable, len(rows) > 0,
+            (f"发现 {len(rows)} 个不可用索引" if rows else "索引状态正常") if usable
+            else _missing_reason("无效/不可用索引", fetch_state(fetch)),
+            [f"unusable_count={len(rows)}"] if usable else [],
+            fetch_state(fetch),
         )
 
     def _check_missing_stats(self, ctx: PackageContext) -> None:
         rule = "ORA.DATA.MISSING_STATS"
-        rows = ctx.tables.get("缺失统计信息表 (TOP20)", [])
+        fetch = ctx.table_fetch("缺失统计信息表 (TOP20)", "oracle.awr.missing_stats")
+        rows = fetch.rows
         count = len(rows)
         t = self._threshold(rule, "missing_stats_table_count_warning", 10)
         triggered = count > t
+        usable = fetch.available
         self._evaluate(
-            rule, True, True, triggered,
-            f"{count} 个表缺失统计信息" if triggered else ("统计信息正常" if not rows else f"{count} 个表缺失统计信息，未超阈值"),
-            [f"missing_stats_count={count}"],
+            rule, True, usable, triggered,
+            (f"{count} 个表缺失统计信息" if triggered
+             else ("统计信息正常" if not rows else f"{count} 个表缺失统计信息，未超阈值")) if usable
+            else _missing_reason("缺失统计信息表（TOP20）", fetch_state(fetch)),
+            [f"missing_stats_count={count}"] if usable else [],
+            fetch_state(fetch),
         )
 
     def _check_io_hotfile(self, ctx: PackageContext) -> None:
         rule = "ORA.PERFORMANCE.IO_HOTFILE"
-        rows = ctx.tables.get("IO 消耗最高数据文件 TOP10", [])
+        fetch = ctx.table_fetch("IO 消耗最高数据文件 TOP10", "oracle.performance.io_files")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无 IO 数据文件数据", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("IO 消耗最高数据文件 TOP10", state), [], state)
             return
         total_io = 0.0
         max_io = 0.0
@@ -701,7 +852,7 @@ class OracleRuleEngine:
             total_io += io_val
             max_io = max(max_io, io_val)
         if total_io == 0:
-            self._evaluate(rule, True, True, False, "IO 活动极低", [])
+            self._evaluate(rule, True, True, False, "IO 活动极低", [], state)
             return
         pct = (max_io / total_io * 100) if total_io > 0 else 0
         t = self._threshold(rule, "single_file_io_pct_warning", 30)
@@ -710,6 +861,7 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"TOP1 数据文件 IO 占比 {pct:.1f}%" + ("，存在热点" if triggered else "，分布正常"),
             [f"max_file_io_pct={pct:.1f}"],
+            state,
         )
 
     # ── 批 11：DataGuard / 对象治理 / 口令 Profile / 大页 ──
@@ -717,12 +869,14 @@ class OracleRuleEngine:
     # 背景：这些域的采集项在包内一直有数据，但规则侧**一条判据都没有**（见
     # `_work/oracle-analysis-gap-review.md` §3）。补充时守两条既有口径：
     #   * 「未采集 ≠ 0」—— 表为空一律落 not_evaluated，不当成"没问题"；
-    #   * 表键同时给 2.0 的 `item_id` 与 1.4 的中文标题，`find_table` 两套包都命中。
+    #   * 表键同时给 2.0 的 `item_id` 与 1.4 的中文标题；批 19 起取数走 `table_fetch`
+    #     （**精确键**，不再走 `find_table` 的子串兜底 —— 那套兜底在 FRA 上命中了错的表）。
 
     def _check_dg_transport(self, ctx: PackageContext) -> None:
         """归档 / DG 传输目的地报错（v$archive_dest，主库也适用）。"""
         rule = "ORA.DG.TRANSPORT_ERROR"
-        rows = ctx.find_table("oracle.dg.archive_dest", "日志传输服务状态")
+        fetch = ctx.table_fetch("oracle.dg.archive_dest", "日志传输服务状态 (v$archive_dest)")
+        rows = fetch.rows
         broken = [
             row for row in rows
             if str(row.get("ERROR", "")).strip().upper() not in {"", "-", "0", "NULL", "NONE"}
@@ -734,8 +888,10 @@ class OracleRuleEngine:
         self._evaluate(
             rule, True, bool(rows), bool(broken),
             f"{len(broken)} 个归档目的地报错" if broken
-            else (f"{len(rows)} 个归档目的地状态正常" if rows else "未采集到归档目的地"),
+            else (f"{len(rows)} 个归档目的地状态正常" if rows
+                  else _missing_reason("归档目的地（V$ARCHIVE_DEST）", fetch_state(fetch))),
             facts,
+            fetch_state(fetch),
         )
 
     def _check_dg_lag(self, ctx: PackageContext, metrics: dict[str, Any]) -> None:
@@ -744,9 +900,14 @@ class OracleRuleEngine:
         单实例（无备库）时该视图为空 —— 落 not_evaluated，不当作"延迟正常"。
         """
         rule = "ORA.DG.APPLY_LAG"
-        rows = ctx.find_table("oracle.dg.protection_mode", "保护模式与主库统计")
+        fetch = ctx.table_fetch("oracle.dg.protection_mode", "保护模式与主库统计")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无备库统计（未配置 DataGuard）", [])
+            self._evaluate(rule, True, False, False,
+                           "无备库统计（未配置 DataGuard）" if state_is_collected(state)
+                           else _missing_reason("保护模式与主库统计", state),
+                           [], state)
             return
         lags: dict[str, float] = {}
         for row in rows:
@@ -755,7 +916,7 @@ class OracleRuleEngine:
             if name and seconds is not None:
                 lags[name] = seconds
         if not lags:
-            self._evaluate(rule, True, False, False, "统计中无可用延迟值", [])
+            self._evaluate(rule, True, False, False, "统计中无可用延迟值", [], state)
             return
         worst_key = max(lags, key=lambda key: lags[key])
         worst = lags[worst_key]
@@ -765,19 +926,25 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"最大延迟 {worst_key}={worst:.0f}s" + ("，超过阈值" if triggered else "，正常"),
             [f"{key}={value:.0f}s" for key, value in sorted(lags.items())],
+            state,
         )
 
     def _check_dg_log_gap(self, ctx: PackageContext) -> None:
         """主备库归档日志序差距（备库落后主库多少个归档）。"""
         rule = "ORA.DG.LOG_GAP"
-        rows = ctx.find_table("oracle.dg.log_sequence_gap", "主备库日志序差距")
+        fetch = ctx.table_fetch("oracle.dg.log_sequence_gap", "主备库日志序差距")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "无备库（未配置 DataGuard）", [])
+            self._evaluate(rule, True, False, False,
+                           "无备库（未配置 DataGuard）" if state_is_collected(state)
+                           else _missing_reason("主备库日志序差距", state),
+                           [], state)
             return
         gaps = [safe_int(row.get("GAP") or row.get("gap")) for row in rows]
         gaps = [gap for gap in gaps if gap is not None]
         if not gaps:
-            self._evaluate(rule, True, False, False, "无法解析日志序差距", [])
+            self._evaluate(rule, True, False, False, "无法解析日志序差距", [], state)
             return
         worst = max(gaps)
         threshold = self._threshold(rule, "dg_log_gap_warning", 5)
@@ -786,12 +953,14 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"最大日志序差距 {worst}" + ("，备库落后" if triggered else "，正常"),
             [f"max_gap={worst}", f"threads={len(gaps)}"],
+            state,
         )
 
     def _check_dg_events(self, ctx: PackageContext) -> None:
         """近 24 小时 DataGuard 事件里是否有非零错误码。"""
         rule = "ORA.DG.EVENT_ERROR"
-        rows = ctx.find_table("oracle.dg.recent_events", "最近 DG 事件")
+        fetch = ctx.table_fetch("oracle.dg.recent_events", "最近 DG 事件 (v$dataguard_status)")
+        rows = fetch.rows
         broken = [
             row for row in rows
             if safe_int(row.get("ERROR_CODE") or row.get("error_code")) not in (None, 0)
@@ -803,16 +972,21 @@ class OracleRuleEngine:
         self._evaluate(
             rule, True, bool(rows), bool(broken),
             f"近 24h {len(broken)} 条 DG 错误事件" if broken
-            else (f"近 24h {len(rows)} 条 DG 事件均无错误" if rows else "近 24h 无 DG 事件记录"),
+            else (f"近 24h {len(rows)} 条 DG 事件均无错误" if rows
+                  else _missing_reason("最近 DataGuard 事件", fetch_state(fetch))),
             facts,
+            fetch_state(fetch),
         )
 
     def _check_segment_bloat(self, ctx: PackageContext) -> None:
         """段空间膨胀：实际占用 - 按统计信息估算的应有大小。"""
         rule = "ORA.SCHEMA.SEGMENT_BLOAT"
-        rows = ctx.find_table("oracle.awr.segment_bloat", "数据膨胀预估")
+        fetch = ctx.table_fetch("oracle.awr.segment_bloat", "数据膨胀预估 (DBA_SEGMENTS vs DBA_TABLES)")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "未采集到段膨胀数据（需统计信息）", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("段膨胀预估（需统计信息）", state), [], state)
             return
         threshold = self._threshold(rule, "segment_bloat_mb_warning", 1024)
         worst, worst_name = 0.0, ""
@@ -826,15 +1000,23 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"最大可回收空间 {worst:.1f}MB（{worst_name}）" + ("，超过阈值" if triggered else ""),
             [f"max_bloat_mb={worst:.2f}", f"candidates={len(rows)}"],
+            state,
         )
 
     def _check_large_segment(self, ctx: PackageContext) -> None:
         """超大表 / 索引段（表的 SIZE_GB 与索引的 SIZE_MB 统一折成 GB 比较）。"""
         rule = "ORA.CAPACITY.LARGE_SEGMENT"
-        table_rows = ctx.find_table("oracle.basic.large_segments", "大表段")
-        index_rows = ctx.find_table("oracle.index.large_segments", "大索引段")
+        table_fetch_ = ctx.table_fetch("oracle.basic.large_segments", "大表段 TOP20（按大小排序）")
+        index_fetch = ctx.table_fetch("oracle.index.large_segments", "大索引段 TOP20")
+        table_rows = table_fetch_.rows
+        index_rows = index_fetch.rows
         if not table_rows and not index_rows:
-            self._evaluate(rule, True, False, False, "未采集到大段数据", [])
+            self._evaluate(
+                rule, True, False, False,
+                _missing_reason("大段数据（大表段 / 大索引段）",
+                                prefer_state(fetch_state(table_fetch_), fetch_state(index_fetch))),
+                [], prefer_state(fetch_state(table_fetch_), fetch_state(index_fetch)),
+            )
             return
         worst_gb, worst = 0.0, ""
         for row in table_rows:
@@ -853,14 +1035,18 @@ class OracleRuleEngine:
             rule, True, True, triggered,
             f"最大段 {worst_gb:.2f}GB（{worst}）" + ("，超过阈值" if triggered else ""),
             [f"max_segment_gb={worst_gb:.3f}"],
+            prefer_state(fetch_state(table_fetch_), fetch_state(index_fetch)),
         )
 
     def _check_password_profile(self, ctx: PackageContext) -> None:
         """口令 Profile 弱策略：无复杂度校验 / 口令永不过期 / 失败次数不受限。"""
         rule = "ORA.SECURITY.PASSWORD_PROFILE"
-        rows = ctx.find_table("oracle.audit.profile_params", "密码配置文件参数")
+        fetch = ctx.table_fetch("oracle.audit.profile_params", "密码配置文件参数")
+        state = fetch_state(fetch)
+        rows = fetch.rows
         if not rows:
-            self._evaluate(rule, True, False, False, "未采集到 Profile 参数", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("Profile 参数", state), [], state)
             return
         weak: list[str] = []
         for row in rows:
@@ -877,6 +1063,7 @@ class OracleRuleEngine:
             rule, True, True, bool(weak),
             f"{len(weak)} 项口令策略偏弱" if weak else "口令 Profile 策略正常",
             weak[:6],
+            state,
         )
 
     def _check_hugepages(self, ctx: PackageContext) -> None:
@@ -886,10 +1073,11 @@ class OracleRuleEngine:
         （Total>0 但 Free 占比高）说明实例没有真正用上静态大页，同样要报。
         """
         rule = "ORA.SYSTEM.HUGEPAGES"
-        states = _hugepage_states(ctx)
+        states, state = _hugepage_states(ctx)
         enabled = states.get("enabled", "")
         if not enabled:
-            self._evaluate(rule, True, False, False, "未采集到透明大页状态", [])
+            self._evaluate(rule, True, False, False,
+                           _missing_reason("透明大页 / HugePages 状态", state), [], state)
             return
         total = safe_int(states.get("total")) or 0
         free = safe_int(states.get("free")) or 0
@@ -911,6 +1099,7 @@ class OracleRuleEngine:
             rule, True, True, bool(reasons),
             "；".join(reasons) if reasons else "透明大页已关闭",
             facts,
+            state,
         )
 
 
@@ -939,15 +1128,41 @@ def _parse_interval_seconds(value: Any) -> float | None:
         return None
 
 
-def _hugepage_states(ctx: PackageContext) -> dict[str, str]:
-    """还原 THP / HugePages 状态（`tables/hugepages.tsv`，真 TAB 表，列 `path`/`value`）。
+def _fra_percent(row: dict[str, Any]) -> float | None:
+    """一行 FRA 使用率 → 百分数。
+
+    ★ 两个落点的**列不一样**（同一份事实、两条 SQL，都出自 `V$RECOVERY_FILE_DEST`）：
+        `oracle.flashback.area_usage` → `PCT_USED`（SQL 里已算好）
+        `oracle.archive.fra_asm`      → 只有 `USED_GB` / `LIMIT_GB`（要自己算）
+      从前按 `PERCENT_SPACE_USED`（那是 `V$FLASH_RECOVERY_AREA_USAGE` 的列名，
+      **这两条 SQL 都不产出**）取值 ⇒ 哪怕表里有数据也算不出使用率。
+      另：判空一律 `is not None`，`or` 链会把**真的 0.0%**（FRA 还空着）吞成「无数据」。
+    """
+    for key in ("PCT_USED", "PERCENT_SPACE_USED", "PCT"):
+        value = safe_float(row.get(key))
+        if value is not None:
+            return value
+    used = safe_float(row.get("USED_GB"))
+    limit = safe_float(row.get("LIMIT_GB"))
+    if used is not None and limit:
+        return used / limit * 100
+    return None
+
+
+def _hugepage_states(ctx: PackageContext) -> tuple[dict[str, str], str]:
+    """还原 THP / HugePages 状态 → `(状态字典, 采集侧状态)`。
 
     `value` 形如 ``[never]`` / ``always madvise [never]`` —— 方括号里的是当前生效值。
     `/proc/meminfo:` 前缀的几行是批 2 新增的**实测值**，只有 Total 与 Free 对照才
     算得出"配了但没被用掉"。
+
+    ★ 返回采集状态的理由：这张表**只有 2.0 采**（1.4 采集器不采 OS 层）⇒ 1.4 包上
+      "读不到"与"查了没有"必须能分开，否则报告会把"这台机器没采操作系统层"写成
+      "透明大页状态正常"（批 19）。
     """
+    fetch = ctx.table_fetch("hugepages", "system.hugepages")
     states: dict[str, str] = {}
-    for row in ctx.tables.get("hugepages", []) or []:
+    for row in fetch.rows:
         path = str(row.get("path") or "").strip()
         raw = str(row.get("value") or "").strip()
         if not path:
@@ -971,4 +1186,4 @@ def _hugepage_states(ctx: PackageContext) -> dict[str, str]:
         if not active:
             active = raw.split()[0] if raw.split() else ""
         states["enabled" if path.endswith("/enabled") else "defrag"] = active
-    return states
+    return states, fetch_state(fetch)

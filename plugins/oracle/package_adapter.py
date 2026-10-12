@@ -11,7 +11,7 @@ import json
 import re
 import shutil
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -58,15 +58,197 @@ _EVIDENCE_TABLES: dict[str, tuple[str, str]] = {
     "system.filesystems": ("filesystems.txt", "df_pt"),
 }
 
+# `tables/` 里"采集侧声明的状态"，两种形态（interface §6.3）：
+#   2.0 `.psv` 占位行 —— `# oracle-inspection psv-empty … status=empty`
+#                       `# oracle-inspection psv-unavailable … status=timeout`
+#   1.4 `.tsv` 占位行 —— `# no rows returned`
+_PSV_PLACEHOLDER = re.compile(
+    r"^#\s*oracle-inspection\s+psv-(?:empty|unavailable)\b.*?\bstatus=(\S+)"
+)
+_LEGACY_EMPTY_MARK = "# no rows returned"
+
+# 「这项**采集过**吗」的判据用的状态集合。
+# ★ 与「有没有数据」是两件事：`empty`（查了、确认没有）**算采集过**，
+#   在 `_NO_DATA_STATES` 里的才是「没采到」——两者的报告结论相反，
+#   绝不能落成同一句话（「未采集 ≢ 0」，批 14 立的规矩）。
+_EMPTY_STATE = "empty"
+_DATA_STATES = frozenset({"ok", _EMPTY_STATE, "partial"})
+_NO_DATA_STATES = frozenset({
+    "unavailable", "permission_denied", "timeout", "error",
+    "not_enabled", "skipped", "unsupported", "missing",
+})
+
+# `item_titles.json` 里的标题 vs 1.4 文件名，实测有三种漂移（都是同一个 JSON 里的既有事实）：
+#   · `UNDO 使用统计 (v\$undostat)`（标题多一个反斜杠）↔ `…(v$undostat)`（文件名）
+#   · `无效/不可用索引`（标题）↔ `无效_不可用索引`（文件名）
+#   · `禁用/失效约束（非SYS用户）` ↔ `禁用_失效约束（非SYS用户）`
+# 不做归一时 6/98 张 1.4 表拿不到 item_id。**归一化的是分隔符与多余转义，不是语义。**
+_NAME_BACKSLASH = chr(92)
+
+
+def name_variants(name: str) -> set[str]:
+    """标题/文件名的等价写法集合（含原名）。"""
+    base = {name, name.replace(_NAME_BACKSLASH, "")}
+    return {variant for variant in base | {item.replace("_", "/") for item in base} if variant}
+
+
+@lru_cache(maxsize=1)
+def load_item_ids_by_title() -> dict[str, str]:
+    """`1.4 标题（含等价写法） → 2.0 item_id`。
+
+    ★ 为什么需要它：1.4 的 `tables/<中文标题>.tsv` 只登记了文件名本身，而
+    `metrics.py` / `oracle_rules.py` 里的取数点写的是 **2.0 的 item_id**
+    （`oracle.session.long_transactions` 等）。`ctx.tables.get(名字, [])` 在键不存在时
+    也返回 `[]`，于是"取不到"和"查了 0 行"不可区分 —— **故障完全静默**。
+    批 19 的注入实验实测：无效对象 / 长事务 / 锁等待 / 最近备份 四条规则在 1.4 包上
+    与数据无关（3 条恒"通过"漏报、1 条恒"触发"误报）。
+
+    单一来源 = 同一个 `item_titles.json`（它本身就是 `item_id → 1.4 标题` 的声明）。
+    **标题重复的条目一律不登记**（宁可少一个别名，不可指向错的表）。
+    """
+    by_title: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for item_id, title in load_item_titles().items():
+        for variant in name_variants(title):
+            if variant in by_title and by_title[variant] != item_id:
+                ambiguous.add(variant)
+                continue
+            by_title[variant] = item_id
+    for variant in ambiguous:
+        by_title.pop(variant, None)
+    return by_title
+
+
+@lru_cache(maxsize=1)
+def known_table_keys() -> frozenset[str]:
+    """`tables/` 里**可能被登记**的键（不含运行期才知道的 OS 层文件名）。
+
+    ★ 为什么要有它：取数点写错名字在运行期**完全静默** —— `ctx.tables.get(名字, [])`
+    返回 `[]`，`ctx.table_fetch(...)` 返回未命中的 `TableFetch`，两者都不会报错。
+    唯一能提前发现的手段是静态对账，而对账需要一份"合法键"的词表。把词表的计算放在
+    **注册逻辑所在的这个文件**里：别名策略改一次，审计工具（`tools/check_oracle_lookup_keys.py`）
+    与它的单测就跟着变，不会各算各的一套。
+
+    收录范围 = 2.0 `item_id` ∪ 1.4 标题（含等价写法）∪ `LEGACY_ALIASES` ∪ 各 `item_id` 的尾段别名。
+    ⚠ 这是**下界**：尾段别名是否真的登记还要看它在具体包里是否唯一（见 `_load_tables`
+    的 `short_counts`），包相关的部分由审计工具在真实包上跑一遍来看。
+    """
+    titles = load_item_titles()
+    keys: set[str] = set(titles)
+    keys.update(load_item_ids_by_title())
+    keys.update(LEGACY_ALIASES)
+    for item_id in titles:
+        keys.update(_short_aliases(item_id))
+    return frozenset(key for key in keys if key)
+
+
+def _declared_status(path: Path) -> str:
+    """读文件首个非空行拿「采集侧声明的状态」；不是占位形态返回空串。
+
+    ★ 这两个占位形态此前被 `parse_delimited` 当注释丢掉 ⇒ 「查了没有」与
+    「没采到」在适配器里就已经混成一样了，下游再怎么判都救不回来。
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if not stripped.startswith("#"):
+                    return ""
+                match = _PSV_PLACEHOLDER.match(stripped)
+                if match:
+                    return match.group(1)
+                if stripped.startswith(_LEGACY_EMPTY_MARK):
+                    return _EMPTY_STATE
+                continue
+    except OSError:
+        return ""
+    return ""
+
 
 class OraclePackageError(RuntimeError):
     """Oracle 采集包无法安全读取。"""
+
+
+@dataclass(frozen=True)
+class TableFetch:
+    """一次取数的结果：**行** + **这项到底采没采**。
+
+    `rows` 单独看是不安全的 —— `ctx.tables.get(名字, [])` 在"名字不对"和"查了 0 行"
+    两种情况下都返回 `[]`。`matched` / `state` 就是用来把这两件事分开的。
+    """
+
+    rows: list[dict[str, str]] = field(default_factory=list)
+    matched: str = ""
+    state: str = ""
+
+    @property
+    def resolved(self) -> bool:
+        """取数键命中了吗（包里存在这一项）。"""
+        return bool(self.matched)
+
+    @property
+    def available(self) -> bool:
+        """这项**采集过**吗。
+
+        判据两条缺一不可：① 键命中（别名对得上）；② 采集侧声明的状态不是"没采到"
+        （`empty` = 查了、确认 0 行，**算采集过**）。任一不满足 ⇒ `not_evaluated`，
+        报告写「证据不足」，**不许写「检查通过」**。
+        """
+        return self.resolved and self.state not in _NO_DATA_STATES
+
+    @property
+    def counted(self) -> int:
+        return len(self.rows)
+
+
+def fetch_state(fetch: TableFetch) -> str:
+    """一次取数 → **采集侧状态**（写进分析产物的那个字符串）。
+
+    `resolved=False` 说明这个键在包里不存在（别名对不上，或这一项本来就没采）⇒ `unavailable`。
+    ★ 取数**没命中**与「查了、确认 0 行」(`empty`) 是**相反结论**，这里必须先分开，
+      下游才可能把它们写成两句话（批 14 立的「未采集 ≠ 0」在这里才第一次真正可判）。
+    """
+    if not fetch.resolved:
+        return "unavailable"
+    return fetch.state or "ok"
+
+
+def state_is_collected(state: str) -> bool:
+    """「采集侧状态」→ **这项采集过吗**。
+
+    `empty`（查了、确认 0 行）**算采集过**；`unavailable` / `timeout` / `permission_denied` 不算。
+    ★ 缺状态（`""`）一律按**没采到**处理 —— 宁可写「证据不足」，不可写「检查通过」。
+      这与 `TableFetch.available` 是同一个判据，规则层与适配器层因此不会各判一套。
+    """
+    return state in _DATA_STATES
+
+
+def prefer_state(*states: str) -> str:
+    """多个来源 → 一个采集状态。优先级：**有内容 > 查了没有 > 没采到**。
+
+    用于「同一份事实有两个落点」的取数点（FRA 的 `V$FLASH_RECOVERY_AREA_USAGE` 与
+    ASM 版 `V$RECOVERY_AREA_USAGE` 各是一张表）。只要有一张真的查到了内容，就不说没采到。
+    """
+    known = [state for state in states if state]
+    if not known:
+        return ""
+    for state in known:
+        if state in _DATA_STATES and state != _EMPTY_STATE:
+            return state
+    for state in known:
+        if state in _DATA_STATES:
+            return state
+    return known[0]
 
 
 @dataclass
 class OraclePackageContext(BasePackageContext):
     # 本包按哪套 `tables/` 语义解析（"1" = 1.4，"2" = 2.0）；空串 = 未知，按 2.0 处理
     collector_major: str = ""
+    # 每个注册名（item_id / 标题 / 尾段 / legacy 别名）→ 采集侧声明的真实状态
+    table_state: dict[str, str] = field(default_factory=dict)
 
     @property
     def instance_id(self) -> str:
@@ -82,6 +264,19 @@ class OraclePackageContext(BasePackageContext):
                 if (name in key or lowered in key.lower()) and self.tables[key]:
                     return self.tables[key]
         return []
+
+    def table_fetch(self, *names: str) -> TableFetch:
+        """按别名顺序取数，返回 `TableFetch`（行 + 状态 + 命中名）。
+
+        ★ **不走 `find_table` 的子串兜底** —— 那是"取不到就找一个名字像的"，
+        实测会把 FRA 使用率的取数点兜到 `快速恢复区（FRA）参数` 上（那张表只有
+        NAME/VALUE，没有 `PERCENT_SPACE_USED`）⇒ 命中了**错的表**，指标恒为 None。
+        要兜底就在调用点把名字列全，让"名字"这件事保持可审计。
+        """
+        for name in names:
+            if name in self.tables:
+                return TableFetch(self.tables[name], name, self.table_state.get(name, ""))
+        return TableFetch()
 
 
 def parse_instance_tag(tag: str) -> tuple[str, str]:
@@ -387,29 +582,41 @@ class OraclePackageAdapter:
         （2.0 的 `tables/kernel_parameters.tsv` 对应的 `item_id` 是 `system.sysctl_selected`，文件名与 id 不同名）。
         """
         titles = load_item_titles()
+        by_title = load_item_ids_by_title()
         file_to_item: dict[str, str] = {}
+        declared: dict[str, str] = {}
         for item in ctx.status.get("items", []) or []:
             output = str(item.get("output_file") or "")
             item_id = str(item.get("item_id") or "")
+            if item_id:
+                declared[item_id] = str(item.get("status") or "")
             if item_id and output.startswith("tables/"):
                 file_to_item[output[len("tables/"):]] = item_id
 
-        entries: list[tuple[Path, str, bool, str, str]] = []
+        entries: list[tuple[Path, str, bool, str, str, str]] = []
         tables_dir = root / "tables"
         if tables_dir.is_dir():
             for path, delimiter, repair_wrap in _iter_table_specs(tables_dir, major):
                 item_id = file_to_item.get(path.name) or path.stem
-                entries.append((path, delimiter, repair_wrap, path.stem, item_id))
+                if major == LEGACY_COLLECTOR_MAJOR and item_id == path.stem:
+                    # 1.4：`status/*.tsv` 是模块级的，反查不到逐项 item_id，
+                    # 于是 `item_id` 一直是中文文件名本身 ⇒ **按 2.0 item_id 写的取数点
+                    # 在 1.4 包上全部落空且静默**。用 `item_titles.json` 的反向索引补出来。
+                    item_id = by_title.get(path.stem) or item_id
+                state = declared.get(item_id) or _declared_status(path)
+                if not state and major != LEGACY_COLLECTOR_MAJOR:
+                    state = "ok"
+                entries.append((path, delimiter, repair_wrap, path.stem, item_id, state))
 
         short_counts: Counter[str] = Counter()
-        for _, _, _, stem, item_id in entries:
+        for _, _, _, stem, item_id, _ in entries:
             short_counts.update(_short_aliases(stem, item_id))
 
-        primary: list[tuple[set[str], list[dict[str, str]]]] = []
-        aliases: list[tuple[set[str], list[dict[str, str]]]] = []
-        for path, delimiter, repair_wrap, stem, item_id in entries:
+        primary: list[tuple[set[str], list[dict[str, str]], str]] = []
+        aliases: list[tuple[set[str], list[dict[str, str]], str]] = []
+        for path, delimiter, repair_wrap, stem, item_id, state in entries:
             rows = parse_delimited(path, delimiter, repair_wrap=repair_wrap)
-            primary.append(({stem, item_id}, rows))
+            primary.append(({stem, item_id}, rows, state))
             extra: set[str] = set()
             title = titles.get(item_id)
             if title:
@@ -420,17 +627,19 @@ class OraclePackageAdapter:
             for legacy, target in LEGACY_ALIASES.items():
                 if target == item_id:
                     extra.add(legacy)
-            aliases.append((extra, rows))
+            aliases.append((extra, rows, state))
 
         # 主键先落，别名只补空缺（主键之间不会撞：文件名与 item_id 各自唯一）
-        for names, rows in primary:
+        for names, rows, state in primary:
             for name in names:
                 if name:
                     ctx.tables[name] = rows
-        for names, rows in aliases:
+                    ctx.table_state[name] = state
+        for names, rows, state in aliases:
             for name in names:
                 if name and name not in ctx.tables:
                     ctx.tables[name] = rows
+                    ctx.table_state[name] = state
 
         # `evidence/*.txt` 里那项"列对齐文本"（N-8 落点变更）—— 已声明的一项回填
         for item_id, (filename, kind) in _EVIDENCE_TABLES.items():
@@ -442,9 +651,11 @@ class OraclePackageAdapter:
             title = titles.get(item_id)
             if title:
                 names.add(title)
+            state = declared.get(item_id) or ("ok" if rows else "")
             for name in names:
                 if name:
                     ctx.tables[name] = rows
+                    ctx.table_state[name] = state
 
     @staticmethod
     def validate_manifest(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
