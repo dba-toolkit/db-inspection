@@ -14,17 +14,20 @@ from typing import Any
 from ..models import PackageContext
 from .history import display_timezone, gap_indices, parse_chart_time
 from .style import (
+    BACKGROUND,
+    COLOR_MAP,
     FALLBACK_LABEL_COLOUR,
     FALLBACK_NOTE_COLOUR,
     FALLBACK_PANEL_TITLE_COLOUR,
     FALLBACK_TICK_COLOUR,
     FALLBACK_TITLE_COLOUR,
     FLAT_PALETTE,
+    LIGHT_GRID,
     apply_style,
     has_matplotlib,
 )
 
-__all__ = ["duration_ms", "generate_os_charts", "render_spec", "spec_has_data"]
+__all__ = ["bar_spec_has_data", "duration_ms", "generate_os_charts", "render_bar_spec", "render_spec", "spec_has_data"]
 
 
 def duration_ms(start_ns: int) -> int:
@@ -304,3 +307,160 @@ def generate_os_charts(ctx: PackageContext, instance_tag: str, charts_dir: Path,
         )
         for spec in os_chart_specs(ctx, instance_tag)
     ]
+
+
+# ---------------------------------------------------------------------------
+# category-axis bar charts（Top-N 排行）
+#
+# 与上面的时间轴折线是**两种规格**：折线的 x 是时间戳、要求 ≥2 点；条形的 x
+# 是类别（表空间名 / SQL_ID），一个类别就该能画。把两者塞进同一 spec 结构会
+# 让 ``spec_has_data`` 的「≥2 点」判据对条形失效，故独立成入口，互不牵连。
+# ---------------------------------------------------------------------------
+def bar_spec_has_data(spec: dict[str, Any]) -> bool:
+    """A bar chart needs at least one category carrying a defined value."""
+    if not (spec.get("categories") or []):
+        return False
+    return any(value is not None for value in (spec.get("values") or []))
+
+
+def _bar_pairs(spec: dict[str, Any]) -> list[tuple[str, float]]:
+    """Zip categories with values, dropping pairs whose value is missing."""
+    pairs: list[tuple[str, float]] = []
+    for category, value in zip(spec.get("categories") or [], spec.get("values") or []):
+        if value is None:
+            continue
+        pairs.append((str(category), float(value)))
+    return pairs
+
+
+def _bar_color(value: float, spec: dict[str, Any]) -> str:
+    """Single-hue bars, turning red once a threshold is crossed (e.g. 表空间 ≥90%)."""
+    threshold = spec.get("alert_threshold")
+    if threshold is not None and value >= float(threshold):
+        return COLOR_MAP["red"]
+    return COLOR_MAP["blue"]
+
+
+def _short_number(value: float) -> str:
+    """Compact label: 1234 → 1.2k, 3_400_000 → 3.4M."""
+    magnitude = abs(float(value))
+    for limit, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if magnitude >= limit:
+            return f"{value / limit:.1f}{suffix}"
+    return f"{value:g}"
+
+
+def _render_bar_matplotlib(spec: dict[str, Any], charts_dir: Path,
+                           output: Path) -> dict[str, Any] | None:
+    if not has_matplotlib():
+        return None
+    start_ns = time.monotonic_ns()
+    import matplotlib.pyplot as plt
+
+    apply_style()
+    pairs = _bar_pairs(spec)
+    labels = [label for label, _ in pairs]
+    values = [value for _, value in pairs]
+    suffix = spec.get("value_suffix", "")
+    height = max(3.0, 0.42 * len(labels) + 1.8)
+    fig, axis = plt.subplots(figsize=(10, height))
+    positions = list(range(len(labels)))
+    axis.barh(positions, values, height=0.66,
+              color=[_bar_color(value, spec) for value in values])
+    axis.set_yticks(positions)
+    axis.set_yticklabels(labels)
+    axis.invert_yaxis()  # 最大值在顶部
+    axis.set_title(spec["title"], loc="center", fontsize=13)
+    if spec.get("xmax"):
+        axis.set_xlim(0, float(spec["xmax"]))
+    if spec.get("xlabel"):
+        axis.set_xlabel(spec["xlabel"])
+    for position, value in zip(positions, values):
+        axis.text(value, position, f" {_short_number(value)}{suffix}",
+                  va="center", fontsize=8.5)
+    fig.tight_layout()
+    path = charts_dir / spec["filename"]
+    fig.savefig(path)
+    plt.close(fig)
+    return {
+        "chart_id": spec["chart_id"], "title": spec["title"], "status": "generated",
+        "file": path.relative_to(output).as_posix(), "source_points": len(labels),
+        "source_scope": spec.get("source_scope", ""), "axis_mode": "category",
+        "renderer": "matplotlib", "duration_ms": duration_ms(start_ns),
+    }
+
+
+def _render_bar_pillow(spec: dict[str, Any], charts_dir: Path,
+                       output: Path) -> dict[str, Any] | None:
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+
+    start_ns = time.monotonic_ns()
+    pairs = _bar_pairs(spec)
+    labels = [label for label, _ in pairs]
+    values = [value for _, value in pairs]
+    suffix = spec.get("value_suffix", "")
+    width = 1400
+    left, right, top, bottom = 170, 70, 108, 74
+    row_height = 42
+    plot_height = max(1, len(labels)) * row_height
+    height = top + plot_height + bottom
+    image = Image.new("RGB", (width, height), BACKGROUND)
+    draw = ImageDraw.Draw(image)
+    font, small, title_font = _pillow_fonts()
+    draw.text((60, 24), spec["title"], fill=FALLBACK_TITLE_COLOUR, font=title_font)
+    data_max = max(values) if values else 1.0
+    xmax = float(spec.get("xmax") or max(data_max * 1.18, 1.0)) or 1.0
+    plot_width = width - left - right
+    for index in range(6):
+        x = left + plot_width * index / 5
+        draw.line((x, top, x, top + plot_height), fill=LIGHT_GRID, width=1)
+        draw.text((x - 22, top + plot_height + 10), _short_number(xmax * index / 5),
+                  fill=FALLBACK_TICK_COLOUR, font=small)
+    for index, (label, value) in enumerate(pairs):
+        y1 = top + index * row_height + 6
+        y2 = y1 + row_height - 12
+        bar_width = plot_width * (value / xmax)
+        draw.rounded_rectangle((left, y1, max(left + 2, left + bar_width), y2),
+                               radius=5, fill=_bar_color(value, spec))
+        rendered = label if len(label) <= 20 else label[:18] + "…"
+        draw.text((10, y1 + 4), rendered, fill=FALLBACK_PANEL_TITLE_COLOUR, font=small)
+        draw.text((min(left + bar_width + 8, width - right - 80), y1 + 4),
+                  f"{_short_number(value)}{suffix}",
+                  fill=FALLBACK_PANEL_TITLE_COLOUR, font=small)
+    path = charts_dir / spec["filename"]
+    image.save(path, "PNG")
+    return {
+        "chart_id": spec["chart_id"], "title": spec["title"], "status": "generated",
+        "file": path.relative_to(output).as_posix(), "source_points": len(labels),
+        "source_scope": spec.get("source_scope", ""), "axis_mode": "category",
+        "renderer": "pillow_fallback", "duration_ms": duration_ms(start_ns),
+    }
+
+
+def render_bar_spec(spec: dict[str, Any], charts_dir: Path, output: Path) -> dict[str, Any]:
+    """Render one category-axis bar spec, matplotlib first, Pillow as fallback.
+
+    Same contract as ``render_spec``: never a silent success — a data-less spec
+    yields a ``skipped`` record, and the record always names the renderer used.
+    """
+    if not bar_spec_has_data(spec):
+        return {
+            "chart_id": spec["chart_id"], "title": spec["title"], "status": "skipped",
+            "reason": "insufficient_data_points",
+            "source_scope": spec.get("source_scope", ""),
+        }
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    result = _render_bar_matplotlib(spec, charts_dir, output)
+    if result is not None:
+        return result
+    result = _render_bar_pillow(spec, charts_dir, output)
+    if result is not None:
+        return result
+    return {
+        "chart_id": spec["chart_id"], "title": spec["title"], "status": "skipped",
+        "reason": "no_renderer_available", "source_scope": spec.get("source_scope", ""),
+    }
+

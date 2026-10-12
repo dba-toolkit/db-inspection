@@ -8,7 +8,7 @@ What lives here:
 - ``style``   — palette, semantic series aliases, severity colours, rcParams
 - ``history`` — SAR/时间归一化、断点检测、序列抽取
 - ``specs``   — 四类 OS 图的纯数据规格（CPU/内存/磁盘/网络）
-- ``render``  — matplotlib 后端 + Pillow 降级后端
+- ``render``  — matplotlib 后端 + Pillow 降级后端（含类别轴条形图 ``render_bar_spec``）
 
 What does not live here: database-specific charts (QPS/TPS、会话、表空间……)
 still belong to ``plugins/<db>/charts.py``.
@@ -29,7 +29,14 @@ from .history import (
     series_values,
     summarize,
 )
-from .render import duration_ms, generate_os_charts, render_spec, spec_has_data
+from .render import (
+    bar_spec_has_data,
+    duration_ms,
+    generate_os_charts,
+    render_bar_spec,
+    render_spec,
+    spec_has_data,
+)
 from .specs import (
     HISTORY_SCOPE,
     REALTIME_SCOPE,
@@ -61,6 +68,7 @@ __all__ = [
     "HISTORY_SCOPE",
     "REALTIME_SCOPE",
     "apply_style",
+    "bar_spec_has_data",
     "busiest_history_device",
     "busy_percent",
     "chart_colors",
@@ -80,6 +88,7 @@ __all__ = [
     "os_network_spec",
     "parse_chart_time",
     "parse_time",
+    "render_bar_spec",
     "render_spec",
     "sar_cpu_summary_rows",
     "series_values",
