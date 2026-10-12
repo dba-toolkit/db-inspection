@@ -777,7 +777,11 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     oi_items: list[dict[str, Any]] = [
         # ── Data layer ──
         _item("关键初始化参数", "oracle.init_params", rows=[
-            {"参数": str(r.get("NAME","")).strip(), "值": str(r.get("VALUE","")).strip()[:80]}
+            # ★ 批 16：这里原写死 `[:80]`，把 control_files 的 86 字符值切成 `…/ZYDB/control`，
+            #   读起来像"第二个控制文件名叫 control" —— 与取数层 sqlplus 折行（a80）同源的误读。
+            #   值列**不截断**：SQL 采集侧已 `SUBSTR(value,1,400)` 收口，Word 单元格自行折行；
+            #   同一节的「块校验与丢失写保护参数」本就没有截断，此处属离群写法。
+            {"参数": str(r.get("NAME","")).strip(), "值": str(r.get("VALUE","")).strip()}
             for r in ctx.tables.get("关键初始化参数", [])[:40]
         ]),
         _item("Redo 日志组信息", "oracle.redo_logs", rows=display_redo),
@@ -1341,12 +1345,16 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                            analysis=_analysis("ORA.DATA.FILE_HEADER")))
 
     # Control file redundancy
-    ctrl_rows = ctx.tables.get("控制文件多路复用", [])
+    # ★ 批 16：这里原先读 `NAME` / `VALUE`，而 `oracle.validation.controlfile_multiplex.psv`
+    #   的列是 `CONTROLFILE_COUNT` / `CONTROLFILE_PATHS` ⇒ 两列全取空，11.8 整张表不渲染
+    #   （报告里只剩一行「原始记录：1 条」）。与批 15 的 P0-3 同源：**展示层的键名必须与
+    #   解析层的产出一致**；取值一律走 `_cell()`，别写死单一拼法。
+    ctrl_rows = ctx.tables.get("控制文件多路复用", []) or ctx.tables.get("controlfile_redundancy", [])
     display_ctrl: list[dict[str, Any]] = []
     for row in ctrl_rows[:10]:
         display_ctrl.append({
-            "参数": row.get("NAME", ""),
-            "值": row.get("VALUE", ""),
+            "控制文件数": _cell(row, "CONTROLFILE_COUNT", "COUNT"),
+            "路径": _cell(row, "CONTROLFILE_PATHS", "PATHS"),
         })
     br_items.append(_item("控制文件冗余", "ORA.CONTROL.REDUNDANCY",
                            rows=display_ctrl,
