@@ -2951,6 +2951,36 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
 - **业务结果不变**：健康分 23 / 规则 42（11/24/7）/ 风险 11 / 章节 9 / 检查项 76 / 图 10；
   10 张 PNG 与 `llm_input.json` **零差异**；新旧产物逐项 diff 后**只有本批这两处**。
   回归 **5 failed / 434 passed / 168 subtests**（5 个 FAIL 仍是 `tests/test_mysql_*` 源包不在仓库）。
-- **未做（待决策）**：① `说明` 列大面积为空（Oracle 30 行里 25 行；MySQL 填的是**口径**，非建议）；
+- **未做（待决策）**：① `说明` 列大面积为空（MySQL 填的是**口径**，非建议）—— ★ **已由批 18 做掉**（§22.65）；
   ② `主机信息` 这类**合成行**在源证据缺一半时仍被判「正常」。
 - 详见 `docs/oracle-collector-fix-plan.md`「批 17」章与 `docs/oracle-collector-interface.md` §11.19。
+
+### 22.65 Oracle 说明列补口径 —— 「空格子分不清没说明还是没数据」（Python 侧）
+
+**范围**：`plugins/oracle/presentation.py`（口径表 + 两处调用点）+ 测试 + 基线。**采集脚本一字未改。**
+把 §22.64「未做（待决策）①」做掉：`说明` 列整列为空。
+
+- **病情**：`数据库身份`（7 行）与 `数据库配置概要`（15 行）的说明列**整列为空**（1.4 / 2.0 两包实测
+  一致，22 行）。病根 = `_val_row(name, value, desc="")` 的第三参有默认值，而调用点**全部只传两个参数**。
+  空格子**不报错、不抛异常、测试不红** ⇒ 读者分不清「这项没有说明」与「这项没有数据」——
+  是批 17「未采集 ≠ `-`」的**第三种混淆**。
+- **口径**（与 MySQL `CONFIG_GROUP_VARIABLES` 同线）：写**释义**（这个值是什么、取自哪个视图），
+  **不写建议** —— 建议在摘要表「依据与建议」与每项「分析结论」两列，混用会让同一列有两种读法。
+- **单一来源**：新增 `ORACLE_IDENTITY_NOTES` / `ORACLE_DB_CONFIG_NOTES` / `ORACLE_SGA_NOTES`
+  （+ `ORACLE_SGA_NOTE_FALLBACK`）。收成表既集中可审、也**可被断言**（就地写死则"漏一行"只能靠肉眼）。
+  ★ `ORACLE_DB_CONFIG_NOTES` 同时是「概要表展示哪些 NLS 参数」的单一来源 —— 补说明**不得**
+  顺手把展示范围改掉（`NLS_TERRITORY` 仍不进表，守门用例钉死）。
+- **同批第三处（被「口径」逼出来的）**：`PGA 总分配` 取 `pga_rows[0]`，而 `v$pgastat` 第一行实测是
+  `total PGA inuse`（采集 SQL 无 `ORDER BY`）⇒ **名字写「总分配」、值是「当前占用」**
+  （1.4 包 123 MB vs allocated 266 MB，差一倍）。改为按名字取 `total PGA allocated`，缺行退回第一行。
+  ★ 这一处绕不过去：口径写不对，说明就只能写假话。
+- **守门**：`tests/test_oracle_report_quality.py::RowNoteCoverageTests` 6 条（身份逐行非空 /
+  概要逐行非空含 **15 行键序列对账** / SGA 未知组件有兜底 / `NLS_TERRITORY` 不带进表 /
+  PGA 取 allocated / allocated 缺行退回）；**负控制 `_work/_b18_negctl.py` 5/5 真实变红**
+  （口径表少一条 / 漏传说明 / 兜底改空 / 顺手多收一行 / PGA 退回第一行），逐字节复原 + sha256。
+- **影响面**：新旧产物逐项 diff = `analysis.json` 与 `report_model*.json` **各 23 处**，
+  全部落在这两件事上（22 处说明 + 1 处 PGA 值）。
+- **业务结果不变**：健康分 23 / 规则 42（11/24/7）/ 风险 11 / 章节 9 / 检查项 76 / 图 10；
+  10 张 PNG、`llm_input.json`、`analyzer_status.json` 零差异。
+- **未做（待决策）**：`主机信息` 这类**合成行**在源证据缺一半时仍被判「正常」（牵动四库，单独一批）。
+- 详见 `docs/oracle-collector-fix-plan.md`「批 18」章与 `docs/oracle-collector-interface.md` §11.20。

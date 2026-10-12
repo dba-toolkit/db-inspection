@@ -1134,3 +1134,20 @@ bash -n inspection/oracle_inspection.sh    # 语法
 > ★ **本批的元教训**：**呈现层的错不产生功能性失败信号**。表头混进数据、`""` 与 `None` 混用，
 > 都不会报错、不会让测试变红，报告照出 —— 只能靠"把渲染结果拉出来与 `analysis.json` 对账"发现。
 > 与批 15/16 同源。
+
+### 11.20 批 18 改造后的增量（2026-10-12，**仅 Python 侧展示层**；采集脚本/契约一字未改）
+
+| 项 | 结论 |
+| --- | --- |
+| 采集脚本 | **一字未改**（`.psv` / `.tsv` 的形态、列名、目录、`status` 全不动） |
+| 契约 | **一字未改**（`snapshot.json` / `collection_status.json` / `tables/*` 的字段与形态不变） |
+| 改的是 | `plugins/oracle/presentation.py` 的**说明列**与 `PGA 总分配` 的取值口径 |
+
+- `数据库身份` / `数据库配置概要` 两张表的「说明」列由**空**变为**口径**（22 行）：写的是
+  「这个值是什么、取自哪个视图」（如 `DB_NAME` → 「数据库名（v$database.name）」），
+  **不是建议**。与 MySQL `CONFIG_GROUP_VARIABLES` 同一条线。
+- `PGA 总分配` 改为按名字取 `total PGA allocated`（此前取 `pga_rows[0]`，实测是 `total PGA inuse`
+  —— 采集 SQL 没有 `ORDER BY`，行序由视图给）。**这是读法修正，不是契约变更**：
+  Python 侧读的仍是同一张表、同一列。
+- ★ 展示层侧的一条纪律：`ORACLE_DB_CONFIG_NOTES` 同时是「概要表展示哪些 NLS 参数」的单一来源 ——
+  加一条口径 = 多展示一行，两者不是两件事（`NLS_TERRITORY` 因此仍不进表）。
