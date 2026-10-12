@@ -11,6 +11,11 @@
   · P1-3 一张表只留一种行形（速率 = 平均值+最大值；比例 = 单值）
   · P1-4 规则判定项正文不得落回「本项没有可展示的结构化记录」
 
+批 16 追加（对同一份报告 5.1 的继续排查）—— 这是 `control_files` 误读链的**第 ④ 层**：
+  · 批 16-④ 5.1 的**值列**写死 `[:80]`，把修好后 86 字符的 `control_files` 又切回 `…/ZYDB/control`。
+    取数层的折行（`COLUMN value FORMAT a80`）已经在批 16 修掉，但展示层这一刀正好也落在**第 80 个
+    字符**上 —— 两处截断肉眼与截图完全一致，报告里**看不出已经修了**。
+
 用**合成 ctx / 合成表**，不连库、不读采集包，改哪条断言哪条。
 """
 from __future__ import annotations
@@ -320,6 +325,34 @@ class EmptyStateAdapterTests(unittest.TestCase):
         })
         self.assertEqual(analysis["status"], "normal")
         self.assertTrue(analysis["evidence"])
+
+
+FULL_CONTROL_FILES = (
+    "/u01/app/oracle/oradata/ZYDB/control01.ctl, "
+    "/u01/app/oracle/oradata/ZYDB/control02.ctl"
+)
+
+
+class InitParameterValueDisplayTests(unittest.TestCase):
+    """批 16-④：5.1 关键初始化参数的值列不得截断。
+
+    病：值列写死 `[:80]`，把 `control_files` 的 86 字符值切成 `…/ZYDB/control`，读起来像
+    「第二个控制文件名叫 control」—— 与取数层 sqlplus 折行（`COLUMN value FORMAT a80`）
+    **同源的误读**。取数层修好后值是 86 字符，展示层这一刀会让报告**看不出已修**。
+
+    判据为什么是「逐字符相等」而不是「长度够长」：两处截断（取数层 a80 / 展示层 [:80]）
+    都正好落在第 80 个字符上，任何「看起来对」的宽松断言都会给这个 bug 背书。
+    """
+
+    def test_long_value_reaches_the_report_verbatim(self) -> None:
+        item = build(tables={
+            "关键初始化参数": [{"NAME": "control_files", "VALUE": FULL_CONTROL_FILES}],
+        })["oracle.init_params"]
+        rows = item["display"]["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["参数"], "control_files")
+        self.assertEqual(rows[0]["值"], FULL_CONTROL_FILES)
+        self.assertTrue(rows[0]["值"].endswith("control02.ctl"))
 
 
 if __name__ == "__main__":
