@@ -2005,6 +2005,124 @@ STATUS |NAME
 **未做（待决策）**：`主机信息` 这类**合成行**在源证据缺一半时仍被判「正常」（改动面在
 适配器/展示层口径，牵动四库，建议单独一批）。
 
+## 批 19：规则项采集状态 / 取数键对齐 / 取数键静态守门（Python 侧）✅ 已完成（2026-10-12）
+
+**范围**：`plugins/oracle/package_adapter.py` / `metrics.py` / `oracle_rules.py` / `presentation.py`、
+`inspection_core/word_engine.py`（状态词表）+ `tools/check_oracle_lookup_keys.py`（新）+ 测试 + 基线。
+**采集脚本一字未改。**
+
+**用户的问法**：「4.2 CPU 压力评估 …… 8.1 长时间事务 …… 9.2 不可用索引 …… 很多这种，
+是没采集到，还是什么原因，很多是空的」。逐条点名的八项全部印着「采集状态：正常」。
+
+### 一、根因：三件事其实是**同一件事**
+
+「**没取到**」与「**没问题**」在代码里长得一模一样：
+
+| 层 | 「没取到」的表现 | 「没问题」的表现 | 能不能分 |
+| --- | --- | --- | --- |
+| 取数 | `ctx.tables.get(名字, [])` → `[]` | 表真的有、查了 0 行 → `[]` | ✗ 都是 `[]` |
+| 取数（旧） | `ctx.find_table("FRA", …)` 子串兜底 → 命中了**别的表** | 命中对的表 | ✗ 兜底不报错 |
+| 规则 | `status` 只有 触发/通过/未评价，**没有"采集到没有"这一维** | 同左 | ✗ 维度缺失 |
+| 展示 | `collection.status` 取的是**采集 item_id** 索引的失败清单 | 规则项写的是**规则 id**，不同域 → 永远落回默认 `ok` | ✗ 恒印「正常」 |
+
+所以用户看到的不是「没采集」，是**报告没有能力说出自己没采集**。
+
+### 二、A 判据 —— `available` 由「取数是否命中」决定
+
+- 新增 `TableFetch`（冻结 dataclass：`rows` / `matched` / `state` + `resolved` / `available` / `counted`）
+  与 `ctx.table_fetch(*names)`。
+- `fetch_state(fetch)`：`resolved=False` ⇒ `unavailable`；否则 `state or "ok"`。
+- `state_is_collected(state)`：`empty`（查了、确认 0 行）**算采集过**；`unavailable` /
+  `timeout` / `permission_denied` / `not_enabled` / `skipped` / `unsupported` / `missing` 不算。
+  ★ **缺状态（`""`）一律按「没采到」处理** —— 宁可写「证据不足」，不可写「检查通过」。
+- 这就是批 14 立的「未采集 ≢ 0」**第一次变得可判**：在此之前那条纪律只是口号，
+  因为没有地方能区分两种 `[]`。
+
+### 三、B 取数键 —— 列全别名，不再靠子串兜底
+
+- 判定层取数全部改走 `ctx.table_fetch(...)`，并**列全** 1.4 标题 / 2.0 item_id / 别名。
+  改完 `oracle_rules.py` 里 **0 个** `find_table` / `tables.get` / `tables[…]`。
+- **FRA 是标本**：`ctx.find_table("FRA", "闪回区", "快速恢复区")` 的子串兜底先把 `"FRA"` 匹配到
+  `快速恢复区（FRA）参数`（只有 `NAME`/`VALUE`，**没有使用率列**）⇒ 命中了错的表 ⇒
+  使用率恒 `None` ⇒ `ORA.STORAGE.FRA` 在 **1.4 / 2.0 两种包形态上都永不触发**。
+- **注入对照实验**（复制包 → 只覆盖一张表文件为真实行 → 重跑）：1.4 包上另有
+  **3 条恒「通过」漏报**（`ORA.OBJECT.INVALID` / `ORA.TXN.LONG` / `ORA.LOCK.BLOCKING`）
+  与 **1 条恒「触发」误报**（`ORA.BACKUP.RECENT`）。实验结束时 **10/10 命中**。
+- 适配器补 1.4 文件名 → 2.0 item_id 的桥（`load_item_ids_by_title()`，单一来源 = `item_titles.json`；
+  **标题重复的条目一律不登记** —— 宁可少一个别名，不可指向错的表）。
+
+### 四、C 采集状态 —— 规则项带 `source_status`
+
+- `RuleEvaluation` 新增 `source_status`，`_evaluate(...)` 透传；展示层 `_item()` **优先读它**，
+  读不到才回落到采集层的 `collection.status`。
+- 效果（2.0 包实测）：§9.2 不可用索引、§9.3 统计信息缺失、无效对象、8.1、8.2、9.5、9.6、9.7
+  的「采集状态：正常」→「**无记录**」。
+
+### 五、守门：`tools/check_oracle_lookup_keys.py`
+
+- 聚合口径按**最近的闭合语句**，不按 `lineno` —— 同一表达式里的多行 `or` 链是**一个**取数点。
+  按行聚合会造出假缺陷（`ORA.SECURITY.PASSWORD_EXPIRY` 的三别名会被误报成「三个别名全死」）。
+- 三档 + 一记门禁：`✓ 命中`（并打印命中的那个键，子串兜底的错命中看得见）/ `! 单边` /
+  `— 未命中` / `✗ 含未登记名`（**退出码非 0**，「未命中 / 单边」只提示不失败 ——
+  那可能是这一项本来没采，静态尺子分不清）。
+- 覆盖范围**只扫判定层**（`metrics.py` + `oracle_rules.py`）：`presentation.py` 的取数错
+  不改变任何结论，只让某张表少几列/整项消失，那类错由 `tests/test_oracle_report_quality.py` 守。
+- ★ **受监控 API 清单**（`_TABLE_ATTRS` / `_TABLE_GETTERS`）：加新取数 API 必须同步这里，
+  否则新调用点对尺子不可见（**静默漏审**）。`tests/test_oracle_lookup_keys.py` 里有一条断言
+  「源码里所有**在 `ctx 上**调用的、名字里带 table 的方法都在清单里」钉住这件事。
+- 当前：**37 个取数点 = 命中 33 / 单边 2 / 未命中 2 / 含未登记名 0**（exit 0）。
+  四个开口都如实标成「这种包形态本来没采」：`metrics.py:200` ASM 磁盘组汇总（两包都缺）、
+  `oracle_rules.py:330` filesystems（1.4 的 `evidence/` 是空目录）、`oracle_rules.py:406`
+  `oracle.archive.fra_asm`（只有 ASM 实例有）、`oracle_rules.py:1163` hugepages（1.4 采集器不采 OS 层）。
+
+### 六、顺带修掉的同类静默缺陷：缺口状态列印英文
+
+附录「数据缺口」表原先**各自手写**一份 6 键字典（professional / legacy 各一份），
+`not_enabled` / `skipped` / `unsupported` / `missing` 落不进那 6 个键 ⇒ **状态列原样印出英文**
+（2.0 包实测 §16.2 出现 `not_enabled` ×3、`skipped` ×2）。改为与 `display_status()` 共用
+模块级 `STATUS_DISPLAY`（并补 `insufficient_history` / `external_evidence_required` / `missing`
+—— ★ 不补这两个缺口专有词，另外三库会从「需要外部证据」**退化成英文**）。
+
+★ **控制变量自证 6/6**：MySQL / SQL Server / PostgreSQL ×（legacy + professional）
+渲染的「全段落 + 全表格单元格」sha256 **逐项不变**（`_work/_b19_freeze_other.py` before/after
+**独立进程**——`word_engine` 驻留内存，同进程改文件再渲染无效）。
+
+### 七、验证
+
+- 守门测试：`tests/test_oracle_lookup_keys.py` **27 条**（尺子自证 + 故意违规喂养 + 受监控 API
+  清单同步 + 四档判定 + 门禁退出码 + 渲染不混淆 + 真仓库静态对账）；
+  `tests/test_word_engine.py::CollectionStatusVocabularyTests` **3 条**（状态词**单一来源** /
+  任何已知状态都不许印出 ASCII 字母 / 缺口表渲染结果里不许出现 `not_enabled` 原样）。
+- 负控制：`_work/_b19_negctl.py` **5/5 真实变红并逐字节复原**。★ 其中 B 组**故意要它不红** ——
+  命中了一个「登记过但错」的名字，工具看不出来。**把这条限制写成断言**，免得将来有人以为
+  守门能兜住取数语义。
+- 全量回归：**470 passed / 5 failed**，5 条失败全部是既有的 MySQL 源包缺失
+  （`tests/test_mysql_*`，长期基线），**无新增失败**。
+
+### 八、影响面与结论
+
+新旧产物逐项 diff 后**只有 4 类**：
+
+1. 42 条 `rule_evaluations` 各新增 `source_status`；
+2. 11 个巡检项的 `collection.status` 由 `ok` 变为 `empty` / `unavailable`；
+3. 4 条规则的口径文案（`COMMON.CAPACITY.FILESYSTEM_USAGE` / `ORA.STORAGE.ASM` /
+   `ORA.STORAGE.FRA` / `ORA.SYSTEM.HUGEPAGES`）；
+4. 1 个展示项改指真表（`ORA.STORAGE.FRA` → `oracle.flashback.area_usage`，此前那 4 行
+   是**参数表**的行，不是使用率）。
+
+★★ **业务结论一条未变**：`expected_summary` 逐项相同（健康分 23 / 规则 42（11 触发 / 24 通过 /
+7 未评价）/ 风险 11 / 章节 9 / 检查项 76 / 图 10），`llm_input.json` 与 10 张 PNG 零差异。
+「结论会变」之所以没发生：这些规则在**真包上**本来就没数据（表存在且 0 行），
+旧的 `ok` 与新的 `empty` 恰好都推出「检查通过」—— 变的不是结论，是
+**这句结论与数据相不相关**。批 19 之前它**恒成立**（注入数据也不会变）。
+
+### 九、未做（待决策）
+
+- `presentation.py` 的取数点不在静态守门覆盖范围内（不影响结论，但会让某张表静默消失）。
+  要覆盖得先把展示层的取数也收进同一个 API 清单，代价是尺子要读懂两套语义。
+- `oracle.awr.*` 与 ASM 相关表在 1.4 包里根本没有（`evidence/` 是空目录），
+  这些取数点在 1.4 上永远是「未命中」—— 是采集层的事，不是分析层能补的。
+
 ## 0.5 实测复核：真实采集包逐条验证（2026-10-09）
 
 **复核对象**：`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`  

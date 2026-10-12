@@ -2984,3 +2984,50 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   10 张 PNG、`llm_input.json`、`analyzer_status.json` 零差异。
 - **未做（待决策）**：`主机信息` 这类**合成行**在源证据缺一半时仍被判「正常」（牵动四库，单独一批）。
 - 详见 `docs/oracle-collector-fix-plan.md`「批 18」章与 `docs/oracle-collector-interface.md` §11.20。
+
+### 22.66 Oracle 规则项采集状态 / 取数键对齐 / 取数键静态守门（Python 侧）
+
+**范围**：`plugins/oracle/{package_adapter,metrics,oracle_rules,presentation}.py`、
+`inspection_core/word_engine.py`（状态词表）、`tools/check_oracle_lookup_keys.py`（新）
++ 测试 + 基线。**采集脚本一字未改。**
+
+用户逐条点名的八项（4.2 / 4.3 / 4.4 / 8.1 / 8.2 / 无效对象 / 9.2 / 9.3 / 9.5 / 9.6 / 9.7）
+全部印着「采集状态：正常」，问「**很多这种，是没采集到，还是什么原因，很多是空的**」。
+
+- **根因（三件事同一件）**：「没取到」与「没问题」在四层里长得一模一样 ——
+  ① `ctx.tables.get(名字, [])` 键写错与查了 0 行都返回 `[]`；② `ctx.find_table(...)` 的子串兜底
+  会**命中错的表**且不报错；③ `RuleEvaluation` **没有"采集到没有"这一维**；
+  ④ 展示层拿的是**采集 item_id** 索引的失败清单，而规则项写的是**规则 id**，不同域 ⇒
+  永远落回默认 `ok`。所以问题不是「没采集」，是**报告没有能力说出自己没采集**。
+- **A 判据**：`available` 改由「取数是否命中」决定 —— `TableFetch`（`resolved`/`state`）
+  + `fetch_state()` + `state_is_collected()`。`empty` **算采集过**；缺状态（`""`）一律按
+  **没采到**处理（宁可「证据不足」，不可「检查通过」）。批 14 的「未采集 ≢ 0」到这里才**可判**。
+- **B 取数键**：判定层改走 `ctx.table_fetch(...)` 并**列全别名**（`oracle_rules.py` 里
+  `find_table` / `tables.get` / `tables[…]` 归零）。★ FRA 是标本：子串兜底把 `"FRA"` 匹配到
+  `快速恢复区（FRA）参数`（无使用率列）⇒ 规则在两种包形态上**永不触发**。
+  **注入对照实验**另抓出 1.4 上 3 条恒「通过」漏报 + 1 条恒「触发」误报，实验结束 10/10 命中。
+  适配器补 1.4 文件名 → 2.0 item_id 的桥（单一来源 `item_titles.json`，**标题重复不登记**）。
+- **C 采集状态**：`RuleEvaluation.source_status` + 展示层优先读它 ⇒ 9.2「正常」→「**无记录**」，
+  8.1 / 8.2 / 无效对象 / 9.3 / 9.5 / 9.6 / 9.7 同。
+- **守门**：`tools/check_oracle_lookup_keys.py` —— 按**语句**（不按行）聚合取数点，
+  `✓ 命中 / ! 单边 / — 未命中 / ✗ 含未登记名`（后者退出码非 0）。当前 37 点 =
+  命中 33 / 单边 2 / 未命中 2 / 含未登记名 0。★ 自带**尺子自证**（多行 `or` 链必须归成一个点）：
+  按行聚合会把 `ORA.SECURITY.PASSWORD_EXPIRY` 误报成「三个别名全死」。
+  ★ 受监控 API 清单（`_TABLE_ATTRS` / `_TABLE_GETTERS`）**加 API 必须同步**，否则静默漏审。
+- **顺带**：附录「数据缺口」表原先各自手写 6 键字典，`not_enabled` / `skipped` 落不进键 ⇒
+  **状态列原样印英文**（2.0 包 §16.2 实测 `not_enabled` ×3、`skipped` ×2）。改为与
+  `display_status()` 共用 `STATUS_DISPLAY`（并补 `insufficient_history` /
+  `external_evidence_required` / `missing` —— 不补这几个缺口专有词，**另外三库会退化成英文**）。
+- **守门与负控制**：`tests/test_oracle_lookup_keys.py` 27 条 +
+  `tests/test_word_engine.py::CollectionStatusVocabularyTests` 3 条；
+  `_work/_b19_negctl.py` **5/5 真实变红并逐字节复原**（★ B 组**故意要它不红** ——
+  「登记过但错」的名字守门看不出来，这条限制写成了断言）；
+  状态词表改动的**控制变量自证 6/6**（四库 × 两布局的「全段落 + 全表格单元格」sha256 逐项不变）。
+- **影响面**：新旧产物 diff **只有 4 类** —— 42 处 `source_status` 新增 / 11 处
+  `collection.status` / 4 条规则文案 / 1 个展示项改指真表。
+  ★★ **业务结论一条未变**：`expected_summary` 逐项相同（健康分 23 / 规则 42（11/24/7）/
+  风险 11 / 章节 9 / 检查项 76 / 图 10），`llm_input.json` 与 10 张 PNG 零差异 ——
+  变的不是结论，是**这句结论与数据相不相关**（批 19 之前它恒成立，注入数据也不会变）。
+- **未做（待决策）**：`presentation.py` 的取数点不在静态守门覆盖内（不影响结论，但会让
+  某张表静默消失）；`oracle.awr.*` / ASM 相关表在 1.4 包里根本没有，属采集层的事。
+- 详见 `docs/oracle-collector-fix-plan.md`「批 19」章与 `docs/oracle-collector-interface.md` §11.21。

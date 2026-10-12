@@ -1151,3 +1151,42 @@ bash -n inspection/oracle_inspection.sh    # 语法
   Python 侧读的仍是同一张表、同一列。
 - ★ 展示层侧的一条纪律：`ORACLE_DB_CONFIG_NOTES` 同时是「概要表展示哪些 NLS 参数」的单一来源 ——
   加一条口径 = 多展示一行，两者不是两件事（`NLS_TERRITORY` 因此仍不进表）。
+
+### 11.21 批 19 改造后的增量（2026-10-12，**仅 Python 侧**；采集脚本与 `.psv`/`.tsv` 形态一字未改）
+
+| 项 | 结论 |
+| --- | --- |
+| 采集脚本 | **一字未改**（`.psv` / `.tsv` 的形态、列名、目录、`status` 全不动） |
+| 采集包契约 | **一字未改**（`snapshot.json` / `collection_status.json` / `tables/*` 字段与形态不变） |
+| 分析产物契约 | **加字段**：`appendix.rule_evaluations[*]` 新增 `source_status`（字符串，可为 `""`） |
+| 改的是 | Oracle 适配器取数 API、规则层取数键与判据、展示层采集状态、公共 Word 引擎的状态词表 |
+
+**`source_status` 的取值域**（与 `tables/*` 首行声明的采集侧状态同域）：
+
+| 取值 | 含义 | 算「采集过」吗 |
+| --- | --- | --- |
+| `ok` | 取到内容 | ✅ |
+| `empty` | **查了、确认 0 行** | ✅ **算**（与「没采到」是相反结论） |
+| `partial` | 部分可用 | ✅ |
+| `unavailable` | 键在包里不存在（别名对不上 / 这一项本来没采） | ❌ |
+| `timeout` / `permission_denied` / `error` | 采集失败 | ❌ |
+| `not_enabled` / `skipped` / `unsupported` | 采集器按条件跳过 | ❌ |
+| `missing` | 声明了但文件不在 | ❌ |
+| `""` | **缺状态** | ❌ **按没采到处理**（宁可「证据不足」，不可「检查通过」） |
+
+- **取数 API**：`ctx.table_fetch(*names) -> TableFetch`。**不用** `ctx.find_table(...)` 的子串兜底 ——
+  那是「取不到就挑一个名字像的」，实测会把 FRA 使用率兜到 `快速恢复区（FRA）参数`。
+  要兜底就在**调用点把名字列全**，让「名字」这件事保持可审计。
+- **判据**：`fetch_state(TableFetch) -> str`（取数 → 状态）、`state_is_collected(str) -> bool`
+  （状态 → 这项采集过吗）、`prefer_state(*states) -> str`（同一事实多个落点 → 一个状态；
+  优先级「有内容 > 查了没有 > 没采到」）。
+- **展示层**：`display_status()` 与附录两处「数据缺口」表共用模块级 `STATUS_DISPLAY` ——
+  状态词只此一份。**加状态值必须加在这一份里**，否则会原样印出英文枚举（这类错不抛异常、
+  测试也不红，见 `tests/test_word_engine.py::CollectionStatusVocabularyTests`）。
+- ★ 展示层纪律：`_item()` 的 `collection.status` **优先取规则项自己的 `source_status`**，
+  取不到才回落到采集层的失败清单。规则 id 与采集 item_id 不同域，回落路线会**恒印「正常」**。
+
+**新增静态守门**：`tools/check_oracle_lookup_keys.py`（`SOURCES = metrics.py + oracle_rules.py`）。
+按**语句**聚合取数点，四档输出，`✗ 含未登记名` 退出码非 0。
+★ 它认得的取数 API 列在 `_TABLE_ATTRS` / `_TABLE_GETTERS` —— **加新 API 必须同步这里**，
+否则新调用点对尺子不可见（静默漏审）。
