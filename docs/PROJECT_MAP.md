@@ -2803,3 +2803,36 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   老问题，无新增）。★ **MySQL 侧没有端到端覆盖**（`test_mysql_*` 因源包不在仓库而失败）—— 本批为该侧
   补了直接打解析器的用例，但**真实 MySQL 包上的端到端验证仍未做**。
 - **未做（批 14b）**：把同一收口推到 PostgreSQL 9 处（共享访问点已就位，纯机械替换）。
+
+### 22.61 Oracle 图表补口 —— 「包内有数据、报告里没有图」的三张图（Python 侧）
+
+**范围**：只动 Python（`inspection_core/charts/render.py` + `plugins/oracle/{charts,word_report,report_adapter}.py`
++ 测试 + 基线），`inspection/oracle_inspection.sh` **零改动**。
+
+- **判据**：批 12 钉死「声明集合 = 可产出集合」之后，还剩一类缺口 —— **包里有数据、报告里连图都没有**。
+  逐项扫「`status=ok` / 有行 **且** 展示层无消费者」得到三张：表空间使用率 Top-N（`oracle.tablespace.usage`，
+  `PCT_USED` 降序 Top10，≥90% 标红）、Top SQL 执行时间 Top-N（`oracle.topsql.elapsed_time`，`ELAPSED_MIN`）、
+  每日归档量趋势（`oracle.archive.daily_30d`，`day` / `day_gb`）。
+- ★ **公共层此前只有时序折线**（`render_spec`：x = 时间戳、`spec_has_data` 要求 ≥2 点）；三张里两张要**类别轴**。
+- **落地**：① `render.py` 新增 `render_bar_spec()` + `bar_spec_has_data()`（matplotlib 优先 / Pillow 降级），
+  **纯新增、不动 `render_spec` / `spec_has_data`**；② 3 个 id 加进 `ORACLE_CHART_IDS`，按章节挂到
+  `storage_capacity` / `oracle_performance` / `backup_recovery`。
+- ★ **为什么不塞进同一个 spec**：折线要求 ≥2 点、条形一个类别即可 —— 塞一起会让判据对条形失真。
+  图**定义**仍在插件（`charts/__init__.py` 明确「表空间等 database-specific chart 归插件」），公共层只给**画法**。
+- ★★ **顺带根治两处「适配器重建模型」的静默坑**（本批踩出来）：
+  ① 图题原在 `word_report.py` 与 `report_adapter.py` **各抄一份** ⇒ 新图在适配器侧
+  `_CHART_CAPTIONS.get(id, id)` **静默落回英文 chart_id**（报告图题变成 `oracle_tablespace_usage`）；
+  收口到 `charts.py`（`ORACLE_CHART_CAPTIONS` / `OS_CHART_CAPTIONS`，与 id 同源）。
+  ② 报告来源词汇只有 `historical` / `realtime_snapshot` ⇒ 表数据图被兜底成 `realtime_snapshot`，
+  而 `word_engine` 对含该 scope 的章节加「短时采样」说明 ⇒ **只有排行图的 storage / backup 章被误加提示**；
+  新增 `table_snapshot` 词汇。
+- **实测（1.4 + 2.0 两份真实包）**：两张条形图正常产出（2.0 包表空间 5 类 / Top SQL 10 类）；
+  **归档图按数据空 `skipped`**（该实例近 30 天无归档），报告以「图表未生成：数据点不足」呈现。
+- ★ **原有 8 张 PNG 逐字节相同**；`expected_summary` 里**只有 `charts` 8 → 10**，其余全同 ⇒ 纯展示层、不触发新判据。
+- **守门**：`tests/test_oracle_chart_coverage.py`（9 用例，含跨章节并集）+ 新增
+  `tests/test_chart_bar_spec.py`（9 用例：判据 / 缺值丢弃 / 阈值着色 / 双后端 / 无渲染器不静默）。
+- **负控制** `_work/_b12b_negctl.py` **4/4 真实变红**。★ **负控制抓到测试自身漏洞**：
+  初版「单一来源」断言写 `if item.chart_id in ORACLE_CHART_IDS` —— 会把「声明了但没登记」的图
+  **静默滤掉**，变异①照常绿；改为「排除 OS 图后取全量再比对」才暴露（延续 §22.59 的教训）。
+- **未做**：Top SQL 另有 `logical_reads` / `physical_reads` 两个维度（各 20 行）未出图；PG 取数收口仍是批 14b。
+

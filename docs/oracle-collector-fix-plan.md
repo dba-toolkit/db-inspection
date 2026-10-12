@@ -1,7 +1,7 @@
 # oracle_inspection.sh 改造清单
 
 - 对象：`inspection/oracle_inspection.sh`（原 3586 行 / 87 个函数 / 注释密度 **4.7%**）
-- **当前状态**：批 **0–7 全部落地**（采集脚本，`inspection/oracle_inspection.sh` **4610 行 / 105 个函数 / 注释密度 14.4%**，`COLLECTOR_VERSION` = `SNAPSHOT_SCHEMA_VERSION` = `PACKAGE_VERSION` = **2.0**，批 5–7 均**无新采集项**、版本号不动）；批 **8 / 10 / 11 / 12 / 13 / 14 在 Python 侧**（采集脚本零改动）：批 8（2026-10-10）让 `plugins/oracle/package_adapter.py` **真正消费 2.0 包**（`collector_version` 分叉 + `.psv` + 1.4→2.0 查找键桥接）；批 10（2026-10-10）把**分析层 / 报告层对齐 MySQL**（补齐「待客户确认事项」+ 修正章节动线）；批 11（2026-10-10）**规则补口** —— 补齐 DataGuard / 对象治理 / 口令 Profile / 大页四个"采了有数据、零判据"的域（规则包 **34 → 42**），并整体刷新 Oracle 基线；批 12（2026-10-10）**图表收口** —— 图的「声明集合 = 可产出集合」（单一来源 `ORACLE_CHART_IDS` + `oracle_txn_rate` 上架 + 共享引擎不再静默 `return False`）；批 13（2026-10-10）**展示补口** —— 把「采了有数据、一个字不进报告」的四个域（AWR 段膨胀/高水位/索引使用/统计缺失、DataGuard、审计画像、undo/temp/共享池）接进报告（检查项 **52 → 76**，章节数不变）；批 14（2026-10-10）**取数口径统一** —— 呈现层不再自拼包内路径，非表格式证据文件一律走共享访问点 `PackageContext.raw_lines`（Oracle 6 处 + MySQL 5 处；规范化比对**零字节变化**，基线未动）。
+- **当前状态**：批 **0–7 全部落地**（采集脚本，`inspection/oracle_inspection.sh` **4610 行 / 105 个函数 / 注释密度 14.4%**，`COLLECTOR_VERSION` = `SNAPSHOT_SCHEMA_VERSION` = `PACKAGE_VERSION` = **2.0**，批 5–7 均**无新采集项**、版本号不动）；批 **8 / 10 / 11 / 12 / 12b / 13 / 14 在 Python 侧**（采集脚本零改动）：批 8（2026-10-10）让 `plugins/oracle/package_adapter.py` **真正消费 2.0 包**（`collector_version` 分叉 + `.psv` + 1.4→2.0 查找键桥接）；批 10（2026-10-10）把**分析层 / 报告层对齐 MySQL**（补齐「待客户确认事项」+ 修正章节动线）；批 11（2026-10-10）**规则补口** —— 补齐 DataGuard / 对象治理 / 口令 Profile / 大页四个"采了有数据、零判据"的域（规则包 **34 → 42**），并整体刷新 Oracle 基线；批 12（2026-10-10）**图表收口** —— 图的「声明集合 = 可产出集合」（单一来源 `ORACLE_CHART_IDS` + `oracle_txn_rate` 上架 + 共享引擎不再静默 `return False`）；批 13（2026-10-10）**展示补口** —— 把「采了有数据、一个字不进报告」的四个域（AWR 段膨胀/高水位/索引使用/统计缺失、DataGuard、审计画像、undo/temp/共享池）接进报告（检查项 **52 → 76**，章节数不变）；批 14（2026-10-10）**取数口径统一** —— 呈现层不再自拼包内路径，非表格式证据文件一律走共享访问点 `PackageContext.raw_lines`（Oracle 6 处 + MySQL 5 处；规范化比对**零字节变化**，基线未动）。批 12b（2026-10-12）**图表补口** —— 补三张「包内有数据、报告里没有图」的图（表空间使用率 Top-N 条形 / Top SQL 执行时间 Top-N 条形 / 每日归档量趋势折线），并把**条形渲染入口下沉公共层** `render_bar_spec`（纯新增、四库基线零影响）；图 **8 → 10**。
 - **批 8（2026-10-10）不在采集脚本里**：转 **Python 侧** —— `plugins/oracle/package_adapter.py` 此前对所有 `tables/*.tsv` 一律按 `|` 解析，**且完全忽略 `tables/*.psv`** ⇒ 2.0 包只读出 5 张垃圾表，34 条规则里 **16 条 `not_evaluated`**。本批按 `collector_version` 分叉 + 重建 1.4→2.0 的查找键桥接，实测 `not_evaluated` **16 → 2**（余下 2 条是"无 ASM / FRA 未配置"的环境事实）。**collector 侧自此无遗留代码项。**
 - `_work/_pkg2_check_report.md` / `_work/_pkg3_check_report.md` = 两轮体检报告（15 条 + 6 条发现 + 批次建议）；验收脚本 `_work/_b1_make_verify.py` → `_work/_verify_b1.sh`（**T1–T26，PASS=139 / FAIL=0**），另有第四道静态守门 `_work/_scan_record_status.py`。
 - **仍需现场确认**：① N-4 用同型号实例复采（ORA-00904 消失）；② OF-19 中断路径构造一次；③ 批 7 的复采核对（见「批 7」章节末尾）。
@@ -1274,7 +1274,7 @@ MySQL 同一章实测 **16 条**真事项。成因：`presentation.build_report_
 | 批次                 | 内容                                                                                                                        |            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | **批 12** ✅ **已完成** | **图表收口**：`charts.py` 可产 9 张、`word_report.py` 曾只声明 8 个 ⇒ `oracle_txn_rate` **生成即丢弃**；图全跳过时引擎**静默 `return False`**          | 见下一章「批 12」 |
-| **批 12b（下一批）**     | **补 3 张"有数据没画"的图**：表空间使用率 Top-N 条形 / 归档量趋势 / Top SQL Top-N —— 需要**新图型**（公共层只有时序折线），且 `archive.daily_30d` 手上包全空，无法用真实数据验证  |            |
+| **批 12b** ✅ **已完成** | **图表补口**：补三张「有数据没画」的图 —— 表空间使用率 Top-N（条形）/ Top SQL 执行时间 Top-N（条形）/ 每日归档量趋势（折线）；条形渲染入口下沉公共层 `render_bar_spec`（纯新增）；图 **8 → 10** |
 | **批 13** ✅ **已完成**           | **展示补口**：`oracle.awr` 8 项一个都不进报告、`oracle.dg` 6 项、`oracle.audit` 7 项；`undo_usage` / `temp_sort_usage` / `shared_pool_frag` |            |
 | **批 14** ✅ **已完成**       | 取数口径统一：presentation 里 6 处直读包内硬编码路径（**MySQL 也有 5 处，一起收**）                                                                  |            |
 
@@ -1361,7 +1361,7 @@ MySQL 源包缺失的长期问题，**无新增**）。MySQL 基线文档 hash �
 
 | 批次           | 内容                                                                                                                                                                                          |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **批 12b**    | **补 3 张"有数据没画"的图**：表空间使用率 Top-N 条形（`oracle.tablespace.usage`）/ 归档量趋势（`oracle.archive.daily_30d`）/ Top SQL Top-N（`oracle.topsql.*`）—— 需**新图型**（公共层只有时序折线）；`archive.daily_30d` 手上包全空，须先解决可验证性 |
+| **批 12b** ✅ **已完成** | **图表补口**：补三张「有数据没画」的图 —— 表空间使用率 Top-N（条形）/ Top SQL 执行时间 Top-N（条形）/ 每日归档量趋势（折线）；条形渲染入口下沉公共层 `render_bar_spec`（纯新增）；图 **8 → 10** |
 | **批 13** ✅ **已完成**     | **展示补口**：`oracle.awr` 8 项一个都不进报告、`oracle.dg` 6 项、`oracle.audit` 7 项；`undo_usage` / `temp_sort_usage` / `shared_pool_frag`                                                                   |
 | **批 14** ✅ **已完成** | 取数口径统一：presentation 里 6 处直读包内硬编码路径（**MySQL 也有 5 处，一起收**）                                                                                                                                    |
 
@@ -1473,7 +1473,7 @@ DataGuard 的 5 项从这里开始展示，把"高可用"写进章名才名实�
 
 | 批次 | 内容 |
 |---|---|
-| **批 12b** | **补 3 张"有数据没画"的图**：表空间使用率 Top-N 条形 / 归档量趋势 / Top SQL Top-N —— 需**新图型**（公共层只有时序折线）；`archive.daily_30d` 手上包全空，须先解决可验证性 |
+| **批 12b** ✅ **已完成** | **图表补口**：补三张「有数据没画」的图 —— 表空间使用率 Top-N（条形）/ Top SQL 执行时间 Top-N（条形）/ 每日归档量趋势（折线）；条形渲染入口下沉公共层 `render_bar_spec`（纯新增）；图 **8 → 10** |
 | **批 14** ✅ | 取数口径统一（见下一章） |
 | **批 13 有意未做** | `oracle.basic.large_segments` / `oracle.index.large_segments`（`ORA.CAPACITY.LARGE_SEGMENT` 的数据源）与 `system.hugepages`（`ORA.SYSTEM.HUGEPAGES` 的数据源）同样"有判据、无展示"，留待下一轮 |
 
@@ -1566,7 +1566,73 @@ DataGuard 的 5 项从这里开始展示，把"高可用"写进章名才名实�
 | 批次 | 内容 |
 |---|---|
 | **批 14b（候选）** | 把同一收口推到 **PostgreSQL**（`presentation.py` 9 处）—— 共享访问点已就位，是纯机械替换 |
-| **批 12b** | 补 3 张"有数据没画"的图（表空间 Top-N 条形 / 归档量趋势 / Top SQL Top-N）—— 需**新图型** |
+
+---
+
+## 批 12b：图表补口 —— 「包内有数据、报告里没有图」的三张图（Python 侧）✅ 已完成（2026-10-12）
+
+**范围**：只动 Python（`inspection_core/charts/render.py` + `plugins/oracle/{charts,word_report,report_adapter}.py`
++ 测试 + 基线），`inspection/oracle_inspection.sh` **零改动**（数据早就采到了，缺的是展示）。
+
+### 病与判据
+
+批 12 把「图的**声明集合** = **可产出集合**」钉死之后，还剩一类缺口没覆盖：
+**包里有数据、报告里却连图都没有**。逐项扫「`status=ok` / 有行 **且** 展示层无消费者」，得到三张：
+
+| 图 | 数据源 | 包内形态 | 图型 |
+|---|---|---|---|
+| 表空间使用率 Top-N | `oracle.tablespace.usage`（`TABLESPACE_NAME` / `PCT_USED`） | 1.4 中文标题 TSV / 2.0 `.psv` | **条形** |
+| Top SQL 执行时间 Top-N | `oracle.topsql.elapsed_time`（`SQL_ID` / `ELAPSED_MIN`） | 同上 | **条形** |
+| 每日归档量趋势 | `oracle.archive.daily_30d`（`day` / `day_gb`） | 同上 | 折线（可复用） |
+
+★ **公共层此前只有时序折线**（`render_spec`：x = 时间戳、`spec_has_data` 要求 ≥2 点），
+三张里两张要**类别轴**（x = 表空间名 / SQL_ID，一个类别就该能画）。
+
+### 三条机制性改动
+
+1. **条形渲染入口下沉公共层**：`inspection_core/charts/render.py` 新增 `render_bar_spec()`
+   （+ `bar_spec_has_data()`），matplotlib 优先、Pillow 降级 —— **纯新增**，
+   不动 `render_spec` / `spec_has_data` ⇒ 四库基线与四张 OS 图零影响（实测原有 8 张 PNG **逐字节不变**）。
+   ★ **为什么不塞进同一个 spec**：折线要求 ≥2 点、条形一个类别即可，塞一起会让判据对条形失真。
+   图**定义**仍在 `plugins/oracle/charts.py`（`charts/__init__.py` 明确「表空间等 database-specific chart 归插件」）。
+2. **新图并入单一来源**：3 个 id（`oracle_tablespace_usage` / `oracle_topsql_elapsed` / `oracle_archive_daily`）
+   加进 `ORACLE_CHART_IDS`；声明按**章节**挂（表空间→`storage_capacity`、Top SQL→`oracle_performance`、
+   归档→`backup_recovery`）⇒ 声明不再等于单一章节，守门 `test_oracle_chart_coverage.py` 改为钉
+   「**跨章节声明的并集 == `ORACLE_CHART_IDS`**（不重不漏）」。
+3. ★★ **顺带根治两处「适配器重建模型」的静默坑**（本批踩出来的）：
+   - **图题**原在 `word_report.py` 与 `report_adapter.py` **各抄一份** ⇒ 新图在适配器侧
+     `_CHART_CAPTIONS.get(id, id)` **静默落回英文 chart_id**（报告里图题变成 `oracle_tablespace_usage`）。
+     现收口到 `charts.py`（`ORACLE_CHART_CAPTIONS` / `OS_CHART_CAPTIONS`，与 id 同源），两处都从它取。
+   - **报告来源词汇**只有 `historical` / `realtime_snapshot` ⇒ 表数据图被兜底成 `realtime_snapshot`，
+     而 `word_engine` 会对含 `realtime_snapshot` 图的章节加「短时采样」说明 ⇒
+     **只有排行图的 storage / backup 章会被误加"现场短时采样"提示**。现新增 `table_snapshot` 词汇。
+
+### 验证
+
+- **回归**：全量 `pytest` = **5 failed / 381 passed / 168 subtests**（370 + 新增 11；5 个 FAIL 仍是
+  MySQL 源包缺失的长期问题，**无新增**）。
+- **实测两份真实包**：
+  - 2.0 包：新增 `oracle_tablespace_usage.png`（5 类，SYSTEM 99.98% 标红）+ `oracle_topsql_elapsed.png`（10 类）；
+    **归档图按数据空 `skipped`**（该实例近 30 天无归档），备份章出现「图表未生成：数据点不足」说明。
+  - 1.4 包：同样两张出新图（Oracle 专属时序图还多出一张 `oracle_physical_io`）；**列对齐文本解析正常**。
+- ★ **原有 8 张 PNG 逐字节相同**（`_work/_b13_14/charts` vs `_work/_b12b_14/charts`）；`expected_summary` 里
+  **只有 `charts` 从 8 → 10**，其余（health 23 / rules 42 / triggered 11 / passed 24 / not_evaluated 7 /
+  risk_register 11 / items 76 / sections 9 / severity_counts）**全同** ⇒ 纯展示层、不触发新判据。
+- **守门**：`tests/test_oracle_chart_coverage.py`（9 用例）+ 新增 `tests/test_chart_bar_spec.py`（9 用例，
+  公共层 bar：判据 / 缺值丢弃 / 阈值着色 / matplotlib 与 Pillow 双后端 / 无渲染器不静默成功）。
+- **负控制** `_work/_b12b_negctl.py` **4/4 全部真实变红**（`ORACLE_CHART_IDS` 少登记 / `storage_capacity` 组清空 /
+  `_bar_pairs` 把缺值当 0 / `bar_spec_has_data` 不看值），逐字节复原 + sha256 校验。
+  ★ **负控制抓到一条测试自身的漏洞**：初版「单一来源」断言写的是
+  `if item.chart_id in ORACLE_CHART_IDS` —— 这个过滤会把「声明了但没登记」的图**静默滤掉**，
+  于是变异①照常绿。改为「**排除 OS 图后取全量**再比对」才把不一致暴露出来
+  （延续批 13「断言形式与被测对象不匹配时绿色不代表正确」）。
+
+### 留给下一批
+
+| 批次 | 内容 |
+|---|---|
+| **批 14b（候选）** | 把取数收口推到 **PostgreSQL**（`presentation.py` 9 处）—— 共享访问点已就位，纯机械替换 |
+| **Top SQL 另两个维度** | 包内还有 `oracle.topsql.logical_reads` / `physical_reads`（各 20 行），本批只画了「执行时间」一张；要再出图时按同一 `render_bar_spec` 追加即可 |
 
 ---
 

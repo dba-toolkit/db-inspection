@@ -1052,3 +1052,25 @@ bash -n inspection/oracle_inspection.sh    # 语法
 > 必须抓到"的用例 —— 这是批 13「断言形式与被测对象不匹配时绿色不代表正确」的直接延伸。
 
 
+### 11.16 批 12b 改造后的增量（2026-10-12，**Python 侧图表层**；契约本身一字未改）
+
+本轮补三张「包内有数据、报告里没有图」的图，并把**条形渲染入口**下沉公共层。
+**采集包契约、目录树、`status` 语义全部不变** —— 数据早就采到了。
+
+| 你应当知道的 | 说明 |
+|---|---|
+| **条形图走 `render_bar_spec()`** | `inspection_core/charts/render.py` 新增（matplotlib 优先 / Pillow 降级）。**纯新增入口**，`render_spec`（时序折线）与 `spec_has_data` 一字未动 ⇒ 四库基线零影响 |
+| **★ 两种轴别混** | 折线：x = 时间戳、`spec_has_data` 要求 **≥2 点**；条形：x = **类别**、一个类别就该能画。`bar_spec_has_data` 是独立判据，别复用折线那套 |
+| **图定义仍在插件** | `plugins/oracle/charts.py`（`charts/__init__.py` 明确「表空间等 database-specific chart 归插件」）；公共层只提供**画法** |
+| **新图取数走 `ctx.tables`** | 这三张读的是**包内的表**（排行 / 汇总），不是 `ctx.timeseries` —— 与既有五张 Oracle 图的取数形态不同 |
+| **图题与 id 同源** | `plugins/oracle/charts.py::ORACLE_CHART_CAPTIONS` / `OS_CHART_CAPTIONS`；`word_report` 与 `report_adapter` **都从它取**，别再抄第二份 |
+| **★ 为什么** | `report_adapter` 是「**重建**」模型而非透传：没登记的 id 会把 caption 静默落回 `chart_id`（报告里图题变英文 id），没有任何测试会红 |
+| **新增 `table_snapshot` 来源词汇** | 报告来源原有 `historical` / `realtime_snapshot`；表数据图是**一次快照**，既非 SAR 历史也非实时采样。词汇不全时会被兜底成 `realtime_snapshot`，让只有排行图的章节被误加「短时采样」说明 |
+| **章节归属跨三章** | 表空间→`storage_capacity`、Top SQL→`oracle_performance`、归档→`backup_recovery`；单一来源仍是 `ORACLE_CHART_IDS`，守门钉「跨章节声明的并集 == 它」 |
+| **对既有图零影响** | 同一 1.4 包重跑：原有 8 张 PNG **逐字节相同**；`expected_summary` 只有 `charts` 8 → 10 |
+
+> ★★ **一条元教训（与批 13 同源）**：**适配器"重建"模型时，任何"两边各抄一份"的映射都会静默漂。**
+> 本批的图题表就是第三份拷贝 —— 新图一上线，`word_report` 侧有（中文明细），
+> `report_adapter` 侧没有 ⇒ caption 静默退化成 id。**收口到与 id 同源**才是终点。
+> 凡见 `X.get(key, key)` 这种"取不到就落回 key"的写法，先问"这个 key 会不会新增"。
+
