@@ -79,7 +79,7 @@ ORACLE_CHART_CAPTIONS = {
     "oracle_redo_rate": "Redo 速率",
     "oracle_parse_ratio": "解析率",
     "oracle_topsql_elapsed": "Top SQL 执行时间排行",
-    "oracle_tablespace_usage": "表空间使用率排行",
+    "oracle_tablespace_usage": "表空间容量使用率排行",
     "oracle_archive_daily": "每日归档量趋势",
 }
 

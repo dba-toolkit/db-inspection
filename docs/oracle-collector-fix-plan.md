@@ -1674,6 +1674,8 @@ DataGuard 的 5 项从这里开始展示，把"高可用"写进章名才名实�
 2. **P0-2 表空间图改口径**（`charts._tablespace_chart`）：图 × 表 6.1 × 规则层**三处同一算式**
    `USED_MB ÷ MAX_MB`；`MAX_MB` 缺失（老包）才退回 `PCT_USED`。图题改「表空间**容量**使用率」、
    x 轴标签写明「已用率（已使用 ÷ 最大可扩，%）」—— 口径写进图里，读者不用翻源码。
+   图片内标题与 **docx 图题**同出 `charts.ORACLE_CHART_CAPTIONS`（单源），一并改为「表空间容量使用率排行」
+   —— 此前图内标题已带口径、图题没带，读者得对照两处才知道分母是最大可扩。
 3. **P0-3 4.5 键名对齐**（`presentation`）：读 `Mounted on`/`Filesystem`/`Available`（旧拼法留作兜底），
    补「类型」列，新增 `_kb_human()` 把 KB 换算成 `64.30 GB`。同一处还加了 **`elif fs_rows:` 分支**：
    **全被过滤掉也要出项**（写 `not_applicable` + 一句说明），让"整机只有 tmpfs/光驱"与"这章漏采了"
