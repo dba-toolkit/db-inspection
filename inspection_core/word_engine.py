@@ -760,11 +760,23 @@ class WordReportEngine:
             # 是完全不同的结论，所以这里允许 item 自带更准确的空数据文案（如"已检查
             # 全部用户库，未产生缺失索引建议"）。没带时才退回通用措辞。
             empty_text = str(display.get("empty_text") or "").strip()
-            if not empty_text:
-                empty_text = "本次采集无相关记录。"
-                if collection.get("status") not in {"empty", "not_applicable"}:
-                    empty_text = "本项没有可展示的结构化记录。"
-            self.note_box("数据状态", empty_text, accent=COLOR_TEXT)
+            analysis = item.get("analysis") or {}
+            raw_conclusion = str(analysis.get("conclusion") or "").strip()
+            conclusion = text(analysis.get("conclusion")).strip() if raw_conclusion else ""
+            if not empty_text and conclusion:
+                # ★ 规则判定项（"CPU 压力评估""无效对象""物理坏块"…）**本就没有明细表**：
+                #   它的全部产出就是一条判定结论。此时落回"本项没有可展示的结构化记录"
+                #   是误导 —— 读的人会把"这是规则项"读成"采集失败 / 数据缺失"。
+                #   professional 布局把完整分析后置到章末小结，正文这里给一行结论；
+                #   detailed 布局紧接着会渲染完整分析块，正文不再重复。
+                if not include_analysis:
+                    self.note_box("分析结论", conclusion, accent=COLOR_TEXT)
+            else:
+                if not empty_text:
+                    empty_text = "本次采集无相关记录。"
+                    if collection.get("status") not in {"empty", "not_applicable"}:
+                        empty_text = "本项没有可展示的结构化记录。"
+                self.note_box("数据状态", empty_text, accent=COLOR_TEXT)
         if include_analysis:
             self.analysis_block(item.get("analysis") or {})
 
