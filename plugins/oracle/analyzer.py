@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import time
 from collections import Counter
 from pathlib import Path
@@ -224,4 +225,9 @@ class OracleAnalyzer:
             "comprehensive_conclusions": instances[0]["comprehensive_conclusions"] if instances else [],
         }
         write_json(self.output / "llm_input.json", llm)
+        # 解压副本收口（镜像 MySQL `Analyzer.analyze`）：四库统一 —— 默认不把原始包
+        # 解压副本留在 `analysis_output/`（含 SQL 明文，多开一个出口）；要留加 `--keep-extracted`。
+        # 所有产出（analysis / report_model / charts / llm_input）均不引用 `_work`，故此处删除是安全的。
+        if not self.keep_extracted:
+            shutil.rmtree(self.work, ignore_errors=True)
         return analysis

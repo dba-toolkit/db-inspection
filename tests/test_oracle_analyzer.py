@@ -41,6 +41,32 @@ class OracleAnalyzerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(len(instance["charts"]), summary["charts"])
 
+    def test_extracted_work_dir_is_removed_by_default(self) -> None:
+        """默认跑完不留解压副本 `_work`。
+
+        Oracle 侧此前 `keep_extracted` 是**死参数** —— 存了不用、cli 也不清，
+        于是 `analysis_output/_work/` 里始终躺着**原始采集包全文**（含 SQL 明文），
+        多跑几个包就累积、被打包外发等于多开一个出口。MySQL / PostgreSQL / SQL Server
+        三库都清，只有 Oracle 漏。本用例把这条钉死。
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            OracleAnalyzer(output).analyze([self.package])
+            self.assertFalse(
+                (output / "_work").exists(),
+                "默认必须删除 _work（解压副本不得留在 output）",
+            )
+
+    def test_keep_extracted_retains_work_dir(self) -> None:
+        """`--keep-extracted` 必须真正生效（此前 Oracle 侧该参数对行为无影响）。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            OracleAnalyzer(output, keep_extracted=True).analyze([self.package])
+            self.assertTrue(
+                (output / "_work").exists(),
+                "keep_extracted=True 应保留 _work",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
