@@ -32,6 +32,7 @@ from inspection_core.charts import (
     has_matplotlib,
     os_chart_specs,
     parse_chart_time,
+    render_bar_spec,
     render_spec,
 )
 from inspection_core.charts.style import COLOR_MAP
@@ -49,10 +50,38 @@ ORACLE_CHART_IDS = (
     "oracle_logical_vs_physical",
     "oracle_redo_rate",
     "oracle_parse_ratio",
+    # 批 12b：下面三张的数据源是**包内的表**（非实时采样时序），形态与上面五张
+    # 不同，但同样受「产出 == 声明」约束，故一并登记在这份唯一清单里。
+    "oracle_tablespace_usage",
+    "oracle_topsql_elapsed",
+    "oracle_archive_daily",
 )
 
 # matplotlib 缺失时只影响上面这五张 Oracle 专属图。
 _MATPLOTLIB_REASON = "matplotlib_not_installed"
+
+# 单张排行图最多画多少个类别（表空间 / Top SQL 共用）。
+_TOP_N = 10
+
+# 图题（呈现层文案）与图 id **同源**，放一起 —— 谁抄第二份，新图上线时就会静默退化：
+# `report_adapter` 是「重建」模型而非透传，没有登记的 id 会把 caption 落回 chart_id，
+# 报告里图题直接变成英文 id。word_report 与 report_adapter 都从这里取。
+OS_CHART_CAPTIONS = {
+    "SYSTEM_CPU": "CPU 使用率趋势",
+    "SYSTEM_MEMORY": "内存使用率趋势",
+    "SYSTEM_DISK": "磁盘 I/O 趋势",
+    "SYSTEM_NETWORK_REALTIME": "网络吞吐趋势",
+}
+ORACLE_CHART_CAPTIONS = {
+    "oracle_txn_rate": "事务速率",
+    "oracle_physical_io": "物理 I/O 趋势",
+    "oracle_logical_vs_physical": "逻辑读与物理读",
+    "oracle_redo_rate": "Redo 速率",
+    "oracle_parse_ratio": "解析率",
+    "oracle_topsql_elapsed": "Top SQL 执行时间排行",
+    "oracle_tablespace_usage": "表空间使用率排行",
+    "oracle_archive_daily": "每日归档量趋势",
+}
 
 
 def _pairs(rows: list[dict[str, Any]], values: list[dict[str, Any]], key: str,
@@ -80,6 +109,7 @@ class OracleChartProvider:
         tag = str(ctx.snapshot.get("instance_tag") or "oracle")
         records = self._os_charts(ctx, tag)
         records.extend(self._oracle_charts(ctx, tag, metrics))
+        records.extend(self._table_charts(ctx, tag))
         return records
 
     # ── 公共 OS 四张 ─────────────────────────────────────────────────────────
@@ -199,3 +229,156 @@ class OracleChartProvider:
             _figure("Oracle Exec Rate & Hard Parse %", "exec/s", "oracle_parse_ratio",
                     [("exec/s", execs)], secondary=("hard parse %", ratio), points=len(execs))
         return records
+
+
+    # ── 表数据三张（批 12b）─────────────────────────────────────────────────
+    def _table_charts(self, ctx: Any, tag: str) -> list[dict[str, Any]]:
+        """三张「有数据没画」的图：表空间 Top-N / Top SQL Top-N / 归档量趋势。
+
+        与 ``_oracle_charts`` 的区别在**数据形态**：那五张画的是实时采样派生速率
+        （``ctx.timeseries``），这三张读的是包里的表（``ctx.tables``）—— 表空间用量、
+        Top SQL、归档量都是**一次快照的排行/汇总**，不是时间序列。
+        """
+        records: list[dict[str, Any]] = []
+        records.extend(self._tablespace_chart(ctx))
+        records.extend(self._topsql_chart(ctx))
+        records.extend(self._archive_chart(ctx))
+        return records
+
+    def _tablespace_chart(self, ctx: Any) -> list[dict[str, Any]]:
+        rows = _rows(ctx, "oracle.tablespace.usage", "所有表空间容量使用情况",
+                     "tablespace.usage")
+        items: list[tuple[str, float]] = []
+        for row in rows:
+            name = _text(row, "TABLESPACE_NAME")
+            used = _number(row, "PCT_USED")
+            if not name or used is None:
+                continue
+            items.append((name, used))
+        items.sort(key=lambda pair: pair[1], reverse=True)
+        items = items[:_TOP_N]
+        if not items:
+            return []
+        spec = {
+            "chart_id": "oracle_tablespace_usage",
+            "title": f"表空间使用率 TOP{len(items)}",
+            "categories": [name for name, _ in items],
+            "values": [value for _, value in items],
+            "value_suffix": "%",
+            "xmax": 100.0,
+            "alert_threshold": 90.0,
+            "xlabel": "已用率（%）",
+            "filename": "oracle_tablespace_usage.png",
+            "source_scope": "table_snapshot",
+        }
+        return self._bar_record(spec)
+
+    def _topsql_chart(self, ctx: Any) -> list[dict[str, Any]]:
+        rows = _rows(ctx, "oracle.topsql.elapsed_time", "Top 20 SQL (按执行时间)",
+                     "topsql.elapsed_time")
+        items: list[tuple[str, float]] = []
+        for row in rows:
+            sql_id = _text(row, "SQL_ID")
+            elapsed = _number(row, "ELAPSED_MIN")
+            if not sql_id or elapsed is None:
+                continue
+            items.append((sql_id, elapsed))
+        items.sort(key=lambda pair: pair[1], reverse=True)
+        items = items[:_TOP_N]
+        if not items:
+            return []
+        spec = {
+            "chart_id": "oracle_topsql_elapsed",
+            "title": f"Top SQL 执行时间 TOP{len(items)}",
+            "categories": [sql_id for sql_id, _ in items],
+            "values": [value for _, value in items],
+            "value_suffix": "min",
+            "xlabel": "执行时间（分钟）",
+            "filename": "oracle_topsql_elapsed.png",
+            "source_scope": "table_snapshot",
+        }
+        return self._bar_record(spec)
+
+    def _archive_chart(self, ctx: Any) -> list[dict[str, Any]]:
+        rows = _rows(ctx, "oracle.archive.daily_30d", "近30天每日归档量")
+        pairs: list[tuple[str, float]] = []
+        for row in rows:
+            day = _text(row, "DAY")
+            gb = _number(row, "DAY_GB")
+            if not day or gb is None:
+                continue
+            pairs.append((day, gb))
+        pairs.sort(key=lambda pair: pair[0])  # 按日期升序，折线才连得对
+        if len(pairs) < 2:
+            return []
+        spec = {
+            "chart_id": "oracle_archive_daily",
+            "title": "每日归档量（近 30 天）",
+            "x": [day for day, _ in pairs],
+            "panels": [("", "GB", [("归档量", [gb for _, gb in pairs])])],
+            "source_scope": "historical",
+            "filename": "oracle_archive_daily.png",
+        }
+        result = render_spec(ctx, spec, self.charts_dir, self.charts_dir)
+        if result.get("status") != "generated":
+            return []
+        path = self.charts_dir / spec["filename"]
+        return [{
+            "chart_id": result["chart_id"], "path": str(path.resolve()),
+            "status": "generated", "source_scope": result["source_scope"],
+            "source_points": result["source_points"], "renderer": result["renderer"],
+            "duration_ms": result["duration_ms"],
+        }]
+
+    def _bar_record(self, spec: dict[str, Any]) -> list[dict[str, Any]]:
+        result = render_bar_spec(spec, self.charts_dir, self.charts_dir)
+        if result.get("status") != "generated":
+            return []
+        path = self.charts_dir / spec["filename"]
+        return [{
+            "chart_id": result["chart_id"], "path": str(path.resolve()),
+            "status": "generated", "source_scope": result["source_scope"],
+            "source_points": result["source_points"], "renderer": result["renderer"],
+            "duration_ms": result["duration_ms"],
+        }]
+
+
+def _rows(ctx: Any, *names: str) -> list[dict[str, str]]:
+    """按候选键取包内表；先走 adapter 的 ``find_table``（带子串兜底），再退化为直查。
+
+    退化分支是给**测试替身**留的：合成 ctx 未必是完整 adapter 子类，但 ``tables``
+    这个字典是基类就有的。
+    """
+    finder = getattr(ctx, "find_table", None)
+    if callable(finder):
+        rows = finder(*names)
+        if rows:
+            return rows
+    tables = getattr(ctx, "tables", None) or {}
+    for name in names:
+        rows = tables.get(name)
+        if rows:
+            return rows
+    return []
+
+
+def _text(row: dict[str, Any], *names: str) -> str:
+    """取字符串列，容忍列名大小写差异与 sqlplus 表头截断（前缀互含）。"""
+    upper = {str(key).upper(): key for key in row}
+    for name in names:
+        wanted = name.upper()
+        if wanted in upper and str(row.get(upper[wanted]) or "").strip():
+            return str(row[upper[wanted]]).strip()
+    for name in names:
+        wanted = name.upper()
+        for key, original in upper.items():
+            if len(key) >= 4 and (wanted.startswith(key) or key.startswith(wanted)):
+                value = str(row.get(original) or "").strip()
+                if value:
+                    return value
+    return ""
+
+
+def _number(row: dict[str, Any], *names: str) -> float | None:
+    return safe_float(_text(row, *names))
+

@@ -11,23 +11,34 @@ from inspection_core.word_engine import (
     WordReportProfile,
 )
 
-from .charts import ORACLE_CHART_IDS, OS_CHART_IDS
+from .charts import (
+    ORACLE_CHART_CAPTIONS as _ORACLE_CHART_CAPTIONS,
+    ORACLE_CHART_IDS,
+    OS_CHART_CAPTIONS as _OS_CHART_CAPTIONS,
+    OS_CHART_IDS,
+)
 
-# 图题属呈现层，留在报告层；**图的 id 清单不在这里手抄** —— 它来自
-# ``plugins/oracle/charts.py::ORACLE_CHART_IDS``，产出与声明共用一份，
-# 两边分叉时 `tests/test_oracle_chart_coverage.py` 会红。
-_ORACLE_CHART_CAPTIONS = {
-    "oracle_txn_rate": "事务速率",
-    "oracle_physical_io": "物理 I/O 趋势",
-    "oracle_logical_vs_physical": "逻辑读与物理读",
-    "oracle_redo_rate": "Redo 速率",
-    "oracle_parse_ratio": "解析率",
-}
-_OS_CHART_CAPTIONS = {
-    "SYSTEM_CPU": "CPU 使用率趋势",
-    "SYSTEM_MEMORY": "内存使用率趋势",
-    "SYSTEM_DISK": "磁盘 I/O 趋势",
-    "SYSTEM_NETWORK_REALTIME": "网络吞吐趋势",
+# 图的 id 与图题都**不再在这里手抄** —— 它们同源在 ``plugins/oracle/charts.py``
+# （``ORACLE_CHART_IDS`` / ``ORACLE_CHART_CAPTIONS``），产出与声明共用一份。
+# 两份分叉时 `tests/test_oracle_chart_coverage.py` 会红；图题若另抄一份，
+# 新图上线时会静默退化成英文 chart_id（适配器重建模型，见 report_adapter）。
+
+
+# 每张 Oracle 专属图挂到报告的哪一章（顺序即章节内上图次序）。
+# ★ 这份「章节归属」是**报告层**信息，产出层（charts.py）不管 —— 但两张表的
+#   并集必须等于 ``ORACLE_CHART_IDS``（不重不漏），由
+#   `tests/test_oracle_chart_coverage.py` 钉住。新增/搬动图时两处都要动。
+_ORACLE_CHART_SECTIONS = {
+    "oracle_performance": (
+        "oracle_txn_rate",
+        "oracle_physical_io",
+        "oracle_logical_vs_physical",
+        "oracle_redo_rate",
+        "oracle_parse_ratio",
+        "oracle_topsql_elapsed",
+    ),
+    "storage_capacity": ("oracle_tablespace_usage",),
+    "backup_recovery": ("oracle_archive_daily",),
 }
 
 
@@ -65,13 +76,16 @@ ORACLE_WORD_PROFILE = WordReportProfile(
                 for chart_id in OS_CHART_IDS
             ),
         ),
-        "oracle_performance": SectionChartProfile(
-            model_field="oracle_analysis",
-            charts=tuple(
-                ChartDefinition(chart_id, _ORACLE_CHART_CAPTIONS[chart_id])
-                for chart_id in ORACLE_CHART_IDS
-            ),
-        ),
+        **{
+            section_id: SectionChartProfile(
+                model_field="oracle_analysis",
+                charts=tuple(
+                    ChartDefinition(chart_id, _ORACLE_CHART_CAPTIONS[chart_id])
+                    for chart_id in chart_ids
+                ),
+            )
+            for section_id, chart_ids in _ORACLE_CHART_SECTIONS.items()
+        },
     },
     sample_points_key="oracle_sample_points",
     sample_points_label="Oracle 采样点",

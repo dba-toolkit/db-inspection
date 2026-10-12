@@ -19,22 +19,20 @@ REPORT_SCHEMA = "2.0"
 FACT_CONCLUSION = "已采集并展示本项巡检事实，不单独形成风险判断。"
 NO_RECORD_CONCLUSION = "未采集到结构化记录，本项不作通过结论。"
 
-_CHART_CAPTIONS = {
-    # 系统四张来自公共 OS 层（inspection_core.charts.specs.OS_CHART_IDS 同一集合）
-    "SYSTEM_CPU": "CPU 使用率趋势",
-    "SYSTEM_MEMORY": "内存使用率趋势",
-    "SYSTEM_DISK": "磁盘 I/O 趋势",
-    "SYSTEM_NETWORK_REALTIME": "网络吞吐趋势",
-    "oracle_physical_io": "物理 I/O 趋势",
-    "oracle_logical_vs_physical": "逻辑读与物理读",
-    "oracle_redo_rate": "Redo 速率",
-    "oracle_parse_ratio": "解析率",
-}
+from .charts import ORACLE_CHART_CAPTIONS, OS_CHART_CAPTIONS
+
+# 图题与图 id 同源（``plugins/oracle/charts.py``），**不在这里抄第二份**：
+# 适配器是「重建」模型而非透传，抄一份就会在新图上线时把 caption 静默落回
+# chart_id（报告里图题变成英文 id），且没有任何测试会红。
+_CHART_CAPTIONS = {**OS_CHART_CAPTIONS, **ORACLE_CHART_CAPTIONS}
 
 # 公共渲染器用 sar_history / realtime_snapshot 表达来源，报告模型的历史词汇是
 # historical；两者在这里对齐一次，避免下游再按图名猜。
 _HISTORICAL_SCOPES = {"historical", "sar_history"}
-REPORT_SCOPES = ("historical", "realtime_snapshot")
+# 报告模型的来源词汇：历史 / 实时短采样 / **表数据快照**（排行、汇总 —— 一次查询的
+# 结果，既不是 SAR 历史，也不是采集窗口内的实时采样）。词汇不全时新图会被兜底成
+# realtime_snapshot，让只有排行图的章节（存储容量 / 备份）被误加「短时采样」说明。
+REPORT_SCOPES = ("historical", "realtime_snapshot", "table_snapshot")
 
 
 def _source_scope(chart: dict[str, Any], chart_id: str) -> str:
@@ -42,7 +40,7 @@ def _source_scope(chart: dict[str, Any], chart_id: str) -> str:
     if scope in _HISTORICAL_SCOPES:
         return "historical"
     if scope in REPORT_SCOPES:
-        return "realtime_snapshot"
+        return scope
     # 旧报告模型没有 scope 字段：按图名兜底（SYSTEM_* / sar_* 来自 SAR 历史）。
     return "historical" if chart_id.startswith(("SYSTEM_", "system_", "sar_")) else "realtime_snapshot"
 

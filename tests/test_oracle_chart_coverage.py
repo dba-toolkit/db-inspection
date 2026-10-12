@@ -41,7 +41,7 @@ _RATE_KEYS = (
 )
 
 
-def context(timeseries: dict | None = None) -> PackageContext:
+def context(timeseries: dict | None = None, tables: dict | None = None) -> PackageContext:
     return PackageContext(
         source=Path("synthetic.tar.gz"),
         root=Path("."),
@@ -54,7 +54,27 @@ def context(timeseries: dict | None = None) -> PackageContext:
         integrity={"status": "ok"},
         history={},
         timeseries=timeseries or {},
+        tables=tables or {},
     )
+
+
+def table_rows() -> dict[str, list[dict[str, str]]]:
+    """批 12b 三张「表数据图」的合成输入 —— 喂足时它们必须全部产出。"""
+    return {
+        "oracle.tablespace.usage": [
+            {"TABLESPACE_NAME": "SYSTEM", "PCT_USED": "99.98"},
+            {"TABLESPACE_NAME": "SYSAUX", "PCT_USED": "86.8"},
+        ],
+        "oracle.topsql.elapsed_time": [
+            {"SQL_ID": "b6usrg82hwsa3", "ELAPSED_MIN": "1.5"},
+            {"SQL_ID": "0gwc9vhhygvbb", "ELAPSED_MIN": "0.5"},
+        ],
+        "oracle.archive.daily_30d": [
+            {"DAY": "2026-10-01", "DAY_GB": "12.5"},
+            {"DAY": "2026-10-02", "DAY_GB": "13.1"},
+            {"DAY": "2026-10-03", "DAY_GB": "11.8"},
+        ],
+    }
 
 
 def sysstat_rows(count: int = 6) -> list[dict[str, str]]:
@@ -77,8 +97,17 @@ def declared_ids(section_id: str) -> list[str]:
 
 class OracleChartCoverageTests(unittest.TestCase):
     def test_declared_oracle_charts_are_the_single_source(self) -> None:
-        # 不是"两边各写一份碰巧相等"，而是声明就是从 ORACLE_CHART_IDS 派生的。
-        self.assertEqual(declared_ids("oracle_performance"), list(ORACLE_CHART_IDS))
+        # 声明现在**跨三个章节**（性能 / 容量 / 备份），按并集比对：
+        # 不重、不漏、不多 —— 单一来源仍是 ORACLE_CHART_IDS。
+        # ★ 过滤条件是「**排除** OS 图」，绝不能写成「**保留**在 ORACLE_CHART_IDS 里的」：
+        #   后者会把"声明了但没登记"的图静默滤掉，让这种不一致反而变绿
+        #   （负控制实测：从 ORACLE_CHART_IDS 删掉 oracle_tablespace_usage 时旧断言仍通过）。
+        #   必须先取全量、再比对 —— 断言形式与被测对象要匹配。
+        declared = [item.chart_id
+                    for section in ORACLE_WORD_PROFILE.section_charts.values()
+                    for item in section.charts
+                    if item.chart_id not in OS_CHART_IDS]
+        self.assertEqual(sorted(declared), sorted(ORACLE_CHART_IDS))
 
     def test_declared_os_charts_are_the_shared_source(self) -> None:
         self.assertEqual(declared_ids("system_performance"), list(OS_CHART_IDS))
@@ -99,11 +128,12 @@ class OracleChartCoverageTests(unittest.TestCase):
     def test_provider_can_produce_every_declared_id(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             provider = OracleChartProvider(Path(temporary))
-            ctx = context({"oracle_sysstat": sysstat_rows()})
+            ctx = context({"oracle_sysstat": sysstat_rows()}, table_rows())
             produced = [record["chart_id"]
                         for record in provider.generate(ctx, metrics_with(rich_rates()))]
-            self.assertEqual(produced, list(ORACLE_CHART_IDS))
-            self.assertEqual(set(produced), set(declared_ids("oracle_performance")))
+            # 章节内顺序由 section_charts 定义，此处只钉「产出集合 == 单一来源」。
+            self.assertEqual(set(produced), set(ORACLE_CHART_IDS))
+            self.assertEqual(len(produced), len(ORACLE_CHART_IDS))
 
     @unittest.skipUnless(has_matplotlib(), "需要 matplotlib 才能出图")
     def test_flat_series_drops_one_chart_but_not_the_declaration(self) -> None:
@@ -135,6 +165,30 @@ class OracleChartCoverageTests(unittest.TestCase):
                     provider.generate(ctx, metrics_with(rich_rates()))
         finally:
             charts_module.ORACLE_CHART_IDS = original
+
+
+class OracleTableChartPlacementTests(unittest.TestCase):
+    """批 12b：三张表数据图的章节挂载 + 缺数据时的运行期行为。"""
+
+    def test_new_charts_are_mounted_on_expected_sections(self) -> None:
+        sections = {section_id: [item.chart_id for item in profile.charts]
+                    for section_id, profile in ORACLE_WORD_PROFILE.section_charts.items()}
+        self.assertEqual(sections.get("storage_capacity"), ["oracle_tablespace_usage"])
+        self.assertEqual(sections.get("backup_recovery"), ["oracle_archive_daily"])
+        self.assertIn("oracle_topsql_elapsed", sections.get("oracle_performance", []))
+
+    @unittest.skipUnless(has_matplotlib(), "需要 matplotlib 才能出图")
+    def test_table_charts_are_skipped_without_table_data(self) -> None:
+        # 表数据缺失是**运行期数据事实**：三张新图不产出，但声明集合不跟着漂。
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OracleChartProvider(Path(temporary))
+            ctx = context({"oracle_sysstat": sysstat_rows()})  # 无 tables
+            produced = [record["chart_id"]
+                        for record in provider.generate(ctx, metrics_with(rich_rates()))]
+            for chart_id in ("oracle_tablespace_usage", "oracle_topsql_elapsed",
+                             "oracle_archive_daily"):
+                self.assertNotIn(chart_id, produced)
+                self.assertIn(chart_id, ORACLE_CHART_IDS)
 
 
 if __name__ == "__main__":

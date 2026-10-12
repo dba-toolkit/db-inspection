@@ -83,11 +83,13 @@ class OraclePluginTests(unittest.TestCase):
     def test_adapter_normalizes_charts(self) -> None:
         result = adapt_report_model(load_source())
         charts = result["oracle_analysis"]["charts"]
-        # 系统四张来自公共 OS 层，Oracle 专属四张留在插件：共 8 张。
+        # 系统四张来自公共 OS 层，Oracle 专属图留在插件：批 12b 后共 10 张
+        # （时序 4 张 + 表数据 2 张；归档那张因本包近 30 天无归档数据 skip）。
         self.assertEqual([chart["chart_id"] for chart in charts], [
             "SYSTEM_CPU", "SYSTEM_MEMORY", "SYSTEM_DISK", "SYSTEM_NETWORK_REALTIME",
             "oracle_physical_io", "oracle_logical_vs_physical",
             "oracle_redo_rate", "oracle_parse_ratio",
+            "oracle_tablespace_usage", "oracle_topsql_elapsed",
         ])
         self.assertTrue(all(chart["status"] == "generated" for chart in charts))
         self.assertTrue(all(chart["file"].startswith("charts/") for chart in charts))
@@ -104,6 +106,10 @@ class OraclePluginTests(unittest.TestCase):
                 "oracle_logical_vs_physical": "realtime_snapshot",
                 "oracle_redo_rate": "realtime_snapshot",
                 "oracle_parse_ratio": "realtime_snapshot",
+                # 表数据图是**一次快照**（排行/汇总），既非 SAR 历史也非实时采样，
+                # 单列 table_snapshot —— 否则只有排行图的章节会被误加「短时采样」说明。
+                "oracle_tablespace_usage": "table_snapshot",
+                "oracle_topsql_elapsed": "table_snapshot",
             },
         )
 
@@ -138,7 +144,8 @@ class OraclePluginTests(unittest.TestCase):
             self.assertIn("23 / 100", table_text)
             self.assertIn("NOARCHIVELOG", table_text)
             # 8 张技术图 + 封面 1 个 logo；逐张都从 charts/ 取到才会被内嵌。
-            self.assertEqual(len(generated.inline_shapes), 9)
+            # 10 张图 + 1 个 logo（归档那张按数据空 skip，不占图位）。
+            self.assertEqual(len(generated.inline_shapes), 11)
 
 
 if __name__ == "__main__":
