@@ -16,6 +16,13 @@
     取数层的折行（`COLUMN value FORMAT a80`）已经在批 16 修掉，但展示层这一刀正好也落在**第 80 个
     字符**上 —— 两处截断肉眼与截图完全一致，报告里**看不出已经修了**。
 
+批 18 追加（审查意见：「很多表格的说明都是空的，不能填吗？」）：
+  · 批 18 `数据库身份` / `数据库配置概要` 的**说明列整列为空**（22 行）。空格子不报错、
+    不抛异常 —— 读者分不清「这项没有说明」与「这项没有数据」，是批 17「未采集 ≠ -」的
+    第三种混淆。补的是**口径**（这个值是什么、取自哪个视图），与 MySQL 一致，不是建议。
+  · 同批发现：`PGA 总分配` 取的是 `pga_rows[0]`，而 `v$pgastat` 第一行实测是
+    `total PGA inuse` ⇒ **名字写"总分配"、值是"当前占用"**（差一倍）。
+
 用**合成 ctx / 合成表**，不连库、不读采集包，改哪条断言哪条。
 """
 from __future__ import annotations
@@ -430,6 +437,114 @@ class MissingEvidenceValueTests(unittest.TestCase):
         self.assertEqual(values["CPU 型号"], "Intel(R) Xeon(R) Gold 6248R CPU @ 3.00GHz")
         self.assertEqual(values["CPU 核数"], "96")
         self.assertEqual(values["NUMA 节点"], "2")
+
+
+class RowNoteCoverageTests(unittest.TestCase):
+    """批 18：`数据库身份` / `数据库配置概要` 的**说明列不得为空**。
+
+    病：`_val_row(name, value)` 的第三参有默认值 ⇒ 两张表整列为空（Oracle 30 行里 22 行，
+    1.4 / 2.0 两包实测一致）。空格子在报告里不报错、不抛异常、测试不红 —— 读者只能猜
+    「这项本来没有说明」还是「这项没有数据」，是批 17「未采集 ≠ `-`」的第三种混淆。
+
+    口径与 MySQL 一致（`CONFIG_GROUP_VARIABLES`）：说明列写**释义**（这个值是什么、取自
+    哪个视图），**不写建议** —— 建议在摘要表「依据与建议」与每项「分析结论」两列。
+
+    ★ 为什么把整列拉成序列对账、而不是抽查两行：说明是**逐行**写的，漏一行不会报错；
+      只有把整列的键序列摆出来才看得见（同「目录与正文是两处独立算式」那条）。
+    ★ 兜底也要断言：SGA 组件名由数据库给出，换版本多一个组件时不许退回空格子。
+    """
+
+    CHARSET_ROWS = [
+        {"PARAMETER": "NLS_CHARACTERSET", "VALUE": "AL32UTF8"},
+        {"PARAMETER": "NLS_DATE_FORMAT", "VALUE": "DD-MON-RR"},
+        {"PARAMETER": "NLS_LANGUAGE", "VALUE": "AMERICAN"},
+        {"PARAMETER": "NLS_NCHAR_CHARACTERSET", "VALUE": "AL16UTF16"},
+        {"PARAMETER": "NLS_TERRITORY", "VALUE": "AMERICA"},
+    ]
+    DB_INFO_ROWS = [{
+        "NAME": "ZYDB", "DB_UNIQUE_NAME": "zydb", "DATABASE_ROLE": "PRIMARY",
+        "OPEN_MODE": "READ WRITE", "LOG_MODE": "NOARCHIVELOG",
+        "CREATED": "2026-06-05 18:19:40",
+    }]
+    SGA_ROWS = [
+        {"NAME": "Database Buffers", "MB": "1168"},
+        {"NAME": "Variable Size", "MB": "464"},
+        {"NAME": "Fixed Size", "MB": "8.49"},
+        {"NAME": "Redo Buffers", "MB": "7.51"},
+    ]
+    # `v$pgastat` 的真实顺序：`total PGA inuse` 排在 `total PGA allocated` 前面
+    # （采集 SQL 没有 ORDER BY）—— 这正是"取第一行"会拿错的原因。
+    PGA_ROWS = [
+        {"NAME": "total PGA inuse", "VALUE": "134217728"},
+        {"NAME": "total PGA allocated", "VALUE": "268435456"},
+        {"NAME": "maximum PGA allocated", "VALUE": "536870912"},
+    ]
+
+    def _rows(self, item_id: str, tables: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        return build(tables or {})[item_id]["display"]["rows"]
+
+    def _notes(self, item_id: str, tables: dict[str, Any] | None = None) -> dict[str, str]:
+        return {str(row["检查项"]): str(row["说明"]) for row in self._rows(item_id, tables)}
+
+    def _config_tables(self, sga: list[dict[str, Any]] | None = None,
+                       pga: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        return {
+            "数据库基本信息": list(self.DB_INFO_ROWS),
+            "数据库字符集": list(self.CHARSET_ROWS),
+            "SGA 汇总信息": list(self.SGA_ROWS if sga is None else sga),
+            "PGA 统计": list(self.PGA_ROWS if pga is None else pga),
+        }
+
+    def test_identity_rows_all_carry_a_note(self) -> None:
+        notes = self._notes("oracle.identity")
+        self.assertEqual(
+            sorted(notes),
+            sorted(["数据库名", "实例名", "版本", "角色", "RAC", "CDB/PDB", "ASM"]),
+        )
+        for name, note in notes.items():
+            self.assertTrue(note.strip(), f"数据库身份 / {name} 的说明为空")
+
+    def test_db_config_rows_all_carry_a_note(self) -> None:
+        notes = self._notes("oracle.db_config", self._config_tables())
+        # 15 行 = 6 固定项 + 4 个 NLS + 4 个 SGA 组件 + PGA
+        self.assertEqual(len(notes), 15)
+        self.assertEqual(
+            sorted(notes),
+            sorted([
+                "DB_NAME", "DB_UNIQUE_NAME", "数据库角色", "打开模式", "归档模式", "创建时间",
+                "NLS_CHARACTERSET", "NLS_NCHAR_CHARACTERSET", "NLS_LANGUAGE", "NLS_DATE_FORMAT",
+                "SGA / Database Buffers", "SGA / Variable Size", "SGA / Fixed Size",
+                "SGA / Redo Buffers", "PGA 总分配",
+            ]),
+        )
+        for name, note in notes.items():
+            self.assertTrue(note.strip(), f"数据库配置概要 / {name} 的说明为空")
+
+    def test_unknown_sga_component_still_gets_a_note(self) -> None:
+        """兜底：`v$sga` 换版本多出组件（如 `Log Buffer` 之外的新组件）时不许是空格子。"""
+        tables = self._config_tables(sga=[{"NAME": "New Fancy Pool", "MB": "16"}])
+        notes = self._notes("oracle.db_config", tables)
+        self.assertEqual(notes["SGA / New Fancy Pool"], "SGA 组件（v$sga）")
+
+    def test_nls_territory_is_not_promoted_into_the_table(self) -> None:
+        """防误伤：口径表同时是「概要表展示哪些 NLS 参数」的单一来源，不许顺手多收一行。
+
+        `nls_database_parameters` 里还有 `NLS_TERRITORY`，报告此前只展示 4 项 ——
+        补说明不得把展示范围一起改掉。
+        """
+        notes = self._notes("oracle.db_config", self._config_tables())
+        self.assertNotIn("NLS_TERRITORY", notes)
+
+    def test_pga_row_matches_its_label(self) -> None:
+        """行名是「PGA 总分配」⇒ 值必须取 `total PGA allocated`，不是第一行的 inuse。"""
+        rows = {str(r["检查项"]): r["采集值"] for r in self._rows("oracle.db_config", self._config_tables())}
+        self.assertEqual(rows["PGA 总分配"], "256 MB")
+
+    def test_pga_falls_back_when_allocated_row_is_missing(self) -> None:
+        """防误伤：`total PGA allocated` 缺行时退回第一行，不许变成空白。"""
+        tables = self._config_tables(pga=[{"NAME": "total PGA inuse", "VALUE": "134217728"}])
+        rows = {str(r["检查项"]): r["采集值"] for r in self._rows("oracle.db_config", tables)}
+        self.assertEqual(rows["PGA 总分配"], "128 MB")
 
 
 if __name__ == "__main__":
