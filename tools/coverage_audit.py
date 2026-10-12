@@ -13,7 +13,8 @@
 每个类别分四档：
 
 * ``consumed``      —— 源码**真读取**了它（``ctx.tables.get("x")`` /
-  ``ctx.tables["x"]`` / ``ctx.root / "tables/x.tsv"`` / ``ctx.history.get("x")`` …）。
+  ``ctx.tables["x"]`` / ``ctx.find_table("x", …)`` / ``ctx.table_fetch("x", …)`` /
+  ``ctx.root / "tables/x.tsv"`` / ``ctx.history.get("x")`` …）。
 * ``declared_only`` —— 只在 source / evidence_refs 这类**声明字符串**里出现，
   代码并没有读它的数据。**这是"声明了来源却没读"的隐蔽缺口**
   （如某些巡检项的 ``source`` 写着两张表，实际只读了一张）。
@@ -131,6 +132,44 @@ def collect_references(
     return references
 
 
+# 多参数取数：``ctx.find_table("A", "B")`` / ``ctx.table_fetch("A", "B")``。
+# ★ 这类调用一次给多个**别名**（按优先级），一个正则组装不下 —— 单独走
+#   `collect_multi_arg_table_calls` 把参数表里的字面量全收进来。
+#   批 19 起 Oracle 的取数点大量从 ``ctx.tables.get(单个键)`` 迁到 ``table_fetch(多别名)``
+#   （为的是同时拿到"采集侧状态"），不认这两种写法就会把**真读了的表**打成"无人提及"。
+_MULTI_ARG_TABLE_CALL = re.compile(
+    r"""ctx\.(?:find_table|table_fetch|find_table_fetch)\(""",
+)
+_STRING_LITERAL = re.compile(r"""["']([^"']+)["']""")
+
+
+def _iter_source_files(sources: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for source in sources:
+        files.extend([source] if source.is_file() else sorted(source.rglob("*.py")))
+    return files
+
+
+def collect_multi_arg_table_calls(sources: list[Path]) -> set[str]:
+    """回收 ``ctx.find_table(...)`` / ``ctx.table_fetch(...)`` 各参数里的表键字面量。"""
+    found: set[str] = set()
+    for path in _iter_source_files(sources):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in _MULTI_ARG_TABLE_CALL.finditer(text):
+            # 从 `(` 起配平括号，取整段实参文本再抠字符串字面量。
+            depth, index = 0, match.end() - 1
+            while index < len(text):
+                if text[index] == "(":
+                    depth += 1
+                elif text[index] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            found.update(_STRING_LITERAL.findall(text[match.end():index]))
+    return found
+
+
 def collect_evidence_via_directory_variable(sources: list[Path]) -> set[str]:
     """回收「目录变量 + 文件名常量」写法的 evidence 引用。
 
@@ -168,6 +207,7 @@ def audit(
     """对比「采集面」与「消费面」，返回结构化结果。"""
     collected = enumerate_collected(package)
     read = collect_references(sources, READ_PATTERNS)
+    read["tables"] |= collect_multi_arg_table_calls(sources)
     read["evidence"] |= collect_evidence_via_directory_variable(sources)
     declared = collect_references(sources, DECLARE_PATTERNS)
     categories: dict[str, object] = {}
