@@ -58,11 +58,14 @@ class OraclePluginTests(unittest.TestCase):
             for section in result["inspection_sections"]
             for item in section["items"]
         ]
-        # 事实型条目：有行 → normal，无行 → 保持 not_evaluated（绝不冒充"通过"）。
-        # 批 13 新增 24 项里 14 项有数据（normal）、9 项无行（not_evaluated）、
-        # 1 项由规则给结论（口令 Profile 偏弱 → attention）。
-        self.assertEqual(statuses.count("normal"), 49)
-        self.assertEqual(statuses.count("not_evaluated"), 17)
+        # 事实型条目：有行 → normal；无行时**按采集状态分叉**：
+        #   · 查过、确认没有（collection.status == "empty"，如 SQL Plan Baseline）
+        #     → normal，结论「已检查，本次未发现相关记录。」—— 这是干净的结论，
+        #       正文早已这么写，小结不能再压成"未采集"（同一件事两种说法）；
+        #   · 根本没采到 / 不适用 → 保持 not_evaluated，**绝不冒充"通过"**。
+        # 批 15 把这两类拆开（此前一起压成 not_evaluated）。
+        self.assertEqual(statuses.count("normal"), 57)
+        self.assertEqual(statuses.count("not_evaluated"), 9)
         # LIBRARY_CACHE 在第⑦步升为 critical，对应巡检项由 attention 变 risk（3→4 / 6→5）。
         self.assertEqual(statuses.count("risk"), 4)
         self.assertEqual(statuses.count("attention"), 6)

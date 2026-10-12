@@ -39,7 +39,14 @@ LOGO = PROJECT_ROOT / "assets" / "logo.png"
 # 控制变量自证：把这 5 处逐字改回旧形态、model 一字不动重渲染，hash 精确回到 E64A9473…
 # （`_work/_ctrl_hash3.py`，含 finally 逐字节复原断言）。旧值：
 # E64A94737ADA4E2DE18CE6D407DA8C737C20BE857D6ADEBC3CB2B32766970FAB
-PRE_SPLIT_NORMALIZED_DOCUMENT_XML = "D34B7A1BD8144180AC46A9ECBE5F1D8A63827970682546BD36D63CFC0D8A44B5"
+# 2026-10-12（批 15）：规则判定项无明细行时，正文不再印「本项没有可展示的结构化记录。」
+# —— 那句话会让读者把「这是规则项」读成「采集失败」。改为：professional 布局正文给
+# 一行「分析结论 <该规则结论>」；legacy 布局紧接着就渲染完整分析块，正文不再重复。
+# 控制变量自证：只把 `render_inspection_item` 那一支逐字改回旧形态、model 一字不动、
+# **独立子进程**重渲染，hash 精确回到 D34B7A1B…（`_work/_b15_ctrl_hash.py`；两次渲染
+# 必须在不同进程里跑，模块驻留内存会让改文件后重渲染无效）。旧值：
+# D34B7A1BD8144180AC46A9ECBE5F1D8A63827970682546BD36D63CFC0D8A44B5
+PRE_SPLIT_NORMALIZED_DOCUMENT_XML = "CB8653E5CF90B753DBDB80B555A4F8DCE73D3F0ADA399A7C88F9A514FD986289"
 
 
 def normalized_document_xml_hash(path: Path) -> str:
@@ -444,6 +451,49 @@ class TableOfContentsAlignmentTests(unittest.TestCase):
     def test_legacy_directory_matches_its_two_tail_chapters(self) -> None:
         headings = self._assert_aligned("legacy")
         self.assertIn("风险清单与整改建议", " ".join(headings))
+
+
+class RowsLessRuleItemTests(unittest.TestCase):
+    """规则判定项**本就没有明细表**时，正文不许落回"没有可展示的结构化记录"。
+
+    这类条目（"挂载参数""CPU 压力评估""无效对象"…）的全部产出就是一条判定结论。
+    原来的兜底措辞会让读者把它当成**采集失败 / 数据缺失** —— 两种含义完全相反。
+    本用例用 MySQL 基线模型里那几条无行条目把行为钉住（引擎是四库共享的）。
+    """
+
+    @staticmethod
+    def _render(layout: str) -> Document:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "rows_less.docx"
+            MySQLWordReportGenerator(
+                REPORT_MODEL,
+                output,
+                author="王劲松",
+                reviewer="邓秋爽",
+                logo_path=LOGO,
+                company=MYSQL_WORD_PROFILE.default_company,
+                layout=layout,
+            ).build()
+            return Document(output)
+
+    @staticmethod
+    def _paragraph_text(document: Document) -> str:
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    def test_professional_body_shows_the_verdict(self) -> None:
+        """professional 把完整分析后置到章末小结，正文这里给一行结论。"""
+        document = self._render("professional")
+        body = self._paragraph_text(document)
+        self.assertNotIn("本项没有可展示的结构化记录。", body)
+        self.assertIn("分析结论", body)
+        # 模型里"挂载参数"无行、结论是"未采集到挂载参数。"——它必须出现在正文。
+        self.assertIn("未采集到挂载参数。", body)
+
+    def test_legacy_body_does_not_repeat_a_placeholder_before_the_analysis_block(self) -> None:
+        """legacy 布局紧随其后就渲染完整分析块，正文不再多印一遍空态措辞。"""
+        body = self._paragraph_text(self._render("legacy"))
+        self.assertNotIn("本项没有可展示的结构化记录。", body)
+        self.assertIn("未采集到挂载参数。", body)
 
 
 if __name__ == "__main__":
