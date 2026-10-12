@@ -327,6 +327,58 @@ def _cell(row: dict[str, Any], *names: str) -> Any:
     return ""
 
 
+# ── 「说明」列的口径表（检查项 / 组件名 → 释义）──────────────────────────────
+#
+# ★ 说明列放的是**口径** —— 这个值是什么、取自哪个视图；**不是建议**。建议有两处：
+#   摘要表的「依据与建议」列、每个采集项的「分析结论」列。混用会让同一列出现两种
+#   读法（与 MySQL 同一条线，见 plugins/mysql/presentation.py::CONFIG_GROUP_VARIABLES）。
+#
+# ★ 为什么收成表而不是就地写字符串：① 口径集中一处才审得动；② 才**可被断言** ——
+#   守门用例喂真实形态的合成 ctx，逐行断言「说明非空」
+#   （tests/test_oracle_report_quality.py::RowNoteCoverageTests）。就地写死的话，
+#   "漏了一行"只能靠肉眼，而空格子在报告里**不报错、不抛异常**。
+#
+# ★ 为什么单独立批：`数据库身份` / `数据库配置概要` 两张表此前**整列为空**
+#   （实测 1.4 与 2.0 两包一致：7 + 15 = 22 行），与批 15/16/17 同族 ——
+#   **呈现层的错不产生功能性失败信号**。
+ORACLE_IDENTITY_NOTES: dict[str, str] = {
+    "数据库名": "db_name 参数（快照 snapshot.db_name）",
+    "实例名": "instance_name（实例 SID）",
+    "版本": "数据库版本（v$instance.version_full）",
+    "角色": "DATABASE_ROLE：PRIMARY / STANDBY",
+    "RAC": "是否 RAC 集群部署（snapshot.is_rac）",
+    "CDB/PDB": "是否多租户容器库（snapshot.is_cdb）",
+    "ASM": "是否使用 ASM 存储（snapshot.has_asm）",
+}
+
+ORACLE_DB_CONFIG_NOTES: dict[str, str] = {
+    "DB_NAME": "数据库名（v$database.name）",
+    "DB_UNIQUE_NAME": "库的唯一名（DataGuard 主备识别用）",
+    "数据库角色": "DATABASE_ROLE：PRIMARY / STANDBY",
+    "打开模式": "OPEN_MODE：读写 / 只读 / 未打开",
+    "归档模式": "LOG_MODE：ARCHIVELOG / NOARCHIVELOG",
+    "创建时间": "库创建时间（v$database.created）",
+    "PGA 总分配": "v$pgastat 的 total PGA allocated（已分配，非当前占用）",
+    # ↓ 这四条同时是「概要表展示哪些 NLS 参数」的**单一来源**（见下方 charset 循环）。
+    "NLS_CHARACTERSET": "服务端字符集",
+    "NLS_NCHAR_CHARACTERSET": "NCHAR / NVARCHAR2 字符集",
+    "NLS_LANGUAGE": "服务端语言（报错文本与日期文本）",
+    "NLS_DATE_FORMAT": "会话默认日期显示格式",
+}
+
+# SGA 组件名由 `v$sga` 给出，不同版本可能多出组件 ⇒ 表 + **兜底**，
+# 保证任何组件都拿得到说明，**永不出现空格子**。
+ORACLE_SGA_NOTES: dict[str, str] = {
+    "Database Buffers": "数据库缓冲区缓存（default buffer cache）",
+    "Variable Size": "共享池 / 大型池等可变内存区",
+    "Fixed Size": "SGA 固定区开销（内部结构）",
+    "Redo Buffers": "日志缓冲区（log buffer）",
+    "Log Buffer": "日志缓冲区（log buffer）",
+}
+ORACLE_SGA_NOTE_FALLBACK = "SGA 组件（v$sga）"
+ORACLE_NLS_NOTE_FALLBACK = "数据库级 NLS 参数（nls_database_parameters）"
+
+
 def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
                                findings: list[Finding],
                                evaluations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -525,13 +577,13 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
             _val_row("NUMA 节点", lscpu.get("NUMA node(s)") or None, "NUMA 拓扑"),
         ]),
         _item("数据库身份", "oracle.identity", [
-            _val_row("数据库名", env.get("db_name")),
-            _val_row("实例名", env.get("instance_name")),
-            _val_row("版本", env.get("ora_version")),
-            _val_row("角色", env.get("db_role")),
-            _val_row("RAC", "是 (集群)" if is_rac else "否 (单机)"),
-            _val_row("CDB/PDB", "是" if is_cdb else "否"),
-            _val_row("ASM", "是" if has_asm else "否"),
+            _val_row("数据库名", env.get("db_name"), ORACLE_IDENTITY_NOTES["数据库名"]),
+            _val_row("实例名", env.get("instance_name"), ORACLE_IDENTITY_NOTES["实例名"]),
+            _val_row("版本", env.get("ora_version"), ORACLE_IDENTITY_NOTES["版本"]),
+            _val_row("角色", env.get("db_role"), ORACLE_IDENTITY_NOTES["角色"]),
+            _val_row("RAC", "是 (集群)" if is_rac else "否 (单机)", ORACLE_IDENTITY_NOTES["RAC"]),
+            _val_row("CDB/PDB", "是" if is_cdb else "否", ORACLE_IDENTITY_NOTES["CDB/PDB"]),
+            _val_row("ASM", "是" if has_asm else "否", ORACLE_IDENTITY_NOTES["ASM"]),
         ]),
         _item("时间同步检查", _RULE_TIME_SYNC,
                analysis=_analysis(_RULE_TIME_SYNC)),
@@ -553,25 +605,49 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     sga_rows = ctx.tables.get("SGA 汇总信息", [])
     pga_rows = ctx.tables.get("PGA 统计", [])
     display_dbconf: list[dict[str, Any]] = [
-        _val_row("DB_NAME", env.get("db_name", "")),
-        _val_row("DB_UNIQUE_NAME", db_info_rows[0].get("DB_UNIQUE_NAME", "").strip() if db_info_rows else ""),
-        _val_row("数据库角色", env.get("db_role", "")),
-        _val_row("打开模式", env.get("open_mode", "") or (db_info_rows[0].get("OPEN_MODE", "").strip() if db_info_rows else "")),
-        _val_row("归档模式", "ARCHIVELOG" if db_info_rows and str(db_info_rows[0].get("LOG_MODE","")).strip() == "ARCHIVELOG" else "NOARCHIVELOG" if db_info_rows else ""),
-        _val_row("创建时间", (db_info_rows[0].get("CREATED","").strip() if db_info_rows else "")),
+        _val_row("DB_NAME", env.get("db_name", ""), ORACLE_DB_CONFIG_NOTES["DB_NAME"]),
+        _val_row("DB_UNIQUE_NAME", db_info_rows[0].get("DB_UNIQUE_NAME", "").strip() if db_info_rows else "",
+                 ORACLE_DB_CONFIG_NOTES["DB_UNIQUE_NAME"]),
+        _val_row("数据库角色", env.get("db_role", ""), ORACLE_DB_CONFIG_NOTES["数据库角色"]),
+        _val_row("打开模式", env.get("open_mode", "") or (db_info_rows[0].get("OPEN_MODE", "").strip() if db_info_rows else ""),
+                 ORACLE_DB_CONFIG_NOTES["打开模式"]),
+        _val_row("归档模式", "ARCHIVELOG" if db_info_rows and str(db_info_rows[0].get("LOG_MODE","")).strip() == "ARCHIVELOG" else "NOARCHIVELOG" if db_info_rows else "",
+                 ORACLE_DB_CONFIG_NOTES["归档模式"]),
+        _val_row("创建时间", (db_info_rows[0].get("CREATED","").strip() if db_info_rows else ""),
+                 ORACLE_DB_CONFIG_NOTES["创建时间"]),
     ]
     for row in charset_rows:
         pname = str(row.get("PARAMETER","")).strip()
-        if pname in ("NLS_CHARACTERSET","NLS_NCHAR_CHARACTERSET","NLS_LANGUAGE","NLS_DATE_FORMAT"):
-            display_dbconf.append(_val_row(pname, str(row.get("VALUE","")).strip()))
+        # ★ 不在口径表里的 NLS 参数不进概要表（表里有 `NLS_TERRITORY` 等）——
+        #   「展示哪些」与「怎么解释」是同一个事实，只能有一处来源。
+        note = ORACLE_DB_CONFIG_NOTES.get(pname)
+        if note is None or not pname.startswith("NLS_"):
+            continue
+        display_dbconf.append(_val_row(pname, str(row.get("VALUE","")).strip(), note))
     for row in sga_rows:
-        display_dbconf.append(_val_row("SGA / " + str(row.get("NAME","")).strip(), f"{safe_float(row.get('MB',row.get('     MB','0'))):.0f} MB" if row.get("MB") or row.get("     MB") else ""))
-    pga_val = pga_rows[0].get("VALUE","") if pga_rows else ""
+        component = str(row.get("NAME","")).strip()
+        display_dbconf.append(_val_row(
+            "SGA / " + component,
+            f"{safe_float(row.get('MB',row.get('     MB','0'))):.0f} MB" if row.get("MB") or row.get("     MB") else "",
+            ORACLE_SGA_NOTES.get(component, ORACLE_SGA_NOTE_FALLBACK),
+        ))
+    # ★ 行名写「PGA 总分配」，就必须取 `total PGA allocated`。原实现取 `pga_rows[0]`，
+    #   而 `v$pgastat` 的第一行实测是 `total PGA inuse`（采集 SQL 没有 ORDER BY，顺序由
+    #   视图给）⇒ **名字写"总分配"、值却是"当前占用"**（1.4 包 123 MB，而 allocated 266 MB，
+    #   差一倍；2.0 是 170 MB vs 305 MB）。按名字取，取不到再退回第一行，保证不因缺行空白。
+    #   这一条是补「说明」时发现的 —— 口径写不对，说明就只能写假话。
+    pga_row = next(
+        (row for row in pga_rows
+         if str(row.get("NAME", "")).strip().lower() == "total pga allocated"),
+        pga_rows[0] if pga_rows else None,
+    )
+    pga_val = pga_row.get("VALUE","") if pga_row else ""
     if pga_val:
         try:
             pga_val = f"{float(pga_val)/1024/1024:.0f} MB"
-        except: pass
-    display_dbconf.append(_val_row("PGA 总分配", pga_val))
+        except (TypeError, ValueError):
+            pass
+    display_dbconf.append(_val_row("PGA 总分配", pga_val, ORACLE_DB_CONFIG_NOTES["PGA 总分配"]))
     se_items.append(_item("数据库配置概要", "oracle.db_config", display_dbconf))
     sections.append({"section_id": "system_environment", "title": "系统环境检查", "items": se_items})
 
