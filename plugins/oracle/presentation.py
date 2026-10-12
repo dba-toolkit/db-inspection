@@ -186,8 +186,14 @@ def _kv_map(lines: list[str]) -> dict[str, str]:
     return result
 
 
+#: 采集侧 key-value 文件（`kernel_parameters.tsv` / `hugepages.tsv`）的**首行是表头**
+#: `path<TAB>value`。它不是参数 —— 落进表里会多出一行「path | value」，读起来像个真参数。
+#: 只对**第一条已解析行**判一次，避免误伤真值恰好是 `value` 的参数。
+_KV_HEADER_VALUES = {"value", "值"}
+
+
 def _key_value_rows(lines: list[str]) -> list[dict[str, str]]:
-    """解析 key-value 文本（`kernel_parameters.tsv`：TAB 或 `=` 分隔）。"""
+    """解析 key-value 文本（`kernel_parameters.tsv`：TAB 或 `=` 分隔），并跳过首行表头。"""
     rows: list[dict[str, str]] = []
     for raw in lines:
         line = raw.strip()
@@ -199,7 +205,10 @@ def _key_value_rows(lines: list[str]) -> list[dict[str, str]]:
             name, value = line.split("=", 1)
         else:
             continue
-        rows.append({"参数": name.strip(), "值": value.strip()})
+        name, value = name.strip(), value.strip()
+        if not rows and value.lower() in _KV_HEADER_VALUES:
+            continue
+        rows.append({"参数": name, "值": value})
     return rows
 
 
@@ -505,12 +514,15 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         )
     se_items: list[dict[str, Any]] = [
         _item("主机信息", "system.host", [
-            _val_row("主机名", s_hostname or env.get("host", ""), "采集目标主机"),
-            _val_row("IP 地址", s_ip or env.get("host", ""), "数据库服务地址"),
-            _val_row("操作系统", os_name, ""),
-            _val_row("CPU 型号", lscpu.get("Model name", ""), "处理器型号"),
-            _val_row("CPU 核数", lscpu.get("CPU(s)", ""), "逻辑核心"),
-            _val_row("NUMA 节点", lscpu.get("NUMA node(s)", ""), "NUMA 拓扑"),
+            # ★ 一律 `or None`，**不要**写 `, ""` 兜底：`""` 在引擎里渲染成 `-`，与
+            #   「字段本身为空」长得一样；`None` 渲染成 `未采集`。1.4 采集器不采操作系统层，
+            #   4 行会变成 `未采集` 而不是一行看不出所以然的 `-`（MySQL 侧同款语义）。
+            _val_row("主机名", s_hostname or env.get("host") or None, "采集目标主机"),
+            _val_row("IP 地址", s_ip or env.get("host") or None, "数据库服务地址"),
+            _val_row("操作系统", os_name or None, "操作系统发行版"),
+            _val_row("CPU 型号", lscpu.get("Model name") or None, "处理器型号"),
+            _val_row("CPU 核数", lscpu.get("CPU(s)") or None, "逻辑核心"),
+            _val_row("NUMA 节点", lscpu.get("NUMA node(s)") or None, "NUMA 拓扑"),
         ]),
         _item("数据库身份", "oracle.identity", [
             _val_row("数据库名", env.get("db_name")),
@@ -528,8 +540,8 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
         _item("采集数据质量", "ORA.COLLECTION.QUALITY",
                analysis=_analysis("ORA.COLLECTION.QUALITY")),
         _data_item("时间与时区", "system.time", [
-            _val_row("本地时间", time_info.get("local_time", ""), ""),
-            _val_row("时区", time_info.get("timezone", ""), ""),
+            _val_row("本地时间", time_info.get("local_time") or None, "采集时刻的主机本地时间"),
+            _val_row("时区", time_info.get("timezone") or None, "主机时区设置"),
         ]),
         _data_item("关键内核参数", "system.kernel", kernel_rows),
         mount_item,
