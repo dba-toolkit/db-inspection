@@ -2926,3 +2926,31 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   `最近 SQL 错误` 的 `MESSAGE_TEXT[:60]` 预览截断（告警消息预览，另有 `PROBLEM_KEY` 兜底）。
 - 详见 `docs/oracle-collector-fix-plan.md`「批 16」章与 `docs/oracle-collector-interface.md` §11.18。
 
+### 22.64 Oracle 空值语义 —— 「没采到」不许长得像「空」（Python 侧）
+
+**范围**：`plugins/oracle/presentation.py`（两处）+ 测试 + 基线。**采集脚本一字未改。**
+把 §22.62/§22.63 之后用户复核真实报告时提出的「很多都没值 / 说明都是空的」逐条落定。
+
+- **先定位用户看的是哪一份**：用户打开的是**回归基线样本** `tests/baselines/oracle/current/oracle_professional_report.docx`，
+  源包是 **08-10 的 1.4 采集包**（98 张 `.tsv` 全是 Oracle 内部视图，`find` 不到任何 OS 层证据文件）。
+  用户贴的 `SGA / Database Buffers 1200 MB` 正是 1.4 的值（2.0 是 1168 MB），据此确认。
+  ⇒ **不是分析层丢的，是 1.4 采集器不采操作系统层**；同一台机器 10-10 的 2.0 包那几项**全部有值**。
+- **① `关键内核参数` 首行 `path | value` 是表头被当参数**：采集侧 N-20（批 7）给
+  `tables/kernel_parameters.tsv` 补了表头（`tables/*.tsv` 都按"真 TSV、首行即列名行"处理），
+  但消费端 `_key_value_rows` 仍把首行收成参数 ⇒ 报告多一行「`path | value`」。
+  MySQL/PG 采集器**不写表头**，故只有 Oracle 暴露 —— 用户"MySQL 都有的"直觉其实指向这里：
+  **不是 Oracle 少采，是 Oracle 多渲染了一行。** 修在**消费端**（首行跳过一次，仅判首条已解析行）。
+- **② 没采到的字段渲染成 `-`**：引擎里 `text(None) → 未采集`、`text("") → -` 本就是**有意区分**，
+  错在调用点写满 `env.get("x", "")` / `lscpu.get("y", "")` —— `""` 把「没有」伪装成「空」。
+  改 `or None` 后 `主机信息` 4 行、`时间与时区` 2 行读作 `未采集`。**MySQL 侧本是 None 语义 ⇒ 四库对齐。**
+- **★ 本批为什么值得单独立批**：两处都属**静默** —— 不报错、不抛异常、测试不红、报告照出，
+  只是读起来像真数据或像字段为空。与批 15/16 同类：**呈现层的错不产生功能性失败信号**。
+- **守门**：`tests/test_oracle_report_quality.py::KernelParameterHeaderTests`（3 条）+
+  `MissingEvidenceValueTests`（3 条），每条**判据都配了防误伤配对**（无表头形态不受影响 / 真值不许被吞）；
+  **负控制 `_work/_b17_negctl.py` 1/1 真实变红**（逐字节复原 + sha256）。
+- **业务结果不变**：健康分 23 / 规则 42（11/24/7）/ 风险 11 / 章节 9 / 检查项 76 / 图 10；
+  10 张 PNG 与 `llm_input.json` **零差异**；新旧产物逐项 diff 后**只有本批这两处**。
+  回归 **5 failed / 434 passed / 168 subtests**（5 个 FAIL 仍是 `tests/test_mysql_*` 源包不在仓库）。
+- **未做（待决策）**：① `说明` 列大面积为空（Oracle 30 行里 25 行；MySQL 填的是**口径**，非建议）；
+  ② `主机信息` 这类**合成行**在源证据缺一半时仍被判「正常」。
+- 详见 `docs/oracle-collector-fix-plan.md`「批 17」章与 `docs/oracle-collector-interface.md` §11.19。
