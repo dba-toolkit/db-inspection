@@ -1106,7 +1106,7 @@ bash -n inspection/oracle_inspection.sh    # 语法
 
 | 你应当知道的 | 说明 |
 |---|---|
-| **★ `.psv` 的「一行 = 一条记录」是契约，且有机械守门** | `tools/check_oracle_psv_widths.py` 查四类破坏它的写法：① `SUBSTR(…,1,N) <别名>` 的宽度声明必须存在且 `M ≥ N`；② SQL 字面量里不许有 `\|`（COLSEP 就是 `\|`）；③ 不许 `WORD_WRAPPED`（按词折行的残段无法回并）；④ 同名别名（含大小写两份）宽度必须唯一。**改采集 SQL 前后都跑一次** |
+| **★ `.psv` 的「一行 = 一条记录」是契约，且有**两套**机械守门（缺一不可）** | **写法侧** `tools/check_oracle_psv_widths.py` 查四类破坏它的写法：① `SUBSTR(…,1,N) <别名>` 的宽度声明必须存在且 `M ≥ N`；② SQL 字面量里不许有 `\|`（COLSEP 就是 `\|`）；③ 不许 `WORD_WRAPPED`（按词折行的残段无法回并）；④ 同名别名（含大小写两份）宽度必须唯一。**数据侧** `tools/check_oracle_psv_records.py` 查**真实产物**：A 字段数 / B 首列非空 / C 触顶（仅警告，不影响退出码）。★ 为什么必须两套：**静态那份结构性地看不到「运行期数据本身含分隔符」** —— 实测 10-10 包 `LISTAGG` 的分隔符用了竖线，第二个控制文件路径被静默丢弃，而写法侧当时**全绿**。**改采集 SQL 前后 + 每次采集后各跑一次**（`--include-tsv` 会自动关掉判据 B：1.4 的 `.tsv` 首列空白是**合法 NULL**，不是残段） |
 | **长值列宽度 = SQL 截断长度** | `value`/`VALUE` → `a500`（SQL 是 `SUBSTR(value,1,400)`）、`description` → `a200`、`message`/`message_text` → `a500`、新增 `COLUMN additional_info FORMAT a120`。**规矩：`SUBSTR(x,1,N)` 的值列，`COLUMN x FORMAT aM` 必须 `M ≥ N`**，否则 sqlplus 按 M 折行、残段成"新行" |
 | **`LISTAGG` 分隔符不要用 `\|`** | `oracle.validation.controlfile_multiplex` 的 `LISTAGG(name,' \| ')` 改为 `'; '`：分隔符与 `SET COLSEP '\|'` 撞，且 2.0 的 `psv_normalize` 会把 ` \| ` 压成 `\|` ⇒ 第二个路径被当列边界丢掉 |
 | **★ 折行续行回并只对 2.0 的 `.psv` 生效** | 判据是「2.0 会话设了 `SET NULL '-'` ⇒ 空单元格不存在 ⇒ 首字段为空只能是残段」。**1.4 没有这个保证** —— 它的第一列空白是 NULL 落在定宽列里、是**真实数据行**（1.4 上开回并会把两行并进表头、整表 0 行）。开关由 `package_adapter._iter_table_specs` 按**采集器版本**给出，**不按分隔符猜**；`parse_delimited(repair_wrap=…)` **默认关**。★ 你若自己写 `.psv` 消费者，`|` 分隔的表格请显式 `repair_wrap=True` |

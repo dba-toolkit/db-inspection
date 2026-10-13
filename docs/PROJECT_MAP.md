@@ -3075,3 +3075,43 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   而真正要禁的是**调用**与 **import**。`tests/test_chart_secondary_axis.py` 覆盖双轴规格。
 - **未做**：SQL Server 不并入（阶段 14 的既有决策，`chart_style.py` 自绘 Pillow）。Pillow 降级图的左上角
   y 轴标签与首个刻度会轻微重叠 —— 属既有布局问题（与批 20 无关），另记。
+
+### 22.68 批 20 附：`.psv` 契约补齐「数据侧」守门 ✅ 已完成（2026-10-13）
+
+**触发**：用户问「Oracle 的采集脚本没问题吧，之前出现过截断问题，现在还有吗」。
+
+**第一步先判「包和脚本谁新」——这一步决定全部结论**：
+`git log -1 -- inspection/oracle_inspection.sh` 显示采集脚本**最后一次改动是批 16（2026-10-12）**，
+批 17–20 都没碰它；而手上 2.0 包采于 **2026-10-10 14:30** ⇒ **包比修复早两天，是旧脚本产物**。
+（别用"包新不新"判断，要用"脚本改没改过"。）
+
+**静态守门全绿，但旧包实测仍有 2 处**，都在控制文件上：
+
+| # | 文件 | `.psv` 层现象 | 解析后（`ctx.tables`） |
+|---|---|---|---|
+| 1 | `oracle.basic.parameters.psv:6` | `\|02.ctl` 折行残段（`control_files` 被 `FORMAT a80` 断成 107→80+27） | ✅ **无损**：86 字符完整，`_rejoin_wrapped_rows` 回并成功，NAME 空行 = 0 |
+| 2 | `oracle.validation.controlfile_multiplex.psv:2` | 值含 `\|`（`LISTAGG(name,'\|')`）切成 3 字段 | ❌ **真丢**：`CONTROLFILE_PATHS` 只剩 1 个路径 |
+
+**业务影响**：第 2 处的规则 `ORA.CONTROL.REDUNDANCY` 读 `CONTROLFILE_COUNT`（=2）⇒ **判定正确**；
+但展示层 `presentation.py` 读 `CONTROLFILE_PATHS` ⇒ **报告里「控制文件路径」少一个**。
+
+**当前脚本（HEAD）两处都已修**：`SUBSTR(value, 1, 400)` + `COLUMN value FORMAT a500`；
+`LISTAGG(name, '; ')`（全脚本唯一一处 `LISTAGG`）。
+
+- **新增守门**：`tools/check_oracle_psv_records.py`（**数据侧**），与
+  `tools/check_oracle_psv_widths.py`（**写法侧**）**配对，缺一不可**。
+  三条判据：A 字段数 / B 首列非空 / C 触顶（仅警告，不影响退出码）。
+- **★ 为什么必须另开一个**：静态分析**结构性地**看不到「运行期数据本身含分隔符」——
+  上面第 2 处，静态工具当时是**全绿**的。
+- **★ 判据 B 的版本前提**：`SET NULL '-'` 保证 2.0 的 `.psv` 空单元格不存在 ⇒ 首列为空只能是残段；
+  **1.4 的 `.tsv` 上不成立**（首列空白是合法 NULL），故 `--include-tsv` **自动关掉**判据 B。
+- **★ 尺子自身的盲区（本轮最重要的发现）**：初版只比「每行字段数 == 表头字段数」，
+  而 `'\|02.ctl'.split('\|')` **正好 2 字段 = 表头 2 列** ⇒ **漏报第 1 处**。
+  修法 = 加判据 B（首列非空：`.psv` 第一列是行标识，折行残段的首列恰好为空）。
+  `_self_test()` 把样本喂给**同一个** `classify()`：旧判据漏、新判据抓；
+  `tests/test_oracle_psv_records.py::test_old_field_count_only_ruler_really_misses_the_fragment`
+  把这条反证固定下来。**「字段数相等」不足以证明「一行一记录」。**
+- **守门**：`tests/test_oracle_psv_records.py` 16 用例（尺子自证 / 抓违规 / 防误伤配对 /
+  版本前提（含**切分符**随版本换 TAB）/ 触顶仅警告）；负控制 `_work/_b20_negctl_records.py` **4/4 真实变红**后逐字节复原。
+- **未做**：`SUBSTR(value,1,400)` 对 ≥10 个控制文件（每个约 42 字符）会超上限 ——
+  有兜底（`oracle.basic.controlfiles` 表**逐行**列出，完整），未改。
