@@ -22,7 +22,8 @@
 - 公共采集模块只接收跨数据库能力；数据库 SQL、许可和专属字段留在插件。
 - 采集器源码可以模块化，但发布物必须继续提供四个独立、可单文件运行的入口。
 - OS 指标必须证明属于数据库目标主机；远程采集端主机数据不得参与目标数据库资源评价。
-- **OS 层的指标键、阈值、判据和 rule_id 只能从 `inspection_core/system_checks.py` 读取。** 插件不得再自行声明一份 OS 阈值，也不得新增第五种 rule_id 拼写；判定统一走 `os_pressure_report()`（窗口选择 + 逐条判定一次拿到），插件只声明自己评价哪几条（`include=`）。旧拼写登记在 `RETIRED_RULE_IDS`，方向只有「旧 → 规范」一种（读取历史报告用），不存在把规范名翻译回插件的反向函数。OS 画图一律走 `inspection_core/charts/`（规格 + 渲染），插件只保留库专属图表。
+- **OS 层的指标键、阈值、判据和 rule_id 只能从 `inspection_core/system_checks.py` 读取。** 插件不得再自行声明一份 OS 阈值，也不得新增第五种 rule_id 拼写；判定统一走 `os_pressure_report()`（窗口选择 + 逐条判定一次拿到），插件只声明自己评价哪几条（`include=`）。旧拼写登记在 `RETIRED_RULE_IDS`，方向只有「旧 → 规范」一种（读取历史报告用），不存在把规范名翻译回插件的反向函数。OS 画图一律走 `inspection_core/charts/`（规格 + 渲染）。
+- **所有图表（含库专属图）一律走 `inspection_core/charts/`：插件只产出 spec，不得 `import matplotlib`。** 批 20 之前 Oracle 的 5 张速率图与 PG 的 2 张图是插件手写 `plt.subplots`，于是同一份报告里并存两套版式 —— 公共图是中文题、右上带框图例、无数据点标记、底部带口径注、采样中断处断开折线、缺 matplotlib 时降级 Pillow；手绘图全是反的，其中两条是**正确性**问题：采样中断会连成假趋势、缺 matplotlib 时整批图消失。库专属图需要公共层表达不了的东西（典型如双轴）时，**给公共层加字段**（`render_spec` 的 `secondary` 就是这么来的），不要回插件自己画。`tests/test_os_common_layer.py::OracleCutoverTests::test_oracle_plugin_never_renders_matplotlib_itself` 用 AST 守门（不用字符串匹配：docstring 里正当地会提到这些名字）。
 - **两库采集形态不一致时，在公共层归一，不要在插件里各绕一次。** 已归一的例子：SAR CPU 列名 `%usr`/`%sys` vs `%user`/`%system`（`SAR_CPU_ALIASES`）、`time_evidence` 缺失时按时间戳自带偏移定展示时区、内存总量缺 `host_identity` 时从实时采样或 `kbmemused/%memused` 反推。新发现的差异照此办理，并补一条覆盖两种形态的测试。
 - 新增采集项或分析项后，用 `python tools/coverage_audit.py <采集包>` 复核「无人提及 / 仅声明未读取」清单：采集了却没人读的字段要么补进分析、要么从采集端移除，不允许长期静默堆积。
 - **规则包里声明的每一个阈值键，都必须有代码真的去请求它。** 请求形态各库不同（MySQL/Oracle 是 `self._threshold(rule, "key", default)`，PG 是内层函数 `threshold("RULE.ID", "key", default)`），所以按「调用里出现的小写字符串字面量」判定，不能按固定参数位置。死键的后果是隐性的：运维照规则包调一个数字，代码不看它，**改完没效果也不报错**。三种情形一律收口——没人读的键删掉；代码硬编码的常量改成读声明键；代码请求了但包里没声明的键必须在包里补上（否则实际生效的是代码默认值）。`tests/test_rule_pack_config.py` 会拦住复活，改规则包后跑它。

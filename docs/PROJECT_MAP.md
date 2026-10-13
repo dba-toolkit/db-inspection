@@ -3031,3 +3031,47 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
 - **未做（待决策）**：`presentation.py` 的取数点不在静态守门覆盖内（不影响结论，但会让
   某张表静默消失）；`oracle.awr.*` / ASM 相关表在 1.4 包里根本没有，属采集层的事。
 - 详见 `docs/oracle-collector-fix-plan.md`「批 19」章与 `docs/oracle-collector-interface.md` §11.21。
+
+### 22.67 批 20：库专属图收口到公共渲染器（Oracle 5 张 + PG 2 张）✅ 已完成（2026-10-13）
+
+- **起因（用户提问）**：「为什么你出的图，和 MySQL 的不一样？你们是一个系统的，不是放公共层面吗？
+  Oracle 的图有 MySQL 的好吗？」—— 直接答案是：**公共层那 4 张（CPU / 内存 / 磁盘 / 网络）确实同源**，
+  两库跑的是同一个 `os_chart_specs()` + 同一个 `render_spec()`；不一样的只有**库专属图**。
+- **查证结论**：公共层的**范围没有划错**（`specs.py` 开头写明只管整机 Linux 指标，库专属图按设计留插件），
+  真正的分叉在「库专属图**用什么渲染**」—— MySQL 的 QPS/TPS、线程两张走 spec + 公共 `render_spec()`，
+  而 Oracle 的 5 张速率图与 PG 的 2 张图是**插件手写 matplotlib**（阶段 14 只搬了 OS 四张）。
+- **手写带来的具体差距**（逐条实测，不是观感）：
+
+  | 项 | 公共渲染器 | 手写版 |
+  | --- | --- | --- |
+  | 画布 | `figsize=(10, 3.9)` → 单面板 1470×534 | 吃 `apply_style()` 默认 `(10, 4.8)` → 1470×**690** |
+  | 图题 | 中文（`CPU 使用率（SAR 历史）`） | 英文 + 整串 instance_tag |
+  | 图例 | 右上、带框、ncol 自适应 | 左上、`frameon=False` |
+  | 数据点 | `lines.markersize=0`（纯线） | `marker="o", markersize=4` |
+  | 口径注 | 底部「注：现场短时采样仅反映采集窗口…」 | 无 |
+  | **采样断点** | `gap_indices()` 在中断处**断开**折线 | 直接 `plot` 连线 ⇒ **把中断画成假趋势** |
+  | **缺 matplotlib** | Pillow 后端照常出图 | `status=skipped` ⇒ **整批消失** |
+
+- **改法**：公共层 `render_spec` 新增顶层 `secondary` 字段表达双轴（matplotlib 用 `twinx`，Pillow 补右轴
+  刻度与「右轴：…」标注）。副轴颜色**接着左轴色位往下取**（左轴 n 条则右轴从 `COLORS[n]` 起，不撞色）；
+  右边框保留（否则刻度悬空），但颜色字号强制回公共值 —— `twinx()` 会带入默认灰与默认字号。
+  Oracle 5 张与 PG 2 张改为「只产出 spec」，插件里不再出现 `plt.subplots` / `savefig`。
+- **行为等价性**：
+  - **无副轴路径逐字节不变** —— `_work/_b20_ctrl_os.py` 用 HEAD 版与当前版各渲染一遍 Oracle 2.0 包的
+    OS 四张，sha256 逐张相同；端到端重出 Oracle 1.4 后，OS 四张与表空间 / TopSQL 两张 PNG 的 sha256 与基线一致。
+  - 各图原有的出图门槛**原样保留**（事务速率的「提交/回滚全零不出图」、解析率的「执行速率 ≥1 才出图」），
+    因此图的数量与位置不变（Oracle 10 张 / PG 6 张）。
+- **顺带暴露一处与批 20 无关的基线滞后**：PG 基线里的 OS 四张自 2026-09-20 起就没随渲染器更新过
+  （基线文件比当前实现早一版）。证据同上（HEAD 版与当前版产出一致）⇒ 不是本轮引入，本次一并刷新并
+  记入 `refreshed_detail`。
+- **影响面**：Oracle 更新 4 张 PNG + docx；PG 更新 6 张 PNG + docx。两库的
+  `analysis.json` / `report_model*.json` **内容零差异**（Oracle 仅 `cover.inspection_date` 随运行日期
+  从 10-12 变 10-13，属运行时戳），故 **json 不覆盖**、`output_sha256` 只更新 docx 项；
+  `expected_summary` 不重算、只校验（可比 9 项逐项一致；`sections` / `items` 在两库 `analysis.json` 里
+  没有直接对应字段，未纳入重算）。
+- **守门**：`tests/test_os_common_layer.py::OracleCutoverTests::test_oracle_plugin_never_renders_matplotlib_itself`
+  —— AST 级禁止插件出现 `.subplots()` / `.figure()` / `.savefig()` / `.twinx()` / `.plot()` 与
+  `import matplotlib`。**用 AST 而不是字符串匹配**：docstring 里正当地提到了这些名字，字符串断言会误伤，
+  而真正要禁的是**调用**与 **import**。`tests/test_chart_secondary_axis.py` 覆盖双轴规格。
+- **未做**：SQL Server 不并入（阶段 14 的既有决策，`chart_style.py` 自绘 Pillow）。Pillow 降级图的左上角
+  y 轴标签与首个刻度会轻微重叠 —— 属既有布局问题（与批 20 无关），另记。

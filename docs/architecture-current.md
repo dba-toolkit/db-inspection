@@ -65,7 +65,7 @@ logs/*
 
 数据库专属采集布局、指标、规则、图表、报告构造和 Word 配置均已离开流程编排器；Word 引擎不导入数据库插件。
 
-### 公共 OS 层（已落地，尚未接线）
+### 公共画图层（已接线，四库共用）
 
 Linux 主机的分析与画图对四个库是同一件事。此前每个插件各写一份，已经出现可度量的分叉：同一检查的 iowait 阈值分别是 20/20/15，内存判据一处用 `average` 一处用 `max`，同一个检查有三套 rule_id 拼写。公共层把这些收口，插件只保留库专属部分。
 
@@ -73,7 +73,9 @@ Linux 主机的分析与画图对四个库是同一件事。此前每个插件�
 - `inspection_core/charts/style.py`：调色板、14 个语义序列别名、严重度色、rcParams（matplotlib 可选）。
 - `inspection_core/charts/history.py`：时间解析、展示时区、断点检测、序列抽取、`CPU_SUMMARY_VALUES`。
 - `inspection_core/charts/specs.py`：四类 OS 图的纯数据规格（CPU/内存/磁盘/网络），不渲染。
-- `inspection_core/charts/render.py`：规格 → PNG，matplotlib 后端 + Pillow 降级后端，结果始终记录真实渲染器。
+- `inspection_core/charts/render.py`：规格 → PNG，matplotlib 后端 + Pillow 降级后端，结果始终记录真实渲染器。批 20 起还负责**双轴**（顶层 `secondary` 字段：左轴与副轴各自的量纲、副轴接着左轴色位往下取色、图例合并）—— 库专属图需要公共层表达不了的东西时，**给这一层加字段**，不要回插件自己画。
+
+**图的归属**：公共层出的是 4 张整机 OS 图；库专属图（QPS/TPS、表空间、DataGuard 速率……）由插件**产出 spec**，渲染仍走这里。批 20 之前 Oracle 的 5 张与 PG 的 2 张是插件手写 matplotlib，导致同一份报告并存两套版式，其中两条是正确性问题（采样中断连成假趋势、缺 matplotlib 时整批图消失）。`tests/test_os_common_layer.py` 用 AST 禁止插件再出现画图调用与 `import matplotlib`。
 
 已收口的口径（不再允许插件各自声明）：
 

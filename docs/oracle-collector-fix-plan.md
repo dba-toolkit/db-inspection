@@ -2123,6 +2123,49 @@ STATUS |NAME
 - `oracle.awr.*` 与 ASM 相关表在 1.4 包里根本没有（`evidence/` 是空目录），
   这些取数点在 1.4 上永远是「未命中」—— 是采集层的事，不是分析层能补的。
 
+## 批 20：库专属图收口到公共渲染器（Python 侧）✅ 已完成（2026-10-13）
+
+**用户提问**：「为什么你出的图，和 MySQL 的不一样？你们是一个系统的，不是放公共层面吗？你画的图有
+MySQL 的图好吗？」
+
+**先给结论**：公共层那 4 张（CPU / 内存 / 磁盘 / 网络）**确实同源**；不一样的只有**库专属图** —— 它们
+从来没进过公共层。`specs.py` 的划分（公共层只管整机 Linux 指标）是对的，分叉出在「库专属图用什么渲染」：
+
+| 库 | 库专属图用什么画 |
+| --- | --- |
+| MySQL | QPS/TPS、线程 → spec + 公共 `render_spec()` ✅ |
+| Oracle | 表空间 / TopSQL / 归档 3 张走公共；**5 张速率图手写 matplotlib** ❌ |
+| PostgreSQL | **2 张手写 matplotlib** ❌ |
+| SQL Server | 阶段 14 明确不并入（`chart_style.py` 自绘）—— 已知决策 |
+
+**手写带来的 7 处差距**（实测，含 2 处正确性问题）：
+
+1. 画布 `figsize` 用 `apply_style()` 默认 `(10, 4.8)`，而公共渲染器自己传 `(10, 3.9)` ⇒ 单面板 690px vs 534px；
+2. 图题是英文并拼上整串 `instance_tag`（`Oracle Reads: Logical vs Physical — ZYDB_db01_...`），中文报告里突兀；
+3. 图例 `loc="upper left", frameon=False`（公共是右上带框、ncol 自适应），左上会压住高值曲线；
+4. `marker="o", markersize=4`，而公共 rcParams 明确 `lines.markersize: 0`（点密时糊成粗条）；
+5. 线宽 1.5 vs 公共 1.6；
+6. **没有底部口径注**（公共实时图有「注：现场短时采样仅反映采集窗口…」）；
+7. **★ 两条正确性问题**：① 不调 `gap_indices()`，采样中断处直接连线 ⇒ **画出不存在的假趋势**；
+   ② 缺 matplotlib 时 `status=skipped` ⇒ **5 张图整片消失**（同一份报告里 OS 4 张照出，一半有图一半没图）。
+   附带 `twinx()` 把右边框带回来（公共 rcParams `axes.spines.right: False`），副轴刻度还是默认灰与默认字号。
+
+**改法**：公共 `render_spec` 加顶层 `secondary` 字段。matplotlib 侧 `twinx` + 合并图例 + 副轴颜色接着
+左轴色位往下取；Pillow 侧补右轴刻度与「右轴：…」标注（网格线只留左轴那一套，两套错位比缺一套更难读）。
+Oracle / PG 改为只产出 spec。
+
+**验证**：
+
+- 无副轴路径逐字节不变：`_work/_b20_ctrl_os.py`（HEAD vs 当前，独立子进程）4/4 一致并逐字节复原；
+- 端到端：Oracle 1.4 重出后 OS 四张 + 表空间 / TopSQL 两张 sha256 与基线一致；
+- 双轴冒烟：matplotlib 与屏蔽 matplotlib 的 Pillow 两条路径都产出（`_work/_b20_smoke_secondary.py`）；
+- 全量回归 471 passed / 5 failed（5 条全是既有的 MySQL 源包缺失）。
+
+**顺带**：PG 基线里的 OS 四张自 2026-09-20 起就滞后于渲染器，本轮一并刷新（`_work/_b20_ctrl_pg_os.py`
+证明与本轮改动无关：HEAD 版与当前版产出一致）。
+
+**未做**：Pillow 降级图左上角 y 轴标签与首个刻度轻微重叠（既有布局问题，另记）。
+
 ## 0.5 实测复核：真实采集包逐条验证（2026-10-09）
 
 **复核对象**：`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`  
