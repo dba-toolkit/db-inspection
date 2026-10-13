@@ -16,12 +16,15 @@ from .history import display_timezone, gap_indices, parse_chart_time
 from .style import (
     BACKGROUND,
     COLOR_MAP,
+    COLORS,
     FALLBACK_LABEL_COLOUR,
     FALLBACK_NOTE_COLOUR,
     FALLBACK_PANEL_TITLE_COLOUR,
     FALLBACK_TICK_COLOUR,
     FALLBACK_TITLE_COLOUR,
     FLAT_PALETTE,
+    FONT_SIZE_TICK,
+    GREY,
     LIGHT_GRID,
     apply_style,
     has_matplotlib,
@@ -67,6 +70,32 @@ def _axis_mode(parsed: list[Any], parsed_ok: bool) -> tuple[str, float, bool]:
     return "sample_index", span_seconds, False
 
 
+def _draw_secondary_axis(axis: Any, plot_x: list[Any], offset: int,
+                         secondary: dict[str, Any]) -> tuple[list[Any], list[str]]:
+    """Draw a right-hand axis on a single-panel line chart, merging both legends.
+
+    ``offset`` is how many series the left axis already used, so the secondary
+    lines continue down the palette instead of colliding with a colour that is
+    already on the left (for example exec/s blue ⇒ hard-parse red).
+
+    The right border is deliberately kept visible — a right axis with no spine
+    leaves its ticks floating.  Its colour and tick size are forced back to the
+    shared values, because ``twinx()`` otherwise brings in matplotlib defaults
+    and the chart stops matching the rest of the report.
+    """
+    twin = axis.twinx()
+    for index, (label, values) in enumerate(secondary.get("series") or []):
+        twin.plot(plot_x, values, label=label, linewidth=1.6,
+                  color=COLORS[(offset + index) % len(COLORS)])
+    twin.set_ylabel(secondary.get("ylabel", ""))
+    twin.tick_params(axis="y", labelsize=FONT_SIZE_TICK, colors=GREY)
+    twin.spines["right"].set_color(GREY)
+    twin.spines["top"].set_visible(False)
+    handles, labels = axis.get_legend_handles_labels()
+    twin_handles, twin_labels = twin.get_legend_handles_labels()
+    return handles + twin_handles, labels + twin_labels
+
+
 def _render_matplotlib(spec: dict[str, Any], charts_dir: Path, output: Path,
                        timezone_name: str, display_tz: Any) -> dict[str, Any] | None:
     if not has_matplotlib():
@@ -83,6 +112,7 @@ def _render_matplotlib(spec: dict[str, Any], charts_dir: Path, output: Path,
     axis_mode, span_seconds, short_clock = _axis_mode(parsed, parsed_ok)
     plot_x: list[Any] = list(range(len(x))) if short_clock or not parsed_ok else parsed
     panels = spec["panels"]
+    secondary = spec.get("secondary") or None
     fig, axes = plt.subplots(
         len(panels), 1, sharex=True,
         figsize=(10, 3.9 if len(panels) == 1 else 7.2),
@@ -106,7 +136,12 @@ def _render_matplotlib(spec: dict[str, Any], charts_dir: Path, output: Path,
         if panel_title:
             axis.set_title(panel_title, loc="left", fontsize=10)
         axis.set_ylabel(ylabel)
-        axis.legend(loc="upper right", ncol=min(4, max(1, len(series))))
+        if secondary is not None and axis is axes[0]:
+            handles, labels = _draw_secondary_axis(axis, plot_x, len(series), secondary)
+            axis.legend(handles, labels, loc="upper right",
+                        ncol=min(4, max(1, len(labels))))
+        else:
+            axis.legend(loc="upper right", ncol=min(4, max(1, len(series))))
     axes[0].set_title(spec["title"], loc="center", fontsize=13)
     last_axis = axes[-1]
     if short_clock:
@@ -168,6 +203,58 @@ def _pillow_fonts() -> tuple[Any, Any, Any]:
     )
 
 
+def _pillow_secondary(draw: Any, secondary: dict[str, Any], *, left: int, top: int,
+                      bottom: int, plot_width: int, plot_height: int, width: int,
+                      right: int, legend_x: int, offset: int,
+                      colors: tuple[str, ...], font: Any) -> None:
+    """Pillow 降级版的右轴：画线、右刻度、图例项。
+
+    网格线只保留左轴那一套 —— 两套网格错位比缺一套更难读。右轴刻度按自身
+    极值独立映射，数值照样可读，只是刻度不与水平网格线重合。降级图本来就
+    已经标注了 renderer，这里不再额外解释。
+    """
+    import math
+
+    series = [(label, list(values)) for label, values in (secondary.get("series") or [])]
+    finite = [
+        value for _, values in series
+        for value in values if value is not None and math.isfinite(value)
+    ]
+    if not finite:
+        return
+    low = min(0.0, min(finite))
+    high = max(finite)
+    if high <= low:
+        high = low + 1.0
+    high *= 1.08
+    for tick_index in range(5):
+        y = top + int(plot_height * tick_index / 4)
+        value = high - (high - low) * tick_index / 4
+        label = f"{value:.1f}"
+        draw.text((width - right + 12 - draw.textlength(label, font=font), y - 10),
+                  label, fill=FALLBACK_TICK_COLOUR, font=font)
+    draw.text((width - right - 150, top - 28), f"右轴：{secondary.get('ylabel', '')}",
+              fill=FALLBACK_LABEL_COLOUR, font=font)
+    for series_index, (label, values) in enumerate(series):
+        stroke = (COLOR_MAP["red"] if series_index == 0
+                  else colors[(offset + series_index) % len(colors)])
+        segment: list[tuple[int, int]] = []
+        for point_index, value in enumerate(values):
+            if value is None or not math.isfinite(value):
+                if len(segment) >= 2:
+                    draw.line(segment, fill=stroke, width=3)
+                segment = []
+                continue
+            px = left + int(plot_width * point_index / max(1, len(values) - 1))
+            py = top + int((high - value) / (high - low) * plot_height)
+            segment.append((px, py))
+        if len(segment) >= 2:
+            draw.line(segment, fill=stroke, width=3)
+        draw.line((legend_x, bottom + 14, legend_x + 42, bottom + 14), fill=stroke, width=4)
+        draw.text((legend_x + 50, bottom + 1), label, fill=FALLBACK_PANEL_TITLE_COLOUR, font=font)
+        legend_x += 205
+
+
 def _render_pillow(spec: dict[str, Any], charts_dir: Path, output: Path,
                    timezone_name: str, display_tz: Any) -> dict[str, Any] | None:
     try:
@@ -183,6 +270,8 @@ def _render_pillow(spec: dict[str, Any], charts_dir: Path, output: Path,
     gaps = gap_indices(parsed)
     axis_mode, _, _ = _axis_mode(parsed, parsed_ok)
     panels = spec["panels"]
+    # 副轴只在单面板图上生效 —— 与 matplotlib 后端同一判据。
+    secondary = (spec.get("secondary") or None) if len(panels) == 1 else None
     width = 1400
     panel_height = 300 if len(panels) > 1 else 480
     height = 115 + panel_height * len(panels) + 100
@@ -191,7 +280,8 @@ def _render_pillow(spec: dict[str, Any], charts_dir: Path, output: Path,
     font, small, title_font = _pillow_fonts()
     draw.text((95, 22), spec["title"], fill=FALLBACK_TITLE_COLOUR, font=title_font)
     colors = FLAT_PALETTE
-    left, right = 105, 45
+    # 有副轴时右侧要留出刻度文字的宽度（matplotlib 侧由 tight_layout 负责）。
+    left, right = 105, 90 if secondary is not None else 45
     plot_width = width - left - right
     top = 88
     for panel_index, (panel_title, ylabel, series) in enumerate(panels):
@@ -238,6 +328,13 @@ def _render_pillow(spec: dict[str, Any], charts_dir: Path, output: Path,
             draw.line((legend_x, panel_bottom + 14, legend_x + 42, panel_bottom + 14), fill=color, width=4)
             draw.text((legend_x + 50, panel_bottom + 1), label, fill=FALLBACK_PANEL_TITLE_COLOUR, font=small)
             legend_x += 205
+        if secondary is not None:
+            _pillow_secondary(
+                draw, secondary, left=left, top=panel_top, bottom=panel_bottom,
+                plot_width=plot_width, plot_height=plot_height, width=width,
+                right=right, legend_x=legend_x, offset=len(series), colors=colors,
+                font=small,
+            )
     label_y = height - 64
     step = max(1, len(x) // 5)
     ticks = list(range(0, len(x), step))
