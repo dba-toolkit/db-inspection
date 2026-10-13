@@ -1,11 +1,18 @@
-"""Oracle 图表生成：系统四张走公共层，Oracle 专属五张留插件，不参与风险判断。
+"""Oracle 图表生成：全部交给公共层渲染，插件只把 Oracle 语义翻译成 spec。
 
-分层边界（阶段 14 第③步）：
-- CPU / 内存 / 磁盘 / 网络四张是纯 OS 图，直接取 ``os_chart_specs()`` 并用公共
-  渲染器出图 —— 与 MySQL 同一套规格、同一套配色、同一套时间处理，matplotlib
-  缺失时自动降级到 Pillow。
-- ``ORACLE_CHART_IDS`` 里的五张依赖 Oracle 语义（统计项速率、双轴解析率），仍由
-  本插件用 matplotlib 绘制，但配色与时间处理一律取自公共层。
+分层边界（阶段 14 第③步 + 批 20）：
+- CPU / 内存 / 磁盘 / 网络四张是纯 OS 图，直接取 ``os_chart_specs()``；
+- 事务速率 / 物理 I/O / 逻辑读对比 / Redo / 解析率五张依赖 Oracle 语义的统计项
+  速率，但**渲染同样交给公共 ``render_spec()``**（解析率那张用公共层的
+  ``secondary`` 字段表达双轴）；
+- 表空间 / Top SQL / 归档量三张走 ``render_bar_spec()`` / ``render_spec()``。
+
+★ 批 20 之前那五张是**手写 matplotlib**，于是同一份报告里并存两套版式。公共层
+  出的图是中文题、右上带框图例、无数据点标记、底部带口径注、采样中断处断开折线、
+  缺 matplotlib 时降级 Pillow；手绘的那五张全是反的 —— 英文题、左上无框图例、
+  带 marker、没有口径注、**把采样中断连成假趋势**、缺 matplotlib 时整批消失。
+  现在本插件里不再允许出现 ``plt.subplots`` / ``savefig``：样式与降级只有公共层
+  一份。发现插件又自己画图，先问「公共层是不是缺个字段」。
 
 ★ **``ORACLE_CHART_IDS`` 是「产出」与「声明」的单一来源**：本模块按它出图，
   ``plugins/oracle/word_report.py`` 的 ``section_charts`` 按它声明。两份集合一旦
@@ -19,23 +26,15 @@
 
 from __future__ import annotations
 
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from inspection_core.charts import (
     REALTIME_SCOPE,
-    apply_style,
-    display_timezone,
-    duration_ms,
-    has_matplotlib,
     os_chart_specs,
-    parse_chart_time,
     render_bar_spec,
     render_spec,
 )
-from inspection_core.charts.style import COLOR_MAP
 
 from .metrics import safe_float
 
@@ -56,9 +55,6 @@ ORACLE_CHART_IDS = (
     "oracle_topsql_elapsed",
     "oracle_archive_daily",
 )
-
-# matplotlib 缺失时只影响上面这五张 Oracle 专属图。
-_MATPLOTLIB_REASON = "matplotlib_not_installed"
 
 # 单张排行图最多画多少个类别（表空间 / Top SQL 共用）。
 _TOP_N = 10
@@ -82,22 +78,6 @@ ORACLE_CHART_CAPTIONS = {
     "oracle_tablespace_usage": "表空间容量使用率排行",
     "oracle_archive_daily": "每日归档量趋势",
 }
-
-
-def _pairs(rows: list[dict[str, Any]], values: list[dict[str, Any]], key: str,
-           display_tz: Any) -> list[tuple[datetime, float]]:
-    """把「时间戳」与「派生速率」配成对，跳过无法解析的时间点。
-
-    派生速率由相邻两个采样点算出，因此比时间戳少一个，两者按顺序对齐。
-    """
-    result: list[tuple[datetime, float]] = []
-    for row, rate in zip(rows[1:], values):
-        moment = parse_chart_time(row.get("timestamp"), display_tz)
-        value = safe_float(rate.get(key))
-        if moment is None or value is None:
-            continue
-        result.append((moment, value))
-    return result
 
 
 class OracleChartProvider:
@@ -131,73 +111,66 @@ class OracleChartProvider:
             })
         return records
 
-    # ── Oracle 专属四张 ──────────────────────────────────────────────────────
+    # ── Oracle 专属五张（实时速率）—— 只翻译语义，渲染归公共层 ────────────────
     def _oracle_charts(self, ctx: Any, tag: str,
                        metrics: dict[str, Any]) -> list[dict[str, Any]]:
+        """五张速率图：产出 spec、交给公共 ``render_spec()``。
+
+        ``tag`` 保留在签名里只为与 ``_os_charts`` / ``_table_charts`` 同形；实例信息
+        由公共层的图题与文件名负责，插件不再往标题里拼。
+        """
         rows = ctx.timeseries.get("oracle_sysstat", [])
         rates = metrics.get("oracle_realtime", {}).get("derived_rate_series", [])
-        if len(rows) < 2 or not rates or not has_matplotlib():
-            if len(rows) >= 2 and rates and not has_matplotlib():
-                return [{"chart_id": "ORACLE_CHARTS", "status": "skipped",
-                         "reason": _MATPLOTLIB_REASON}]
+        if len(rows) < 2 or not rates:
             return []
 
-        import matplotlib.dates as mdates
-        import matplotlib.pyplot as plt
+        # 派生速率由相邻两个采样点算出，因此比时间戳少一个，两者按顺序对齐。
+        # ★ 用 zip 截断而不是逐点跳过：跳过会把后面的点整体前移，等于把采样中断
+        #   画成连续 —— 而公共渲染器本来就会在断点处断开折线，别在取数层提前抹平。
+        paired = list(zip([str(row.get("timestamp", "")) for row in rows[1:]], rates))
+        x_values = [item[0] for item in paired]
+        rate_rows = [item[1] for item in paired]
+        if len(x_values) < 2:
+            return []
 
-        apply_style()
-        timezone_name, display_tz = display_timezone(ctx)
         records: list[dict[str, Any]] = []
 
-        def _figure(title: str, ylabel: str, chart_id: str,
-                    series: list[tuple[str, list[tuple[datetime, float]]]],
-                    *, secondary: tuple[str, list[tuple[datetime, float]]] | None = None,
-                    points: int) -> None:
+        def _emit(chart_id: str, title: str, ylabel: str,
+                  series: list[tuple[str, list[float | None]]], *,
+                  secondary: dict[str, Any] | None = None) -> None:
             # 产出侧自守门：id 必须在单一来源里注册过，否则会画出一张没人声明、
             # 永远不会出现在报告里的图（生成即丢弃）。宁可当场报错，也别静默产垃圾。
             if chart_id not in ORACLE_CHART_IDS:
                 raise ValueError(f"未在 ORACLE_CHART_IDS 注册的 Oracle 图：{chart_id}")
-            fig, axis = plt.subplots()
-            for label, pairs in series:
-                axis.plot([p[0] for p in pairs], [p[1] for p in pairs],
-                          linewidth=1.5, marker="o", markersize=4, label=label)
-            handles, labels = axis.get_legend_handles_labels()
-            if secondary is not None:
-                twin = axis.twinx()
-                twin.plot([p[0] for p in secondary[1]], [p[1] for p in secondary[1]],
-                          color=COLOR_MAP["red"], linewidth=2, marker="D", markersize=4,
-                          label=secondary[0])
-                twin.set_ylabel(secondary[0])
-                twin_handles, twin_labels = twin.get_legend_handles_labels()
-                handles, labels = handles + twin_handles, labels + twin_labels
-            axis.set_title(f"{title} — {tag}")
-            axis.set_ylabel(ylabel)
-            axis.legend(handles, labels, loc="upper left", frameon=False, fontsize=9)
-            axis.set_xlabel(f"时间（{timezone_name}）")
-            axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=display_tz))
-            axis.xaxis.set_major_locator(mdates.AutoDateLocator(tz=display_tz))
-            fig.autofmt_xdate(rotation=25)
-            fig.tight_layout()
-            path = self.charts_dir / f"{chart_id}.png"
-            start_ns = time.monotonic_ns()
-            fig.savefig(path)
-            plt.close(fig)
-            records.append({
-                "chart_id": path.stem,
-                "path": str(path.resolve()),
-                "status": "generated",
+            spec: dict[str, Any] = {
+                "chart_id": chart_id,
+                "title": title,
+                "x": x_values,
+                "panels": [("", ylabel, series)],
                 "source_scope": REALTIME_SCOPE,
-                "source_points": points,
-                "renderer": "matplotlib",
-                "duration_ms": duration_ms(start_ns),
+                "filename": f"{chart_id}.png",
+            }
+            if secondary is not None:
+                spec["secondary"] = secondary
+            result = render_spec(ctx, spec, self.charts_dir, self.charts_dir)
+            if result.get("status") != "generated":
+                return
+            records.append({
+                "chart_id": result["chart_id"],
+                "path": str((self.charts_dir / spec["filename"]).resolve()),
+                "status": "generated",
+                "source_scope": result["source_scope"],
+                "source_points": result["source_points"],
+                "renderer": result["renderer"],
+                "duration_ms": result["duration_ms"],
             })
 
-        def _series(key: str) -> list[tuple[datetime, float]]:
-            return _pairs(rows, rates, key, display_tz)
+        def _series(key: str) -> list[float | None]:
+            return [safe_float(row.get(key)) for row in rate_rows]
 
-        def _positive(pairs: list[tuple[datetime, float]]) -> bool:
+        def _positive(values: list[float | None]) -> bool:
             """保留原有门槛：全零的速率不出一张平线图。"""
-            return any(value > 0 for _, value in pairs)
+            return any(value is not None and value > 0 for value in values)
 
         reads = _series("physical_reads_per_sec")
         writes = _series("physical_writes_per_sec")
@@ -209,25 +182,25 @@ class OracleChartProvider:
         hard = _series("parse_count_hard_per_sec")
 
         if _positive(commits) or _positive(rollbacks):
-            _figure("Oracle Transaction Rate", "txn/s", "oracle_txn_rate",
-                    [("commits/s", commits), ("rollbacks/s", rollbacks)], points=len(commits))
+            _emit("oracle_txn_rate", "Oracle 事务速率（现场短时采样）", "次/秒",
+                  [("提交", commits), ("回滚", rollbacks)])
         if _positive(reads) or _positive(writes):
-            _figure("Oracle Physical IO Rate", "IO/s", "oracle_physical_io",
-                    [("reads/s", reads), ("writes/s", writes)], points=len(reads))
+            _emit("oracle_physical_io", "Oracle 物理 I/O 速率（现场短时采样）", "次/秒",
+                  [("物理读", reads), ("物理写", writes)])
         if _positive(logical) and len(reads) >= 2:
-            _figure("Oracle Reads: Logical vs Physical", "reads/s",
-                    "oracle_logical_vs_physical",
-                    [("logical reads/s", logical), ("physical reads/s", reads)],
-                    points=len(logical))
+            _emit("oracle_logical_vs_physical", "Oracle 逻辑读与物理读（现场短时采样）",
+                  "次/秒", [("逻辑读", logical), ("物理读", reads)])
         if _positive(redo):
-            _figure("Oracle Redo Rate", "MB/s", "oracle_redo_rate",
-                    [("redo MB/s", [(moment, value / 1024 / 1024) for moment, value in redo])],
-                    points=len(redo))
-        if any(value >= 1 for _, value in execs) and len(hard) >= 2:
-            ratio = [(moment, hard_value / (exec_value or 1) * 100)
-                     for (moment, exec_value), (_, hard_value) in zip(execs, hard)]
-            _figure("Oracle Exec Rate & Hard Parse %", "exec/s", "oracle_parse_ratio",
-                    [("exec/s", execs)], secondary=("hard parse %", ratio), points=len(execs))
+            _emit("oracle_redo_rate", "Oracle Redo 速率（现场短时采样）", "MB/s",
+                  [("Redo 速率",
+                    [None if value is None else value / 1024 / 1024 for value in redo])])
+        if any(value is not None and value >= 1 for value in execs) and len(hard) >= 2:
+            ratio = [None if (exec_value is None or hard_value is None)
+                     else hard_value / (exec_value or 1) * 100
+                     for exec_value, hard_value in zip(execs, hard)]
+            _emit("oracle_parse_ratio", "Oracle 执行速率与硬解析率（现场短时采样）",
+                  "次/秒", [("执行速率", execs)],
+                  secondary={"ylabel": "硬解析率（%）", "series": [("硬解析率", ratio)]})
         return records
 
 

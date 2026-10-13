@@ -652,8 +652,42 @@ class OracleCutoverTests(unittest.TestCase):
 
         for name in ("_time_line", "_duration_ms", "_parse_ts"):
             self.assertFalse(hasattr(charts, name), f"{name} 应已下沉到 inspection_core.charts")
-        # 配色必须是公共层那一份（同一对象），不能是插件自建的同名副本。
-        self.assertIs(charts.COLOR_MAP, common_style.COLOR_MAP)
+        # 批 20 起五张速率图也走公共渲染器，插件不再需要任何绘图原语。
+        # 断言写成「要么没有、要么必须是公共层那一份」——既钉住不许自建同名副本，
+        # 也钉住不许再把 matplotlib 的样式拉进插件（拉进来就是分叉的开始）。
+        for name in ("COLOR_MAP", "COLORS", "apply_style", "has_matplotlib"):
+            if hasattr(charts, name):
+                self.assertIs(getattr(charts, name), getattr(common_style, name),
+                              f"plugins.oracle.charts.{name} 必须是公共层那一份")
+
+    def test_oracle_plugin_never_renders_matplotlib_itself(self) -> None:
+        """★ 批 20 的根因判据：插件里一旦重新出现画图调用，版式就又开始分叉。
+
+        用 AST 而不是字符串匹配 —— docstring 里正当地提到了这些名字，字符串断言会
+        误伤；真正要禁的是**调用**与 **import**。批 20 之前正是本文件里的手写
+        matplotlib 让同一份报告并存两套长相（英文题 / 左上无框图例 / 带 marker /
+        无口径注 / 采样中断连成假趋势 / 缺 matplotlib 时整批消失）。
+        """
+        import ast
+
+        source = (Path(__file__).resolve().parents[1] / "plugins/oracle/charts.py").read_text(
+            encoding="utf-8")
+        offenders: list[str] = []
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call):
+                attr = getattr(node.func, "attr", "") or ""
+                if attr in {"subplots", "figure", "savefig", "twinx", "plot"}:
+                    offenders.append(f"line {node.lineno}: .{attr}()")
+            elif isinstance(node, ast.Import):
+                offenders += [f"line {node.lineno}: import {alias.name}"
+                              for alias in node.names if "matplotlib" in alias.name]
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and "matplotlib" in node.module:
+                    offenders.append(f"line {node.lineno}: from {node.module}")
+        self.assertEqual(
+            offenders, [],
+            "Oracle 图表必须走公共渲染器，插件里不得自己画：\n  " + "\n  ".join(offenders),
+        )
 
     def test_oracle_private_chart_style_is_removed(self) -> None:
         self.assertFalse(
