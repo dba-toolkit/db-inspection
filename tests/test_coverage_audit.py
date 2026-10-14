@@ -98,6 +98,41 @@ class CoverageAuditTests(unittest.TestCase):
         for source in coverage_audit.default_sources():
             self.assertTrue(source.exists(), f"默认分析源缺失: {source}")
 
+    def test_nested_evidence_html_is_collected_not_silently_skipped(self) -> None:
+        """批 23 回归：`evidence/db_reports/*.html` 必须被计入采集面。
+
+        改动前 evidence 只认 `.txt`（`_EXT`），`enumerate_collected` 里
+        `not tail.endswith(".txt")` ⇒ **静默 continue** ⇒ AWR 报告在"采了什么/读了什么"
+        对账里根本不出现。这是尺子自身的盲区：漏判**不会报错、不会变红**，所以必须有
+        "故意喂一个 .html 子目录、要求它出现在采集面里"的用例钉住。
+
+        三条一起钉：① 计入采集面（数量 +1）；② 默认豁免后**不进**"待补的分析缺口"；
+        ③ 拿掉豁免它**必须冒出来**（否则 ① 可能是假绿）。
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = self._build_package(root)
+            _write(package / "evidence" / "db_reports" / "awr_report.html", "<html></html>\n")
+            source = self._build_source(root)
+            default = coverage_audit.audit(package, [source])
+            no_exempt = coverage_audit.audit(
+                package, [source], frozenset({"history/coverage"})
+            )
+
+        evidence = default["categories"]["evidence"]
+        # ① 防漏判：原本 3 个 evidence 文件（lscpu/backup_cron/ghost），现在 4 个
+        self.assertEqual(evidence["collected"], 4)
+        # ② 防误报：默认豁免 —— 契约是「分析层不解析」，不该长期报成缺口
+        self.assertNotIn("db_reports/awr_report.html", evidence["unused"])
+        self.assertEqual(evidence["unused"], ["ghost.txt"])
+        # ③ 相反结论必须长得不一样：拿掉豁免，它必须出现在 unused 里
+        self.assertIn(
+            "db_reports/awr_report.html",
+            no_exempt["categories"]["evidence"]["unused"],
+        )
+        # ④ 防误伤：同目录的 .txt 仍按原样统计
+        self.assertIn("lscpu.txt", evidence["consumed"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2240,6 +2240,147 @@ Oracle / PG 改为只产出 spec。
   不要把本节的 7 条误记成"现在的失败面"。
   ⚠ 用例总数随批次增长（批 20 记 471、本节 502、当前 508），**别拿两批的 passed 数相减**当作本批新增用例数。
 
+## 批 22：AWR 报告的第三条出口 —— 快照窗口按需回退 + 缺快照必须留痕（采集层）✅ 已完成（2026-10-14，仅动 `inspection/oracle_inspection.sh`）
+
+**触发**：用户把 `--diagnostics-pack` 与 `--awr-report` **两个开关都打开**，包里仍然没有 AWR 报告。
+诊断发现批 21 只修了三条出口里的两条——第三条（快照不足）仍是静默的。
+
+`collect_awr_report` 实际有**三条出口**，批 21 之后前两条已留痕，第三条没有：
+
+| 出口 | 条件 | 批 21 后 | 本批 |
+|---|---|---|---|
+| ① 许可闸门 | `DIAGNOSTICS_PACK≠1` | `not_enabled` + reason ✅ | 不变 |
+| ② 生成成功/失败 | — | `ok` / `error`，HTML 落 `evidence/` ✅ | 不变 |
+| ③ **快照不足** | `begin_snap >= end_snap` | **`md_line …; return 0`** ⇒ 记 `ok`、不写任何状态行 ❌ | 见 OF-39 / OF-40 |
+
+### OF-39 请求窗口内不足 2 个快照 → 回退到最近两个可用快照【P0 · 可用性】
+
+- **实际行为**：快照选择用 `SELECT MIN(snap_id),MAX(snap_id) FROM dba_hist_snapshot WHERE end_interval_time > SYSDATE - ${awr_hours}/24`，
+  而 `AWR_HOURS` 默认 **1**。目标实例实测快照**间隔约 6 小时**（包内 `oracle.basic.awr_snapshot_status.psv`
+  = `MIN 166 / MAX 184 / COUNT 19 / 2026-10-09 22:45 → 2026-10-14 09:05`，106.3h ÷ 18 区间 ≈ 5.9h），
+  于是 1 小时窗口里**通常只有 0 或 1 个快照**：0 个时 `MIN/MAX` 为空、1 个时 `MIN==MAX`，
+  两种都命中 `-ge` ⇒ 走出口③。**对这个实例，默认参数下 AWR 报告功能等于永远出不来**，
+  与开关打没打开无关。
+- **改法**：出口③拆成两档——窗口不足但**全库有 ≥2 个** ⇒ 用 `ROWNUM <= 2` 取最近两个可用快照继续出报告，
+  并在 md 表格里把「时间范围」改成「回退到最近两个可用快照（请求为近 N 小时）」、表格下补一行
+  `> ℹ️ 窗口内（近 N 小时）不足 2 个快照，已回退到最近两个可用快照（起 → 止）`，
+  `oracle.awr.report` 的 reason 同步带上这句。
+  ★ **只回退、不静默改口径**：报告表头原本写「近 1 小时」而快照是 6 小时前那对，读者会以为中间漏采了。
+- **sqlplus 探针接口**：回退查询带固定注释标记 `-- awr fallback: latest two available snapshots`，
+  供 harness 与窗口查询区分（两者都 `FROM dba_hist_snapshot`）。
+
+### OF-40 快照不足被记成 `ok` 且不留痕【P0 · 口径】
+
+- **实际行为**：出口③原为 `md_line "> ⚠️ 近 N 小时内快照不足2个…"; return 0`
+  ⇒ `rc=0` ⇒ `run_module` 记 **`ok`**，且**完全不写 `oracle.awr.report` 状态行**。
+  包里既无产物也无原因，与「检查通过」长得一模一样——与批 21 修的许可闸门**同类**，
+  同属 AGENTS.md「不得把未采集/不适用/空结果转换为 0 或正常」禁止的那一类。
+- **改法**：全库可用快照也不足 2 个时，`MODULE_REASON` 写明「可用快照不足 2 个（窗口内不足、实例内亦不足）
+  ——环境条件不满足，非许可问题」并 `return "$EXIT_POLICY_SKIP"`（复用批 21 的策略跳过码 40）
+  ⇒ 模块记 `not_enabled`，进 `summary.txt` 的失败项明细与报告附录「数据缺口」，原因可读。
+  按批 21 已确立的写法，这一档**不产生 `oracle.awr.report` 产物行**（「没生成」不伪装成「空」）。
+- **为什么不落 `not_applicable`**：它在 `plugins/oracle/package_adapter.py` 里**既不在 `_DATA_STATES`
+  也不在 `_NO_DATA_STATES`**，且 `collection_quality()` 把它与 `ok/empty` 一起排除出 `non_ok_items`
+  ⇒ 写了反而**在报告里看不见**。留痕要走能进缺口清单的那条路。
+
+### 顺带：给验收 harness 加第四道静态守门（假 sqlplus 必须单独 `bash -n`）
+
+- **起因**：本批的回退探针一开始写成 `*awr fallback*)`。bash 的 case 模式里**裸空格是词分隔符**
+  ⇒ `syntax error near unexpected token` ⇒ **整个假 sqlplus 解析失败** ⇒ **所有探针一起返回空**。
+  现象是「查不到快照」，与真实缺陷同形，极难归因（第一版 T27 因此 14/11）。
+- **为什么原有守门抓不到**：假 sqlplus 是 `<<'FAKESQLPLUS'` **带引号**的 heredoc，
+  `bash -n _verify_b1.sh` 不会解析它的正文。故在生成器里新增第四道守门：把正文单独抽出来验。
+- **尺子自证**：把裸空格模式塞回**生成器**副本 ⇒ 生成器 `exit=1` 并打印
+  `refuse to generate: 内嵌假 sqlplus 未通过 bash -n`。
+
+**验收证据**（`python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh`，新增 **T27 (5)(6)**）：
+
+- T27 单跑 **PASS=25 / FAIL=0**（批 21 是 15/0）。新增覆盖：窗口不足 ⇒ 模块仍 `ok` + 产物 `ok`
+  + `快照 183-184` + reason 带「回退到最近两个可用快照」/ 全库不足 ⇒ `not_enabled` + `exit_code=40`
+  + reason 带「可用快照不足 2 个」+ **不产生**产物行。
+- **运行期负控制**（换源重生成，因为 harness 的被测函数是**生成期**抽取的，运行时设 `B1_SRC` 改不了行为）：
+  - NC1 把出口③退回静默 `return 0` ⇒ **只红**场景 6 的 3 条留痕断言；
+  - NC2 让回退判定恒假 ⇒ **只红**场景 5 的 4 条回退断言。
+- **静态断言尺子自证**（`B1_SRC=<变异副本>`）：NC1 源 ⇒ 只红「两处闸门都用策略跳过码」；
+  NC3 源（放回旧静默文案 + 抹掉回退标记）⇒ 只红「旧静默文案已删除」+「回退查询带可识别标记」。
+- 生成期四道静态守门全过（反引号 / 裸美元 / `record_status` 实参=10 / 假 sqlplus `bash -n`）。
+- `bash -n inspection/oracle_inspection.sh` 过；纯 LF、无 BOM。
+
+## 批 23：AWR 报告落点收进 `evidence/db_reports/` + 文件名改稳定短名（采集层 + 工具层）✅ 已完成（2026-10-14）
+
+**触发**：批 21/22 之后 AWR 报告能随包回来了（实包 `…_2026-10-14_14-29-54.tar.gz` 已验证：
+`evidence/…_awr_….html` 575KB、`oracle.awr.report` = `ok / 10317ms / row_count 9994`、
+reason 写到「已回退到最近两个可用快照（13:00→14:00）」）。但用户提出：**它和 25 个 <4KB 的
+OS 原始输出平铺在同一个 `evidence/` 里**，解包后一眼找不到；后续 ASH / ADDM 报告同类，会越堆越多。
+问「是否要为 AWR 报告单独放一个文件夹，方便分析层分析」。
+
+**先核清了两个事实（决定改法与改不改）**：
+
+1. **AWR HTML 目前零消费者**。`plugins/oracle/package_adapter.py` 只**非递归** glob
+   `tables/*.tsv|psv`、`timeseries/*.csv`、`history/*.csv`、`status/*.tsv`，**根本不遍历 `evidence/`**；
+   `_load_tables` 的 `file_to_item` 只收 `output.startswith("tables/")` ⇒ `output_file=evidence/…`
+   **不参与任何反查**；evidence 只有 `_EVIDENCE_TABLES` 里几个**写死文件名**的回填。
+   `plugins/oracle/presentation.py` 全文没有 "AWR" 这个串（报告里的 AWR 内容全部来自 `.psv` 表）。
+   ⇒ 挪落点/改名**对现有代码零影响**，也不会丢东西。
+2. **覆盖率审计对 `.html` 是盲的**（尺子自身的缺口）。`tools/coverage_audit.py` 的
+   `_EXT` 把 `evidence` 钉死为 `.txt`，`enumerate_collected` 里 `not tail.endswith(...)` 直接
+   `continue` ⇒ **AWR 报告在"采了什么 / 分析读了什么"对账里根本不出现**。
+
+### OF-41 AWR 报告与 OS 原始输出混放，落点无约定【P2 · 交付清晰度】
+
+- **实际行为**：`awr_file` 直接写 `${EVIDENCE_DIR}/<prefix>_awr_<tag>_<qctime>.html`，
+  与 `lscpu.txt` / `mounts.txt` 这 25 个 OS 证据同级平铺；文件名把 instance 与时间又抄了一遍
+  （包名里已经有了）。
+- **不改的后果**：人解包后要在 26 个文件里找那一个 HTML；ASH/ADDM 接进来后同类文件继续堆积；
+  也没有一个"按约定去找"的稳定路径（文件名带时间戳 ⇒ 每次都不一样）。
+- **改法**：
+  1. 落点 → **`evidence/db_reports/`**（`mkdir -p`，缺则建；建不出就回退 `evidence/` 根）。
+     ★ **顶层目录 `tables/evidence/timeseries/history/logs` 是四库统一契约，一个不动** ——
+     mysql/pg 采集器同构，只给 Oracle 顶层新开 `reports/` 会破坏统一性且要同步 3 个采集器 +
+     `artifacts` 声明 + 覆盖率工具 + 文档，为一个库一份 HTML 不值。
+  2. 文件名 → **稳定短名 `awr_report.html`**（回退到包外 `REPORT_DIR` 时顺带解决孤儿堆积）。
+  3. 报告正文的 md 链接与「报告文件」行改印**包内相对路径**（只印 basename，读者按包根找会落空）。
+  4. `oracle.awr.report` 的 reason 追加「DB 原生报告原件（人看，分析层不解析）」——
+     把"不解析"这个决定写进结论里，免得后面有人拿它当分析输入。
+- **明确不做**：**不让分析层解析 AWR HTML**。结构化通路已存在且更可靠（`oracle.performance.*` /
+  `oracle.topsql.*` / `oracle.session.wait_events` / `oracle.awr.*` 共 12 张 `.psv`，都是
+  **SQL 直查 `dba_hist_*`**）；AWR HTML 排版随 Oracle 版本/patchset 变，解析失配**不报错**
+  （正则空 → 看起来没问题），正是本项目反复踩的那类坑。**要新 AWR 指标应加一条 SQL 采集项**
+  （走 `awr_stats` 模块）。
+
+### OF-42 覆盖率审计对 `evidence/` 下的 `.html` 静默漏判【P1 · 尺子盲区】
+
+- **实际行为**：`_EXT = {"evidence": ".txt", …}` + `enumerate_collected` 的
+  `not tail.endswith(_EXT[head]) → continue` ⇒ 非 `.txt` 的证据文件**不进 `collected`**。
+- **不改的后果**：AWR 报告**从"采了但没人读"的对账里消失**。这类漏判**不报错、不抛异常、
+  测试不红**，属于呈现/工具层的静默缺陷。
+- **改法**：① `_EXT` 改成 `dict[str, tuple[str, ...]]`，`evidence` 认 `.txt` + `.html`；
+  ② evidence 的键由 `Path(tail).name` 改为**类内相对路径**（顶层文件两种写法等价，
+  但 `db_reports/awr_report.html` 才能精确到子目录、不与同名文件混淆）；
+  ③ `DEFAULT_EXEMPT` 增 `evidence/db_reports/awr_report.html` —— 按「分析层不解析」的契约豁免，
+   **把这个决定钉进代码**，免得每次审计都把它当"待补的缺口"报一遍；
+  ④ `READ_PATTERNS` / `DECLARE_PATTERNS` 的 evidence 字符类补 `/`，子目录引用可捕获。
+- **验证（三条一起钉）**：`tests/test_coverage_audit.py` 新增
+  `test_nested_evidence_html_is_collected_not_silently_skipped` —— ① 计入采集面（数量 3→4）；
+  ② 默认豁免后**不进** `unused`；③ **拿掉豁免它必须冒出来**（否则 ① 可能是假绿）；④ 同目录 `.txt` 不受影响。
+  负控制：把 `_EXT` 与 evidence 键写法**同时**改回原样 ⇒ 该用例变红（`3 != 4`），逐字节复原（sha256 一致）。
+
+**契约（新增）**：`evidence/db_reports/` = **DB 原生报告原件**（AWR，及将来的 ASH / ADDM）。
+**分析层不解析它**；它不是四库统一布局的一部分，mysql/pg 无需同步。
+`output_file` 仍是"包内真实存在的文件路径"（interface §4）—— 子目录只是路径多一段。
+
+**验收证据**（`python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh`，T27 扩到 **29/0**）：
+
+- 新增断言：`output_file` == `evidence/db_reports/awr_report.html` / 该路径**真能按包根解析到文件** /
+  **`db_reports` 子目录真被建出来**（不是只写路径）/ 包外**不留** `awr_report.html` 孤儿 /
+  静态三条（落点走子目录、`mkdir -p` 兜底、**文件名是稳定短名**）+ 一条反向断言（旧时间戳命名已移除）。
+- ★ **过程中修掉一处"尺子量错对象"**：稳定短名那条断言一开始写成 `grep -c 'awr_report\.html'`，
+  结果数出 **3**（函数体注释里也提到这个名字）而"看起来像失败"；改成只 grep **赋值行**
+  `awr_file="${awr_dir}/awr_report.html"`，并配反向断言防人把落点改回去。
+- 对真包跑 `tools/coverage_audit.py`：`[evidence] 采集 25`（改前是 24），
+  AWR HTML **终于出现在对账面**；旧包用旧命名 ⇒ 如实报进"无人提及"（**不是缺陷**）。
+- `bash -n` 过；改动文件纯 LF、无 BOM。
+
 ## 批 21 续：证据引用域归一 / 规则判据修正 / 缺口原因中文化（分析层 + 报告层）✅ 已完成（2026-10-14）
 
 **触发**：交付前的客户级审查（同一份 2.0 实包 `…_2026-10-14_09-26-21.tar.gz` 的报告）。
@@ -2477,7 +2618,12 @@ Oracle 侧原**一个测试都没有**；**批 1 起已建立构造自测**（`_
    - 批 2：`_work/_verify_b2os.sh`（OF-06/07/09/11/12/18 综合 → **PASS=20 / FAIL=0**）、`_work/_verify_b2.sh`（OF-06 独立）。
    - 批 3：`_work/_verify_b3.sh` + `_work/_verify_b3_pkg.sh`。
    - 批 2 后 `bash -n` 通过、`run_with_timeout` 13 处调用、`collect_sys_info` 内重复裸命令归零。
-   - **批 21（最新，仅 `inspection/oracle_inspection.sh`）**：`python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh` → **PASS=154 / FAIL=0**（新增 **T27**：AWR 许可闸门 + 产物落点；单跑 15/0）。负控制 `_work/_b21_awr_harness.py` 两组，各自**只红对应断言**；静态断言另做尺子自证（变异副本 → 3 红）。
+   - **批 21（仅 `inspection/oracle_inspection.sh`）**：`python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh` → **PASS=154 / FAIL=0**（新增 **T27**：AWR 许可闸门 + 产物落点；单跑 15/0）。负控制 `_work/_b21_awr_harness.py` 两组，各自**只红对应断言**；静态断言另做尺子自证（变异副本 → 3 红）。
+   - **批 22（仅 `inspection/oracle_inspection.sh`）**：同上 → **PASS=164 / FAIL=0**（T27 扩到 **25/0**：新增 (5) 窗口回退、(6) 缺快照留痕）。
+     运行期负控制 `_work/_b22_nc.py`（换源重生成）两组；静态断言尺子自证 `B1_SRC=<变异副本>` 两组；生成器新增第四道守门（假 sqlplus 必须单独 `bash -n`），并用变异生成器做尺子自证。
+   - **批 23（最新，`inspection/oracle_inspection.sh` + `tools/coverage_audit.py` + `tests/test_coverage_audit.py`）**：
+     同上 → **PASS=168 / FAIL=0**（T27 扩到 **29/0**：新增 db_reports 子目录 / 稳定短名 / 子目录真建出 / 旧时间戳命名已移除 等 4 条，并修掉一处"`grep -c` 把注释也算进去"的尺子量错对象）；
+     新增单测 `test_nested_evidence_html_is_collected_not_silently_skipped`（3 条：计入采集面 / 默认豁免不进 unused / **拿掉豁免必须冒出来**），负控制同时改回 `_EXT` 与 evidence 键写法 ⇒ 变红（`3 != 4`）并逐字节复原。
 
 ---
 

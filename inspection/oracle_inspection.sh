@@ -60,7 +60,7 @@ CONFIG[PAGESIZE]=50000       # SQL分页大小（设足够大避免列头重复�
 CONFIG[AWR_MINUTES]=60      # AWR分析时间范围(分钟)
 CONFIG[AWR_HOURS]=1         # AWR报告时间范围(小时)，默认最近1小时
 CONFIG[AWR_REPORT]=1        # 是否生成AWR报告；默认关闭，需确认 Diagnostics Pack 许可后显式开启
-CONFIG[DIAGNOSTICS_PACK]=0  # 1=已确认拥有 Diagnostics Pack 许可，可采集 AWR/ASH/ADDM
+CONFIG[DIAGNOSTICS_PACK]=1  # 1=已确认拥有 Diagnostics Pack 许可，可采集 AWR/ASH/ADDM
 CONFIG[ALERT_DAYS]=7        # 告警日志分析天数
 CONFIG[ALERT_LOG]=1         # 是否扫描告警日志 1=是 0=否，默认是
 CONFIG[CUTOFF_HOURS]=48     # 备份告警阈值(小时)
@@ -166,6 +166,7 @@ cat <<EOF
   --awr-report          生成AWR性能报告（还需 --diagnostics-pack）
   --no-awr-report       不生成AWR报告
   --awr-hours=N         AWR报告时间范围，默认最近1小时 (如: --awr-hours=4)
+                        窗口内不足2个快照时，自动回退到最近两个可用快照（报告内注明实际区间）
   --rman-validate       本地执行 RESTORE DATABASE VALIDATE（耗时/IO较高）
   --no-rman-validate    不执行恢复可用性验证（默认）
   --alert-log           扫描告警日志（默认开启）
@@ -190,7 +191,7 @@ cat <<EOF
   DIR/<prefix>_task_<tag>_<时间>/                   结构化任务目录，含
       snapshot.json / collection_status.json / summary.txt /
       status/ / tables/ / evidence/ / timeseries/ / history/ / logs/
-      evidence/<prefix>_awr_<tag>_<时间>.html       AWR HTML 报告（仅 --diagnostics-pack 时生成；随包回传）
+      evidence/db_reports/awr_report.html           AWR HTML 报告（DB 原生报告原件；仅 --diagnostics-pack 时生成，随包回传）
   DIR/<prefix>_task_<tag>_<时间>.tar.gz             回传包（tar 整个任务目录）
 
 中断语义:
@@ -3339,10 +3340,53 @@ AWREOF
     end_snap=${end_snap//[!0-9]/}
 
     # 检查快照数据是否有效
+    #   ★ 批 22：窗口（--awr-hours，默认 1 小时）内不足 2 个快照时**回退到最近两个可用快照**。
+    #     实测起因：目标实例 AWR 快照间隔约 6 小时（19 个快照摊在 106 小时里），默认 1 小时
+    #     窗口内通常只有 0 或 1 个 ⇒ 旧版这里是 `return 0`：**模块被记成 ok、且不写任何状态行**，
+    #     包里既无产物也看不出原因（与 AGENTS.md「不得把未采集/不适用/空结果转换为 0 或正常」
+    #     冲突，也和批 21 修的许可闸门同属一类「没采到长得像没问题」）。现在三分：
+    #       ① 窗口内有 ≥2 个 → 按请求窗口出报告；
+    #       ② 窗口内不足、但全库有 ≥2 个 → 回退到最近两个并**注明实际区间**（仍出报告）；
+    #       ③ 全库都不足 2 个 → 走策略跳过码，模块记 not_enabled + reason（留痕，不伪装成 ok）。
+    local awr_window_note=""
     if [ -z "$begin_snap" ] || [ -z "$end_snap" ] || ! [[ "$begin_snap" =~ ^[0-9]+$ ]] || ! [[ "$end_snap" =~ ^[0-9]+$ ]] || [ "$begin_snap" -ge "$end_snap" ]; then
-        md_line "> ⚠️ 近 ${awr_hours} 小时内快照不足2个，无法生成 AWR 报告"
-        md_line "> 请确认: AWR 快照是否正常采集（默认每小时一次）"
-        return 0
+        local fb_data fb_begin fb_end fb_bt fb_et
+        fb_data=$(ora_exec <<FBEOF 2>/dev/null
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF ECHO OFF TRIMSPOOL ON LINESIZE 200
+WHENEVER SQLERROR CONTINUE
+SELECT MIN(snap_id)||','||MAX(snap_id)||','||
+       TO_CHAR(MIN(CAST(end_interval_time AS DATE)),'YYYY-MM-DD"T"HH24:MI')||','||
+       TO_CHAR(MAX(CAST(end_interval_time AS DATE)),'YYYY-MM-DD"T"HH24:MI')
+FROM (
+  SELECT snap_id, end_interval_time FROM (
+    -- awr fallback: latest two available snapshots
+    SELECT snap_id, end_interval_time FROM dba_hist_snapshot
+    WHERE instance_number = (SELECT instance_number FROM v\$instance)
+    ORDER BY snap_id DESC
+  ) WHERE ROWNUM <= 2
+);
+EXIT;
+FBEOF
+)
+        fb_data=${fb_data//[$'\t\r\n ']/}
+        IFS=',' read -r fb_begin fb_end fb_bt fb_et <<< "$fb_data"
+        fb_begin=${fb_begin##*:}; fb_begin=${fb_begin//[!0-9]/}
+        fb_end=${fb_end##*:};     fb_end=${fb_end//[!0-9]/}
+        # 时间串**不能**去冒号（`##*:` 会把 03:05 砍成 05），用正则校验，不合法就留空
+        [[ "$fb_bt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$ ]] || fb_bt=""
+        [[ "$fb_et" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$ ]] || fb_et=""
+
+        if [ -n "$fb_begin" ] && [ -n "$fb_end" ] && [ "$fb_begin" -lt "$fb_end" ]; then
+            begin_snap="$fb_begin"; end_snap="$fb_end"
+            awr_window_note="窗口内（近 ${awr_hours} 小时）不足 2 个快照，已回退到最近两个可用快照（${fb_bt:-?} → ${fb_et:-?}）"
+        else
+            md_line "## AWR 性能报告"
+            md_line ""
+            md_line "> ⚠️ 本实例可用 AWR 快照不足 2 个：近 ${awr_hours} 小时窗口内不足 2 个，全库亦不足 2 个，无法生成 AWR 报告。"
+            md_line "> 请确认：AWR 是否启用、快照保留期是否过短、实例是否刚启动（自动快照尚未产生第二个）。"
+            MODULE_REASON="AWR 报告未生成：dba_hist_snapshot 可用快照不足 2 个（近 ${awr_hours} 小时窗口内不足 2 个，实例内亦不足 2 个）——环境条件不满足，非许可问题"
+            return "$EXIT_POLICY_SKIP"
+        fi
     fi
 
     # 获取 dbid 和 instance_number
@@ -3358,9 +3402,24 @@ AWREOF
     #     ⇒ AWR HTML **永远不进包**，只在包外留一个「无 status 登记、不进 manifest、不随包回传」
     #     的孤儿文件（实测 2.0 包 316 条目里没有任何 AWR 报告）。放到 evidence/ 就随包走。
     #     未开结构化包（--no-structured）时没有 EVIDENCE_DIR，回退 REPORT_DIR 保持原行为。
+    #   ★ 批 23：DB **原生报告**（AWR，及将来的 ASH / ADDM）落 `evidence/db_reports/` ——
+    #     与 evidence/ 下 25 个 <4KB 的 OS 原始输出分开存放。**顶层目录
+    #     （tables/evidence/timeseries/history/logs）是四库统一契约，不动**；只在 evidence
+    #     下加一层子目录，故跨库零影响（mysql/pg 采集器同构，无需同步）。
+    #     ★ 文件名用**稳定短名** `awr_report.html`：instance + 时间已经写在包名里，包内再
+    #     带一遍是重复；稳定名才能让「按约定去找」成立（人看 / 将来做附件都靠它）。
+    #     回退到 REPORT_DIR（包外）时稳定名还顺带解决**孤儿文件堆积**（旧版带时间戳不覆盖）。
+    #     ★ 契约：本目录是「人看的原件 + 随包交付物」，**分析层不解析它** —— AWR HTML 的排版
+    #     跟 Oracle 版本/patchset 绑定，解析失配不会报错；结构化数据一律走 SQL 采集项
+    #     （oracle.topsql.* / oracle.performance.* / oracle.session.wait_events）。
     local awr_dir awr_file
-    if [ -n "${EVIDENCE_DIR:-}" ]; then awr_dir="$EVIDENCE_DIR"; else awr_dir="${CONFIG[REPORT_DIR]}"; fi
-    awr_file="${awr_dir}/${CONFIG[REPORT_PREFIX]}_awr_${instance_tag:-report}_${qctime}.html"
+    if [ -n "${EVIDENCE_DIR:-}" ]; then
+        awr_dir="${EVIDENCE_DIR}/db_reports"
+        mkdir -p "$awr_dir" 2>/dev/null || awr_dir="$EVIDENCE_DIR"
+    else
+        awr_dir="${CONFIG[REPORT_DIR]}"
+    fi
+    awr_file="${awr_dir}/awr_report.html"
 
     local awr_start_iso awr_start_ms awr_end_iso awr_end_ms
     awr_start_iso=$(iso_now); awr_start_ms=$(epoch_ms)
@@ -3376,27 +3435,40 @@ AWREOF
 
     awr_end_iso=$(iso_now); awr_end_ms=$(epoch_ms)
 
-    local awr_basename out_rel=""
+    local awr_basename awr_link out_rel=""
     awr_basename=$(basename "$awr_file")
     [ -n "${TASK_DIR:-}" ] && out_rel="$(safe_relpath "$awr_file")"
+    # 报告里显示**包内相对路径**（`evidence/db_reports/awr_report.html`）而不是裸文件名 ——
+    # 落点挪进子目录后再只印 basename，读者按包根找会落空。
+    awr_link="${out_rel:-$awr_file}"
 
     # 检查报告是否成功生成（内容必须包含 HTML 标签，而不是 Oracle 错误）
     if [ -s "$awr_file" ] && grep -q '<!DOCTYPE\|^<html' "$awr_file" 2>/dev/null; then
-        md_line "AWR 报告已生成: [\`${awr_basename}\`](${awr_basename})"
+        md_line "AWR 报告已生成: [\`${awr_link}\`](${awr_link})"
         md_line ""
         md_line "| 项目 | 值 |"
         md_line "| --- | --- |"
-        md_line "| 时间范围 | 近 ${awr_hours} 小时 |"
+        if [ -n "$awr_window_note" ]; then
+            md_line "| 时间范围 | 回退到最近两个可用快照（请求为近 ${awr_hours} 小时） |"
+        else
+            md_line "| 时间范围 | 近 ${awr_hours} 小时 |"
+        fi
         md_line "| 起始快照 | ${begin_snap} |"
         md_line "| 结束快照 | ${end_snap} |"
         md_line "| DBID | ${dbid} |"
         md_line "| 实例号 | ${inst_num} |"
-        md_line "| 报告文件 | ${awr_basename} |"
+        md_line "| 报告文件 | ${awr_link} |"
+        # ★ 批 22：走了窗口回退就必须写明「实际区间是哪个」——否则报告表头写着
+        #   「近 1 小时」、快照却是 6 小时前那对，读者会以为漏采了中间的数据。
+        if [ -n "$awr_window_note" ]; then
+            md_line ""
+            md_line "> ℹ️ ${awr_window_note}"
+        fi
         # ★ 产物登记：output_file 必须是**包内真实存在的文件路径**（契约见 interface §4）；
         #   未开结构化包时无 TASK_DIR，按「本项无产物文件」写空串。
         record_status "oracle.awr.report" "sql" "ok" "$awr_start_iso" "$awr_end_iso" \
             "$((awr_end_ms-awr_start_ms))" 1 0 "$out_rel" \
-            "AWR HTML 报告；快照 ${begin_snap}-${end_snap}，DBID ${dbid}，实例号 ${inst_num}"
+            "AWR HTML 报告；快照 ${begin_snap}-${end_snap}，DBID ${dbid}，实例号 ${inst_num}${awr_window_note:+；${awr_window_note}}；DB 原生报告原件（人看，分析层不解析）"
     else
         md_line "> ⚠️ AWR 报告生成失败，请确认 Diagnostics Pack 许可"
         # ★ 生成失败必须留痕（否则「没生成」与「没采集」又长得一样）。reason 只取 ORA- 编号，

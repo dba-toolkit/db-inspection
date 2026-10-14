@@ -41,10 +41,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SOURCES = ("plugins/mysql", "inspection_core")
 
 # 采集端自身的中间产物，不是分析的输入，默认不计入未消费。
-DEFAULT_EXEMPT = frozenset({"history/coverage"})
+# ★ 批 23：`evidence/db_reports/*`（AWR 等 **DB 原生报告原件**）按契约**只作人看/交付**，
+#   分析层明确不解析它（AWR HTML 排版随 Oracle 版本/patchset 变，解析失配不报错；
+#   结构化数据一律走 SQL 采集项 oracle.topsql.* / oracle.performance.*）。
+#   豁免写在这里而不是靠 --exempt，等于把「不解析」这个决定**钉进代码**，免得
+#   每次审计都把它当"待补的分析缺口"报一遍，也免得将来有人误以为那是漏读。
+DEFAULT_EXEMPT = frozenset(
+    {
+        "history/coverage",
+        "evidence/db_reports/awr_report.html",
+    }
+)
 
 CATEGORIES = ("tables", "evidence", "timeseries", "history")
-_EXT = {"tables": ".tsv", "evidence": ".txt", "timeseries": ".csv", "history": ".csv"}
+# 每类允许多个后缀（tuple）。★ 批 23 前 evidence 只认 `.txt` ⇒ `evidence/` 下的
+# `.html` 被 `enumerate_collected` **静默 continue 掉**，AWR 报告在"采了什么/读了什么"
+# 对账里根本不出现（采了但审计看不见）。这是尺子自身的盲区，与采集器无关。
+_EXT: dict[str, tuple[str, ...]] = {
+    "tables": (".tsv",),
+    "evidence": (".txt", ".html"),
+    "timeseries": (".csv",),
+    "history": (".csv",),
+}
 
 # 真读取：从 ctx 取数，或按项目内相对路径打开文件（root 可能是 ctx.root，也可能是局部 root）。
 READ_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -64,10 +82,11 @@ READ_PATTERNS: dict[str, tuple[str, ...]] = {
         r"""\broot\s*/\s*["']timeseries/([A-Za-z0-9_\-]+)\.csv["']""",
     ),
     "evidence": (
-        r"""\broot\s*/\s*["']evidence/([A-Za-z0-9_.\-\*]+)["']""",
+        r"""\broot\s*/\s*["']evidence/([A-Za-z0-9_.\-\*/]+)["']""",
         # 两段式路径：``ctx.root / "evidence" / "timedatectl.txt"``。曾经漏判，
         # 把真读了的证据打成「仅声明未读取」（timedatectl / innodb_status 都中过）。
-        r"""\broot\s*/\s*["']evidence["']\s*/\s*["']([A-Za-z0-9_.\-\*]+)["']""",
+        # 批 23 起字符类含 ``/``，子目录（``evidence/db_reports/…``）也能捕获。
+        r"""\broot\s*/\s*["']evidence["']\s*/\s*["']([A-Za-z0-9_.\-\*/]+)["']""",
     ),
 }
 
@@ -83,7 +102,7 @@ DECLARE_PATTERNS: dict[str, tuple[str, ...]] = {
     "tables": (r"""tables/([A-Za-z0-9_\-]+)\.tsv""",),
     "history": (r"""history/([A-Za-z0-9_\-]+)\.csv""",),
     "timeseries": (r"""timeseries/([A-Za-z0-9_\-]+)\.csv""",),
-    "evidence": (r"""evidence/([A-Za-z0-9_.\-\*]+)""",),
+    "evidence": (r"""evidence/([A-Za-z0-9_.\-\*/]+)""",),
 }
 
 
@@ -106,13 +125,17 @@ def _iter_package_members(package: Path) -> list[str]:
 
 
 def enumerate_collected(package: Path) -> dict[str, set[str]]:
-    """包内实际存在的采集项（键 = 表/序列名，evidence = 文件名）。"""
+    """包内实际存在的采集项（键 = 表/序列名；evidence = 类内相对路径）。"""
     collected: dict[str, set[str]] = {category: set() for category in CATEGORIES}
     for rel in _iter_package_members(package):
         head, _, tail = rel.partition("/")
         if head not in CATEGORIES or not tail.endswith(_EXT[head]):
             continue
-        collected[head].add(Path(tail).name if head == "evidence" else Path(tail).stem)
+        # evidence 取**类内相对路径**而非 basename：顶层文件两种写法等价
+        # （`filesystems.txt` ⇒ `filesystems.txt`），但批 23 起 AWR 报告在
+        # `evidence/db_reports/awr_report.html`，用相对路径才能①不与其他目录里
+        # 同名文件混淆 ②让 DEFAULT_EXEMPT 的豁免键精确到子目录。
+        collected[head].add(tail if head == "evidence" else Path(tail).stem)
     return collected
 
 

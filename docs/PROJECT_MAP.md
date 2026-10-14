@@ -3166,3 +3166,56 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   `COLUMN path FORMAT a80` 孤立声明 / `SUBSTR(value,1,500)` 满余量）—— 用户决定**都不动**；
   ② `oracle.awr.report` 这一**新增产物型采集项**不进 `item_titles.json`（它不是表），
   `package_adapter._load_tables` 目前只对 `tables/` 前缀做反查 ⇒ 若将来有规则引用它，得先补消费者。
+
+### 22.70 批 22：AWR 报告快照窗口回退 + 缺快照留痕（采集层）✅ 已完成（2026-10-14）
+
+- **背景**：`collect_awr_report` 有三条出口，批 21 只修了「许可闸门」与「生成成功/失败」两条，
+  第三条「窗口内快照不足 2 个」仍是 `md_line …; return 0` ⇒ 模块记 `ok`、**不写任何状态行**、包里无痕迹。
+  用户现场「两个开关都开了却没生成」踩的正是这条。
+- **★ 为什么必然踩到**：窗口用 `AWR_HOURS`（默认 1）去查「最近 1 小时内的快照」，
+  而现场实例的快照有断档（166→185 跨约 103 小时）⇒ 1 小时窗口里只有 0 或 1 个快照。
+  ★ 快照间隔**不能当固定参数**：本实例 185→190 是逐小时，但前面有大断档，别按一段推全量。
+- **改法**：① 窗口不足但全库 ≥2 个 ⇒ **回退到最近两个可用快照**（`ROWNUM <= 2`），报告照样出，
+  表格「时间范围」改「回退到最近两个可用快照（请求为近 N 小时）」并加一行 `> ℹ️`，
+  `oracle.awr.report` 的 reason 同步带上；② 全库也不足 ⇒ `MODULE_REASON` + `EXIT_POLICY_SKIP`，
+  模块记 `not_enabled`（进 `summary.txt` 失败明细与报告附录数据缺口），**不产生**产物行。
+- **★ 陷阱（本批最值钱的一条）**：验收 harness 的假 sqlplus 是 `<<'FAKESQLPLUS'` 带引号 heredoc
+  ⇒ **正文不参与 `bash -n`** ⇒ 回退探针写成 `*awr fallback*)`（case 模式里**裸空格是词分隔符**）
+  导致 `syntax error` ⇒ **整个假 sqlplus 解析失败 ⇒ 所有探针一起返回空**，现象酷似「采集器查不到快照」，
+  第一版 T27 是 14/11 **全假失败**。修法 = 生成器新增第四道静态守门（把正文抽出来单独 `bash -n`）
+  + **变异生成器自证**（塞回坏模式 ⇒ 生成器 `exit=1`）。
+- **★ 控制变量的分工**：harness 的被测函数是**生成期**从脚本抽出来的 ⇒ 运行时设 `B1_SRC`
+  只改得动**静态 grep 断言**，改不了被测行为；运行期负控制必须**换源重生成**。
+- **守门**：T27 扩到 **25/0**（新增「(5) 窗口回退」「(6) 缺快照留痕」）；运行期负控制两组
+  （退回静默 `return 0` ⇒ 只红场景 6 的 3 条；回退判定恒假 ⇒ 只红场景 5 的 4 条）；
+  静态断言尺子自证两组（NC1 源只红「两处闸门都用策略跳过码」，NC3 源只红另两条）。
+- **验收**：全链 **PASS=164 / FAIL=0**；`bash -n` 过、纯 LF 无 BOM。
+
+### 22.71 批 23：AWR 报告落点收进 `evidence/db_reports/` + 覆盖率审计补 `.html` 盲区（采集层 + 工具层）✅ 已完成（2026-10-14）
+
+- **背景**：用户问「AWR 报告要不要单独放一个目录，方便分析层分析」。核对后给出两条事实：
+  ① 该 HTML **零消费者**（`package_adapter` 只**非递归** glob `tables/`/`timeseries/`/`history/`/`status/`，
+  **不遍历 `evidence/`**；`presentation.py` 全文没有 "AWR" 字样）⇒ 挪落点对现有代码零影响、不会丢东西；
+  ② **不解析 HTML** 这个决定不变（排版随版本/patchset 变，失配**不报错**）。
+- **改法**：落点 `evidence/db_reports/awr_report.html`（稳定短名 —— instance + 时间已在**包名**里）；
+  顶层 `tables/ evidence/ timeseries/ history/ logs/` **一个没动**（四库统一契约，不开新顶层）；
+  报告 md 的链接与「报告文件」行改印**包内相对路径**；`-h` 的产物布局行同步。
+- **★ 顺手挖出的独立缺陷（比目录本身更重要）**：`tools/coverage_audit.py` 的 `_EXT` 把 evidence
+  钉死 `.txt`，`enumerate_collected` 里 `not tail.endswith(".txt")` 直接 `continue`
+  ⇒ **AWR 报告在「采了什么 / 分析读了什么」对账里根本不出现**。不报错、不抛异常、测试不红
+  —— 典型的**尺子自身盲区**。改法：多后缀（`.txt` + `.html`）、evidence 键由 basename 改
+  **类内相对路径**、`DEFAULT_EXEMPT` 增 `evidence/db_reports/awr_report.html`
+  （把豁免写进代码 = 把「分析层不解析」这个决定钉死，免得每次审计都当缺口报一遍）。
+- **★ 尺子量错对象**：稳定短名那条断言最初写 `grep -c 'awr_report\.html'`，数出 **3**
+  （函数体**注释**里也提到这个名字）而「看起来像失败」；改成只 grep 赋值行，并配一条**反向断言**
+  （旧时间戳命名必须已移除）防人把落点改回去。
+- **守门**：`tests/test_coverage_audit.py` 新增用例（① 计入采集面 3→4；② 默认豁免后不进 `unused`；
+  ③ **拿掉豁免必须冒出来**；④ 同目录 `.txt` 不受影响）；负控制（同时把 `_EXT` 与 evidence 键写法
+  改回原样 ⇒ 新用例变红 `3 != 4`），逐字节复原 sha256 一致。
+- **验收**：全链 **PASS=168 / FAIL=0**；pytest **509 passed / 5 failed**（5 条均为既有 `test_mysql_*`，
+  MySQL 源包不在仓库）；对真包跑 `coverage_audit`：`[evidence] 采集 25`（改前 24）；
+  `check_oracle_psv_widths.py` 四类判据全过、`check_oracle_psv_records.py <包>` 违规 0。
+- **未做（明确记下）**：AWR 分析层（`dba_hist_*` 窗口数据采集 + 独立分析文件 + 独立报告章）与
+  「19c 最佳实践参数基线」两项**均未实施**；后者方案与顺手挖到的 3 个采集缺陷
+  （`spfile_params` 死项 / `recent_param_changes` 名不副实 / 参数采集面过窄）见
+  `docs/oracle-parameter-baseline-plan.md`（**方案待审**）。

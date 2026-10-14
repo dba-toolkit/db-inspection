@@ -1212,3 +1212,63 @@ bash -n inspection/oracle_inspection.sh    # 语法
 **一处容易误判的地方**：`AWR_REPORT` 的**默认值是 1**，所以命令行加不加 `--awr-report` 对结果
 没有区别；真正决定跑不跑的是 `--diagnostics-pack`（默认 0）。现场「打开了 AWR 报告却没采到」
 的根因就是这个不对称 —— 开场现在会显式告警，不再静默。
+
+### 11.23 批 22 改造后的增量（2026-10-14，**采集层**；AWR 报告补齐第三条出口）
+
+**背景**：用户把两个开关**都打开**，包里仍然没有 AWR 报告。查出批 21 只修了三条出口里的两条——
+第三条「请求窗口内不足 2 个快照」仍是静默的（`return 0` ⇒ 记 `ok`、不写任何状态行）。
+根因是 `--awr-hours` 默认 **1 小时**，而目标实例实测快照**间隔约 6 小时**。
+详见 `docs/oracle-collector-fix-plan.md` 的 §批 22（OF-39 / OF-40）。
+
+| # | 契约变化 | 落点 | Python 侧要知道的事 |
+|:--:|---|---|---|
+| 1 | **AWR 报告变成三条出口**：①许可未确认 ②生成成功/失败 ③**快照不足** | `status/oracle.module.awr_report.tsv` | ③ 现在记 **`not_enabled`**（原先记 `ok`），reason 写明「可用快照不足 2 个……非许可问题」。与①共用 `exit_code=40`，所以**不能靠 exit_code 区分这两档**，要看 reason |
+| 2 | **窗口内不足 2 个快照时自动回退到最近两个可用快照**（仍出报告） | `evidence/<prefix>_awr_<tag>_<qctime>.html` | 报告实质时间范围**可能大于** `--awr-hours`。md 表格的「时间范围」会写成「回退到最近两个可用快照（请求为近 N 小时）」，表格下方补一行 `> ℹ️ …`；`oracle.awr.report` 的 reason 同步带上这句 |
+| 3 | 回退查询带固定 SQL 注释标记 `-- awr fallback: latest two available snapshots` | 采集脚本内部 | 仅用于把回退查询与窗口查询区分开（两者都 `FROM dba_hist_snapshot`），**不是**给 Python 用的 |
+
+**不变量（本批没动）**：
+
+- **不新增状态词**：仍然只用既有枚举。曾考虑落 `not_applicable`，实测它在
+  `plugins/oracle/package_adapter.py` 里**既不在 `_DATA_STATES` 也不在 `_NO_DATA_STATES`**，
+  且 `collection_quality()` 把它与 `ok/empty` 一起排除出 `non_ok_items` ⇒ **写了反而看不见**。
+- 快照不足这一档**不产生** `oracle.awr.report` 产物行（同批 21：没生成 ≠ 空结果）。
+- 两个开关（`--diagnostics-pack` / `--awr-report`）的**语义与默认值未变**：`--awr-report` 仍是
+  子开关、许可闸门仍是 `--diagnostics-pack`，开场告警保留。
+- 旧包（脚本不重跑）不受影响；只有重跑采集才会出现新的 `not_enabled` 成因。
+
+**一处容易误判的地方**：`--awr-hours` 是**请求窗口**而非**报告实际区间**。快照间隔远大于
+1 小时时报告会走回退，读者若只看命令行参数会以为报告是「最近 1 小时」——所以要读报告里的那行
+`> ℹ️`，别按参数猜。
+
+### 11.24 批 23 改造后的增量（2026-10-14，**采集层 + 工具层**；AWR 报告落点收进子目录、文件名改稳定短名）
+
+**背景**：AWR 报告能随包回来了，但它和 25 个 <4KB 的 OS 原始输出**平铺在同一个 `evidence/` 里**，
+人解包后一眼找不到；后续 ASH / ADDM 报告同类，会越堆越多。本批把「DB 原生报告」这一类
+单独收进子目录，给一个稳定路径。**本批取代 §11.23 表格第 2 行的落点写法。**
+
+| # | 契约变化 | 落点 | Python 侧 / 工具侧要知道的事 |
+|:--:|---|---|---|
+| 1 | AWR HTML 落点 `evidence/` → **`evidence/db_reports/`** | `status/oracle.awr.report.tsv` 的 `output_file` | 现在写 `evidence/db_reports/awr_report.html`。**顶层目录 `tables/evidence/timeseries/history/logs` 一个没动** —— 那是四库统一契约，mysql/pg 采集器无需同步 |
+| 2 | 文件名 `<prefix>_awr_<tag>_<qctime>.html` → **稳定短名 `awr_report.html`** | 同上 | instance + 时间已经写在**包名**里，包内再带一遍是重复；**稳定名才能让「按约定去找」成立**。回退到包外 `REPORT_DIR` 时顺带解决孤儿文件堆积 |
+| 3 | 报告 md 的链接与「报告文件」行改印**包内相对路径** | 报告 md | 只印 basename 的话读者按包根找会落空 |
+| 4 | `oracle.awr.report` 的 reason 追加「DB 原生报告原件（人看，分析层不解析）」 | `status/oracle.awr.report.tsv` | 把「不解析」这个决定写在结论里 |
+| 5 | `tools/coverage_audit.py`：`_EXT` 支持**多后缀**（evidence = `.txt` + `.html`）；evidence 的键由 basename → **类内相对路径**；`DEFAULT_EXEMPT` 增 `evidence/db_reports/awr_report.html` | 工具 | 改前 `enumerate_collected` 对 evidence 下的 `.html` **静默 continue** ⇒ AWR 报告在采集/消费对账里**根本不出现**（尺子自身的盲区，不报错、不抛异常、测试不红） |
+
+**契约（新增，别踩）**：
+
+- **`evidence/db_reports/` = DB 原生报告原件**（AWR，及将来的 ASH / ADDM）。
+  ★ **分析层不解析它**：AWR HTML 的排版随 Oracle 版本 / patchset 变，解析失配**不会报错**
+  （正则匹配不到 → 字段空 → 看起来"没问题"）。**要新 AWR 指标，正确做法是加一条 SQL 采集项**
+  （走 `awr_stats` 模块），结构化数据一律看 `oracle.topsql.*` / `oracle.performance.*` /
+  `oracle.session.wait_events` / `oracle.awr.*`。
+- 该目录**不是四库统一布局的一部分**：mysql / pg 采集器没有它，也不需要同步（顶层目录未变）。
+- `output_file` 仍是"**包内真实存在的文件路径**"（§4）—— 子目录只是路径多一段，契约未变；
+  `__package_adapter__` 对 evidence 的取数一直是**显式文件名**（不 glob 遍历），加子目录不误伤。
+
+**不变量（本批没动）**：
+
+- **顶层目录布局未变** ⇒ mysql / pg / sqlserver 采集器、`collection_status.json` 的
+  `artifacts` 声明、`generate_manifest`（`find "$TASK_DIR" -type f`，递归）全部无需改动。
+- 三条出口的留痕语义（批 21/22）、两个开关的默认值与语义、`oracle.awr.report` 的 item_id 均未变。
+- 旧包（脚本不重跑）不受影响：旧命名落在 `evidence/` 根的 HTML 在新审计里会出现在
+  **「无人提及」**里 —— 这是**如实报出**，不是缺陷。
