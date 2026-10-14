@@ -59,7 +59,7 @@ CONFIG[DRY_RUN]=0           # 0=执行 1=仅预览
 CONFIG[PAGESIZE]=50000       # SQL分页大小（设足够大避免列头重复）
 CONFIG[AWR_MINUTES]=60      # AWR分析时间范围(分钟)
 CONFIG[AWR_HOURS]=1         # AWR报告时间范围(小时)，默认最近1小时
-CONFIG[AWR_REPORT]=0        # 是否生成AWR报告；默认关闭，需确认 Diagnostics Pack 许可后显式开启
+CONFIG[AWR_REPORT]=1        # 是否生成AWR报告；默认关闭，需确认 Diagnostics Pack 许可后显式开启
 CONFIG[DIAGNOSTICS_PACK]=0  # 1=已确认拥有 Diagnostics Pack 许可，可采集 AWR/ASH/ADDM
 CONFIG[ALERT_DAYS]=7        # 告警日志分析天数
 CONFIG[ALERT_LOG]=1         # 是否扫描告警日志 1=是 0=否，默认是
@@ -190,6 +190,7 @@ cat <<EOF
   DIR/<prefix>_task_<tag>_<时间>/                   结构化任务目录，含
       snapshot.json / collection_status.json / summary.txt /
       status/ / tables/ / evidence/ / timeseries/ / history/ / logs/
+      evidence/<prefix>_awr_<tag>_<时间>.html       AWR HTML 报告（仅 --diagnostics-pack 时生成；随包回传）
   DIR/<prefix>_task_<tag>_<时间>.tar.gz             回传包（tar 整个任务目录）
 
 中断语义:
@@ -202,6 +203,9 @@ cat <<EOF
   20    Oracle 连接失败
   30    敏感信息扫描拦截，已阻止打包
   31    打包失败，任务目录可用
+  40    模块策略跳过（**模块内部返回码，不是脚本终态**）：模块跑了、但按许可/前置条件
+       没有采集（如 AWR 报告未确认 Diagnostics Pack）。由 run_module 拦下记 not_enabled，
+       计入「未启用」分档、**不计入失败数**，也不写「采集异常」。
  130    收到 INT/TERM/HUP 中断
 EOF
 }
@@ -1133,6 +1137,16 @@ detect_env() {
 #   历史教训（实测-3）：v1.4 用 `module.${module_name}`（中文）当 item_id → 16 个模块名塌到
 #     `module.`、27 个只剩 11 个文件；module 层内容可恢复，sql 层不可恢复。
 #   容错（有意为之）：模块失败不中断整包（配合 set +e 与 WHENEVER SQLERROR CONTINUE）。
+#
+# ★ EXIT_POLICY_SKIP：模块**策略跳过**的返回码（不是失败，也不是脚本终态退出码）。
+#   语义 = 「模块跑了，但按许可/前置条件没有采集」。目前唯一使用者是 collect_awr_report
+#   （未确认 Diagnostics Pack）。run_module 在 `rc≠0 → error` 分支**之前**拦下它，
+#   记 not_enabled + MODULE_REASON，**不**累加 MODULES_FAILED、**不**写「采集异常」。
+#   为什么非要一个专用码：旧版 AWR 跳过走 `return 0` ⇒ 被记成 ok（实测 13ms / reason 空）
+#   ⇒ 包内台账与控制台都看不出它被跳过（AGENTS.md 禁止把「未采集」当「正常」）；
+#   而若直接返回 1，就又变成「错记失败」。两个极端都不对，必须走第三条路。
+EXIT_POLICY_SKIP=40
+
 run_module() {
     local module_id="$1"
     local module_name="$2"
@@ -1161,10 +1175,25 @@ run_module() {
     # ★ N-16（批 7）：不再用 `if ! ${func_name}` —— 那会把任何非零返回码**一律压成 1**，
     #   而 `collect_structured_package` 需要把真实 rc（30=安全扫描拦截 / 31=tar 失败）带出去。
     #   改为"先执行、再取 $?"，rc 原样保留（脚本是 `set +e`，不会因非零退出）。
-    #   `MODULE_REASON` 是本函数**唯一**允许被调函数回传的出口（用于给出比
-    #   "module returned non-zero" 更精确的结论）；每次进入前先清空，避免上一次的残留串味。
+    #   `MODULE_REASON` 是本函数允许被调函数回传的**两个出口之一**（另一个是专用策略跳过码
+    #   `EXIT_POLICY_SKIP`，见下方分支）—— 用于给出比 "module returned non-zero" 更精确的
+    #   结论；每次进入前先清空，避免上一次的残留串味。
     MODULE_REASON=""
     ${func_name} 2>>"${RUNTIME[LOG_FILE]}"; rc=$?
+
+    # ★ EXIT_POLICY_SKIP：策略跳过 ≠ 失败，必须在下面的 `rc -ne 0 → error` 分支**之前**拦下。
+    #   否则会被打成「采集异常」、累加 MODULES_FAILED、还往 Markdown 里写一行 "采集异常" ——
+    #   那只是把「错记成功」换成「错记失败」。这里按 not_enabled 记账（进「未启用」分档、
+    #   进报告附录的「数据缺口」表），精确 reason 由模块经 MODULE_REASON 给出。
+    if [ "$rc" -eq "$EXIT_POLICY_SKIP" ]; then
+        end_iso=$(iso_now); end_ms=$(epoch_ms)
+        RUNTIME[MODULES_EXECUTED]=$((RUNTIME[MODULES_EXECUTED] + 1))
+        record_status "$module_id" "module" "not_enabled" "$start_iso" "$end_iso" \
+            "$((end_ms-start_ms))" 0 "$rc" "" "${MODULE_REASON:-policy skip}"
+        progress "[SKIP] 模块 ${module_name} 按许可/前置条件未采集: ${MODULE_REASON:-policy skip}"
+        return 0
+    fi
+
     if [ "$rc" -ne 0 ]; then
         log_warn "模块 [${module_name}] 执行出现异常，已跳过，继续后续采集"
         md_line ""
@@ -1668,14 +1697,16 @@ SELECT username, account_status, lock_date, expiry_date,
 FROM dba_users
 ORDER BY username;"
 
-    ora_sql_to_md "oracle.basic.password_expiry" "用户密码过期预警（账户非OPEN或30天内到期）" "
+    ora_sql_to_md "oracle.basic.password_expiry" "用户密码过期预警（OPEN 账户 30 天内到期）" "
 SELECT username, account_status, expiry_date,
        TRUNC(expiry_date - SYSDATE) days_until_expire,
        profile, default_tablespace
 FROM dba_users
-WHERE account_status != 'OPEN'
-   OR (expiry_date IS NOT NULL AND expiry_date - SYSDATE < 30)
-ORDER BY expiry_date NULLS LAST;"
+WHERE account_status = 'OPEN'
+  AND oracle_maintained = 'N'
+  AND expiry_date IS NOT NULL
+  AND expiry_date - SYSDATE BETWEEN 0 AND 30
+ORDER BY expiry_date;"
 
     ora_sql_to_md "oracle.basic.awr_snapshot_status" "AWR 快照状态（确认 AWR 是否正常运行）" "
 SELECT MIN(snap_id) min_snap_id, MAX(snap_id) max_snap_id,
@@ -3267,11 +3298,19 @@ collect_oracle_realtime_samples() {
 # 生成 AWR 文本/HTML 报告（需 --diagnostics-pack 显式确认许可）
 collect_awr_report() {
     # 开关判断
+    #   ⚠ 注意这里的**不对称**：CONFIG[AWR_REPORT] 默认就是 1，所以「加 --awr-report」其实
+    #     什么都没改变；真正决定跑不跑的是 DIAGNOSTICS_PACK（默认 0，须显式 --diagnostics-pack）。
+    #     （反方向另有不对称：--no-diagnostics-pack 会顺手把 AWR_REPORT 也置 0，见 parse_args。）
     if [ "${CONFIG[AWR_REPORT]}" -ne 1 ] || [ "${CONFIG[DIAGNOSTICS_PACK]:-0}" -ne 1 ]; then
         md_line "## AWR 性能报告"
         md_line ""
         md_line "> AWR 报告已跳过。生成报告必须同时指定 --diagnostics-pack 和 --awr-report。"
-        return 0
+        # ★ 许可未确认 ≠ 采集成功。旧版这里 `return 0` ⇒ run_module 记成 ok（实测
+        #   status/oracle.module.awr_report.tsv = ok / 13ms / reason 空）⇒ 包内台账与控制台
+        #   **都看不出它被跳过**，与 AGENTS.md「不得把未采集、无权限、不支持、不适用、
+        #   空结果转换为 0 或正常」冲突。改为回传策略跳过码，由 run_module 记 not_enabled。
+        MODULE_REASON="AWR 报告未启用：需同时指定 --diagnostics-pack 与 --awr-report（本次 DIAGNOSTICS_PACK=${CONFIG[DIAGNOSTICS_PACK]:-0}，AWR_REPORT=${CONFIG[AWR_REPORT]}）"
+        return "$EXIT_POLICY_SKIP"
     fi
 
     md_line "## AWR 性能报告"
@@ -3314,8 +3353,17 @@ AWREOF
     inst_num=${inst_num##*:}; inst_num=${inst_num//[!0-9]/}
 
     # 生成 AWR HTML 报告
-    local awr_file
-    awr_file="${CONFIG[REPORT_DIR]}/${CONFIG[REPORT_PREFIX]}_awr_${instance_tag:-report}_${qctime}.html"
+    #   ★ 落点必须在 **TASK_DIR 内**。旧版写 `${CONFIG[REPORT_DIR]}/…`，而 REPORT_DIR 与
+    #     TASK_DIR **同级**，打包又是 `tar -C <parent> -czf … <basename TASK_DIR>`（只打 TASK_DIR）
+    #     ⇒ AWR HTML **永远不进包**，只在包外留一个「无 status 登记、不进 manifest、不随包回传」
+    #     的孤儿文件（实测 2.0 包 316 条目里没有任何 AWR 报告）。放到 evidence/ 就随包走。
+    #     未开结构化包（--no-structured）时没有 EVIDENCE_DIR，回退 REPORT_DIR 保持原行为。
+    local awr_dir awr_file
+    if [ -n "${EVIDENCE_DIR:-}" ]; then awr_dir="$EVIDENCE_DIR"; else awr_dir="${CONFIG[REPORT_DIR]}"; fi
+    awr_file="${awr_dir}/${CONFIG[REPORT_PREFIX]}_awr_${instance_tag:-report}_${qctime}.html"
+
+    local awr_start_iso awr_start_ms awr_end_iso awr_end_ms
+    awr_start_iso=$(iso_now); awr_start_ms=$(epoch_ms)
 
     ora_exec > "$awr_file" <<AWREOF
 SET PAGESIZE 0 FEEDBACK OFF HEADING OFF ECHO OFF TRIMSPOOL ON
@@ -3326,8 +3374,11 @@ SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML(
 EXIT;
 AWREOF
 
-    local awr_basename
+    awr_end_iso=$(iso_now); awr_end_ms=$(epoch_ms)
+
+    local awr_basename out_rel=""
     awr_basename=$(basename "$awr_file")
+    [ -n "${TASK_DIR:-}" ] && out_rel="$(safe_relpath "$awr_file")"
 
     # 检查报告是否成功生成（内容必须包含 HTML 标签，而不是 Oracle 错误）
     if [ -s "$awr_file" ] && grep -q '<!DOCTYPE\|^<html' "$awr_file" 2>/dev/null; then
@@ -3341,8 +3392,20 @@ AWREOF
         md_line "| DBID | ${dbid} |"
         md_line "| 实例号 | ${inst_num} |"
         md_line "| 报告文件 | ${awr_basename} |"
+        # ★ 产物登记：output_file 必须是**包内真实存在的文件路径**（契约见 interface §4）；
+        #   未开结构化包时无 TASK_DIR，按「本项无产物文件」写空串。
+        record_status "oracle.awr.report" "sql" "ok" "$awr_start_iso" "$awr_end_iso" \
+            "$((awr_end_ms-awr_start_ms))" 1 0 "$out_rel" \
+            "AWR HTML 报告；快照 ${begin_snap}-${end_snap}，DBID ${dbid}，实例号 ${inst_num}"
     else
         md_line "> ⚠️ AWR 报告生成失败，请确认 Diagnostics Pack 许可"
+        # ★ 生成失败必须留痕（否则「没生成」与「没采集」又长得一样）。reason 只取 ORA- 编号，
+        #   不整段落盘 —— 输出里可能夹带连接串痕迹。
+        local awr_diag
+        awr_diag=$(grep -Eo 'ORA-[0-9]{5}[^|]{0,60}' "$awr_file" 2>/dev/null | head -2 | tr '\n' ' ')
+        record_status "oracle.awr.report" "sql" "error" "$awr_start_iso" "$awr_end_iso" \
+            "$((awr_end_ms-awr_start_ms))" 0 0 "" \
+            "AWR HTML 未生成或内容非 HTML（DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML 无输出或报错）${awr_diag:+：$awr_diag}"
     fi
 }
 
@@ -4506,6 +4569,14 @@ printf " 日志: %s\n" "${RUNTIME[LOG_FILE]}"
 if [ "$TARGET_IS_LOCAL" -ne 1 ]; then
     printf " ⚠ 连接目标 %s 不是本机：OS 数据（内存/磁盘/IO/大页/进程）属于采集机 %s，不代表数据库服务器\n" "${DB_CONN[HOST]}" "$_COLLECTOR_HOSTNAME"
     log_warn "连接目标 ${DB_CONN[HOST]} 不是本机；OS 数据属于采集机 ${_COLLECTOR_HOSTNAME}，不代表数据库服务器"
+fi
+# ★ 许可开关**不对称**，必须在开场说清（批 21）：CONFIG[AWR_REPORT] 默认就是 1，所以
+#   「打开了 AWR 报告开关」这个动作往往等于什么都没做，真正卡住的是 DIAGNOSTICS_PACK（默认 0）。
+#   旧版这种情形一路静默跑到收尾，操作员只在 summary 里看到一个被记成 ok 的模块，无从察觉。
+if [ "${CONFIG[AWR_REPORT]}" -eq 1 ] && [ "${CONFIG[DIAGNOSTICS_PACK]:-0}" -ne 1 ]; then
+    printf " ⚠ AWR_REPORT=1 但 DIAGNOSTICS_PACK=0：本次**不会**生成 AWR 报告（已按许可保护策略跳过）\n"
+    printf "   需要 AWR 报告请追加 --diagnostics-pack（须先确认已获 Diagnostics Pack 许可）。\n"
+    log_warn "AWR_REPORT=1 但 DIAGNOSTICS_PACK=0：AWR 报告将被跳过（加 --diagnostics-pack 才会生成）"
 fi
 printf "========================================\n"
 
