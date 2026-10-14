@@ -212,5 +212,58 @@ class WarningOnlyTests(unittest.TestCase):
         self.assertEqual(limits.get("VALUE"), {400})
 
 
+class PlaceholderLineTests(unittest.TestCase):
+    """⑥ 占位行（`# oracle-inspection psv-empty …`）不是记录 —— 批 21。
+
+    真实缺口：`.psv` 的占位形态**没有表头**，而工具原先拿 `lines[0]` 当表头 ⇒
+    把占位行当成了列名行。当前包里每个占位文件都只有这一行、后面没有数据行，
+    于是**恰好**不报违规 —— 看起来是绿的，实际上那个文件**从来没有被检查过**
+    （「未采集 ≠ 0」的经典变体：把「没记录可查」混进了「查过没问题」）。
+    """
+
+    MARKER = "# oracle-inspection psv-empty item_id=oracle.x sep=| rows=0 status=empty"
+    THREE = ["ITEM", "STATUS", "COUNT"]
+
+    def test_marker_line_is_skipped_not_judged(self) -> None:
+        # 3 列表头下，占位行按 `|` 切只有 2 个字段 ⇒ 若当数据行必然误报
+        self.assertNotEqual(len(self.MARKER.split("|")), len(self.THREE))
+        self.assertEqual(TOOL.classify(self.THREE, [self.MARKER]), [])
+
+    def test_records_drops_comments_and_blank_lines(self) -> None:
+        self.assertEqual(TOOL._records([self.MARKER, "", "   ", "a|b|c"]), ["a|b|c"])
+        self.assertEqual(TOOL._records([self.MARKER, ""]), [])
+
+    def test_skipping_really_comes_from_the_hash_rule(self) -> None:
+        """**负控制**：把 `_is_comment` 换成"永不成立"，同一行必须被报出来。
+
+        否则「不报」可能只是恰好字段数对上了，而不是这条判据在起作用。
+        """
+        original = TOOL._is_comment
+        try:
+            TOOL._is_comment = lambda line: False
+            self.assertNotEqual(TOOL.classify(self.THREE, [self.MARKER]), [])
+        finally:
+            TOOL._is_comment = original
+
+    def test_cli_counts_placeholders_separately_from_checked_files(self) -> None:
+        """★ 占位文件必须**单独计数**：不能说成"检查了 N 个文件"（那是「未采集 ≠ 0」）。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            _write_psv(temporary, "oracle.x.psv", [self.MARKER])
+            code, output = _run([temporary, "--script", str(Path(temporary, "none.sh"))])
+        self.assertEqual(code, 0, output)
+        self.assertIn("占位文件 1 个", output)
+        self.assertIn("实际判定 0 个", output)
+
+    def test_placeholder_does_not_mask_a_real_violation_next_to_it(self) -> None:
+        """**防误伤配对**：占位文件在场，也不许把旁边真违规的文件一起"跳"过去。"""
+        with tempfile.TemporaryDirectory() as temporary:
+            _write_psv(temporary, "oracle.x.psv", [self.MARKER])
+            _write_psv(temporary, "dirty.psv", ["NAME|VALUE"] + WRAPPED)
+            code, output = _run([temporary, "--script", str(Path(temporary, "none.sh"))])
+        self.assertEqual(code, 1, output)
+        self.assertIn("首列为空", output)
+        self.assertIn("实际判定 1 个", output)
+
+
 if __name__ == "__main__":
     unittest.main()

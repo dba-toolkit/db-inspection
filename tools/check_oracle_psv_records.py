@@ -27,6 +27,12 @@
   「值里含 ``|``」误报成字段数不符。
 - **C 触顶**：某列最长值 ``>=`` 采集脚本里该列的 ``SUBSTR(...,1,N)`` 上限 ⇒ **警告**
   （值可能就是被 SQL 砍到这个长度的）。C **不影响退出码** —— 它只是"疑似"，不是"确证"。
+- **占位行不是记录**：``# oracle-inspection psv-empty …`` / ``… psv-unavailable …``
+  是「查了没有 / 没取到」的占位形态，**无表头、无数据行**。守门把它当注释跳过，
+  并把这类文件单独计数报出（``psv-empty`` / ``psv-unavailable`` 是**相反结论**，
+  不能与「查过没问题」混在同一个计数里）。
+  ★ 它与下游三处（``tabular.py`` / ``package_adapter.py`` / ``presentation.py``）**同一个判据**：
+  守门必须按消费者看到的形态判，否则会出现「守门通过、而那一项从未被检查」的假绿。
 
 ## 两条判据必须同时用
 
@@ -57,6 +63,18 @@ _SUBSTR = re.compile(
     r"SUBSTR\s*\(\s*(?:[A-Za-z_][\w$.]*\.)?(\w+)\s*,\s*\d+\s*,\s*(\d+)\s*\)", re.I)
 
 
+def _is_comment(line: str) -> bool:
+    """`.psv` 的**占位行**（`# oracle-inspection psv-empty …` / `… psv-unavailable …`）。
+
+    它与下游三处**同一个判据**（`inspection_core/tabular.py:15`、
+    `plugins/oracle/package_adapter.py:403`、`plugins/oracle/presentation.py:200`）：
+    守门必须**按消费者看到的形态**判 —— 消费者跳过它，守门就不能把它当表头/数据行，
+    否则会出现「守门说通过了，而那一项其实**从来没被检查过**」这种假绿。
+    占位行**不是记录**：`.psv` 的三种形态里，只有「数据」形态才有表头。
+    """
+    return line.strip().startswith("#")
+
+
 def classify(header: list[str], lines: list[str], *, delimiter: str = "|",
              first_column_must_be_filled: bool = True) -> list[str]:
     """判据 A + B。返回违规描述列表；**被自证用例直接复用**，别在这里加外部依赖。
@@ -68,14 +86,20 @@ def classify(header: list[str], lines: list[str], *, delimiter: str = "|",
     problems: list[str] = []
     width = len(header)
     for index, line in enumerate(lines, start=2):
-        if not line.strip():
-            continue                      # 末尾空行不是记录，跳过（否则会误报）
+        if not line.strip() or _is_comment(line):
+            continue                      # 空行 / 占位行都不是记录（否则会误报）
         fields = line.split(delimiter)
         if len(fields) != width:
             problems.append(f"行{index} 字段数 {len(fields)} != 表头 {width}  [{line[:70]!r}]")
         elif first_column_must_be_filled and fields[0].strip() == "":
             problems.append(f"行{index} 首列为空（疑折行残段）  [{line[:70]!r}]")
     return problems
+
+
+def _records(lines: list[str]) -> list[str]:
+    """去掉空行与占位行后的**真记录**（含表头作为第 0 条）。"""
+    return [line for line in lines if line.strip() and not _is_comment(line)]
+
 
 
 def _legacy_field_count_only(header: list[str], lines: list[str]) -> list[str]:
@@ -121,6 +145,21 @@ def self_test(verbose: bool = True) -> bool:
     checks.append(("同一行误用 | 切就会被报（对照）",
                    classify(tsv_header, [tsv_line], delimiter="|",
                             first_column_must_be_filled=False) != []))
+
+    # ⑥ 占位行（# oracle-inspection psv-empty …）**不是记录**：
+    #    它既不能当表头，也不能当数据行。3 列表头下这行只有 2 个字段 ⇒ 若当成数据会被误报。
+    marker = "# oracle-inspection psv-empty item_id=oracle.x sep=| rows=0 status=empty"
+    three = ["ITEM", "STATUS", "COUNT"]
+    checks.append(("占位行带 # 时被跳过", classify(three, [marker]) == []))
+    checks.append(("_records 只留真记录", _records([marker, ""]) == []))
+    # 负控制：把 `_is_comment` 换成"永不成立"，同一行必须被报出来 ——
+    # 证明"跳过"确实由这条判据生效，而不是恰好字段数对上了。
+    original_is_comment = globals()["_is_comment"]
+    try:
+        globals()["_is_comment"] = lambda line: False
+        checks.append(("负控制：关掉 # 跳过后占位行必被报出", classify(three, [marker]) != []))
+    finally:
+        globals()["_is_comment"] = original_is_comment
 
     if verbose:
         print("=== 尺子自证 ===")
@@ -178,24 +217,38 @@ def main(argv: list[str] | None = None) -> int:
 
     violations: dict[str, list[str]] = {}
     warnings: list[str] = []
+    placeholders: list[str] = []
+    checked = 0
     for path in files:
         lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
         if not lines:
             continue
-        header = lines[0].split(delimiter)
-        found = classify(header, lines[1:], delimiter=delimiter,
+        records = _records(lines)
+        if not records:
+            # 纯占位文件（`psv-empty` / `psv-unavailable`）：**按契约没有表头、没有记录**，
+            # 无 A/B 可判。单独计数并在结论里报出来 —— 否则「检查了 N 个文件」会把
+            # 「没记录可查」混进「查过没问题」，这正是「未采集 ≠ 0」要防的那种假绿。
+            placeholders.append(path.name)
+            continue
+        checked += 1
+        header = records[0].split(delimiter)
+        found = classify(header, records[1:], delimiter=delimiter,
                          first_column_must_be_filled=not args.include_tsv)
         if found:
             violations[str(path)] = found
         for column_index, column in enumerate(header):
             longest = max((len(line.split(delimiter)[column_index])
-                           for line in lines[1:]
-                           if line.strip() and column_index < len(line.split(delimiter))),
+                           for line in records[1:]
+                           if column_index < len(line.split(delimiter))),
                           default=0)
             for limit in limits.get(column.strip().upper(), ()):
                 if longest >= limit:
                     warnings.append(
                         f"{path.name} 列 {column.strip().upper()} 最长 {longest} 触到 SUBSTR 上限 {limit}")
+
+    if placeholders:
+        print(f"  ⓘ 其中 {len(placeholders)} 个为占位文件（psv-empty / psv-unavailable）："
+              f"按契约无表头、无记录，不参与 A/B 判定；实际判定 {checked} 个")
 
     print("\n=== 判据 A/B（违规，影响退出码）===")
     if violations:
@@ -212,7 +265,8 @@ def main(argv: list[str] | None = None) -> int:
     print("✓ 无触顶" if not warnings else "\n".join(f"⚠ {w}" for w in warnings))
 
     total = sum(len(v) for v in violations.values())
-    print(f"\n结论：违规 {total} 处（{len(violations)} 个文件）；警告 {len(warnings)} 处")
+    print(f"\n结论：违规 {total} 处（{len(violations)} 个文件）；警告 {len(warnings)} 处；"
+          f"占位文件 {len(placeholders)} 个（无记录可查，未参与判定）")
     return 0 if total == 0 else 1
 
 
