@@ -3115,3 +3115,54 @@ AST `PARSE_ERRORS=0` / `TOKENS=7178` / UTF-8 BOM + 纯 LF / **1875 行 / 147 行
   版本前提（含**切分符**随版本换 TAB）/ 触顶仅警告）；负控制 `_work/_b20_negctl_records.py` **4/4 真实变红**后逐字节复原。
 - **未做**：`SUBSTR(value,1,400)` 对 ≥10 个控制文件（每个约 42 字符）会超上限 ——
   有兜底（`oracle.basic.controlfiles` 表**逐行**列出，完整），未改。
+### 22.69 批 21：证据引用域归一 / 规则判据修正 / 缺口原因中文化（Python 侧 + 采集层）✅ 已完成（2026-10-14）
+
+**触发**：两条独立线。① 现场问「AWR 报告采集打开了，为什么没采到、包里怎么没有？」—— 属**采集层**
+（OF-31 许可闸门把跳过记成 `ok`、OF-32 AWR HTML 落在 `TASK_DIR` 之外永不进包；见
+`oracle-collector-fix-plan.md` 批 21 与 `oracle-collector-interface.md` §11.22，本文件不重复）。
+② 交付前的客户级审查（「这份报告能不能直接交给客户」）逼出 5 条**及格线缺陷**，即本节。
+
+**★ 审查的分轴方式（定下来）**：把「缺采集项」归**加分题**、把「代码正确性缺陷」归**及格线**，
+两条轴**分开答**。混着答会让"再加一个采集项"盖住"证据引用指向不存在的文件"这种更该先修的问题。
+
+| # | 缺陷 | 性质 |
+|---|---|---|
+| OF-33 | 42 条规则的 `evidence_refs` 是 1.4 中文 `.tsv` **假路径**，产物里 48 处指向不存在的文件 | 口径（P0） |
+| OF-34 | 块校验规则按 `VALUE ∈ {OFF,FALSE,NONE}` 一刀切 ⇒ `filesystemio_options=none`（默认值）被误算；标题与事实不符 | 判据（P1） |
+| OF-35 | 密码过期与锁定账户两条 finding 语义重叠、数字差 1（35 vs 34，差的正是 `SYS`） | 判据（P1） |
+| OF-36 | F-003（high）的 facts 恒为空（写死 `[]`）⇒ 交付物「依据」列空白 | 呈现（P2） |
+| OF-37 | 缺口表「原因」列整列印英文报错（`506 Cannot talk to daemon` / `TNS-12541: TNS:no listener`） | 呈现（P2） |
+| OF-38 | 数据侧守门把 `# … psv-empty` 占位行当表头 ⇒ 37/98 个文件**从未被判定**却报「无违规」 | 假绿（P2） |
+
+- **★ OF-33 的教训（两步才算修完）**：只把 `tables/xxx.tsv` 的外壳去掉是不够的 ——
+  仍有 8 条指向 2.0 **已改名的旧标题**（`FRA使用统计`、`表空间使用情况`、`特权用户`、
+  `用户密码过期预警`、`缺失统计信息表`、`重做日志切换频率`、`Scheduler失败作业`）与 `collection_status`。
+  **改完必须拿「可解析性」当验收判据**（能不能落到一张真表/一个真文件上），
+  而不是"看起来像个名字了"。验收：本包 61 条渲染引用 **0 条解析不到**，DOCX 里 `.tsv`/`.psv` 字样 0。
+- **★ 守门与取数键审计共用同一把尺子**：`package_adapter.known_table_keys()` ∪ OS 层合法键 ∪
+  采集包契约里的固定文件路径。**单列一份"合法引用名"清单 = 又养第二份映射表**，那正是这轮漂移的成因。
+  含尺子自证（三种真实缺陷形态必须被抓）与防误伤配对（`filesystems`、`snapshot.json#time_evidence` 不许报）。
+- **★ OF-35 的连带影响**：改采集脚本标题 ⇒ `item_titles.json` 重生成 ⇒ **旧标题不再是 2.0 词表项**，
+  必须登记进 `package_adapter.LEGACY_ALIASES`，否则 1.4 包上那条规则静默「证据不足」。
+  这条漏了会让取数键守门**真实变红**（`✗ 含未登记名`）—— 是它把问题兜住的。
+- **★ OF-37 的映射表口径**：`GAP_REASON_NOTES` / `GAP_ACTION_NOTES` 都在
+  `inspection_core/word_engine.py` 模块级，**未命中一律原样返回**（fail-safe）；输出「中文说明（原始信息：…）」。
+  互斥跳过的项 `补充建议` 由「修复采集条件后重采」改「无需处理」—— **原语义相反**（它并没有采集失败）。
+  三库影响面已核：四库基线缺口 reason 无一命中 ⇒ 其余三库产物逐字节不变。
+- **★ OF-38 是"没有能力说出自己没采集"的又一变体**：占位文件**无表头**，
+  而工具拿 `lines[0]` 当表头；当前包每个占位文件只有这一行、恰好不报违规 ⇒ 绿的，但那 37 个文件
+  **从来没被检查过**。修法 = 与下游三处同一个 `#` 判据跳过 + **单独计数**
+  （98 个文件 → 37 占位 / 61 实判），单独计数就是为了不让"没记录可查"混进"查过没问题"。
+- **守门**：`tests/test_oracle_lookup_keys.py::EvidenceRefResolvabilityTests`（4）、
+  `tests/test_word_engine.py::GapReasonLocalisationTests`（6，含**运行期负控制**：
+  清空映射表后同一批样本必须逐字原样返回）、
+  `tests/test_oracle_psv_records.py::PlaceholderLineTests`（5，含负控制与"占位文件在场也不许把旁边真违规一起跳过去"）。
+- **回归**：全量 **508 passed / 5 failed**（5 条全部既有 `tests/test_mysql_*`，MySQL 源包不在仓库）。
+  批 21 上半段记录的 `test_oracle_lookup_keys` 2 条失败，根因就是 OF-35 的旧标题未登记，已随本节修掉。
+- **基线刷新**：`tests/baselines/oracle/current/` 用**同一个源包**（08-10 1.4 包）整体重出 +
+  重算 `output_sha256`；**`expected_summary` 逐项相同**（这是"业务判据零变化"的强证据）。
+  `source_implementation.*` 按既有约定**刻意不重写**；旧 `refreshed_detail` 随 `refreshed_history` 保留。
+- **未做（明确记下）**：① 采集脚本的 3 个「可动可不动」点（无通用「值含 `|`」防护 /
+  `COLUMN path FORMAT a80` 孤立声明 / `SUBSTR(value,1,500)` 满余量）—— 用户决定**都不动**；
+  ② `oracle.awr.report` 这一**新增产物型采集项**不进 `item_titles.json`（它不是表），
+  `package_adapter._load_tables` 目前只对 `tables/` 前缀做反查 ⇒ 若将来有规则引用它，得先补消费者。

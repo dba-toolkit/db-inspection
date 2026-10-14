@@ -797,7 +797,7 @@ grep -c 'run_with_timeout' inspection/oracle_inspection.sh  # 13 处调用 + 1 �
 
 ```bash
 python _work/_b1_make_verify.py            # 生成自测脚本（内含两道静态守门）
-bash _work/_verify_b1.sh                   # 批 0–7 综合：T1–T26，PASS=139 / FAIL=0（约 1 分钟）
+bash _work/_verify_b1.sh                   # 批 0–21 综合：T1–T27，PASS=154 / FAIL=0（不连真库；Windows Git Bash 下较慢）
 python _work/_scan_record_status.py inspection/oracle_inspection.sh   # 第四道守门（record_status arity，须 rc=0）
 bash -n inspection/oracle_inspection.sh    # 语法
 ```
@@ -1190,3 +1190,25 @@ bash -n inspection/oracle_inspection.sh    # 语法
 按**语句**聚合取数点，四档输出，`✗ 含未登记名` 退出码非 0。
 ★ 它认得的取数 API 列在 `_TABLE_ATTRS` / `_TABLE_GETTERS` —— **加新 API 必须同步这里**，
 否则新调用点对尺子不可见（静默漏审）。
+
+### 11.22 批 21 改造后的增量（2026-10-14，**采集层**；新增一个「产物型」采集项）
+
+**背景**：现场 2.0 包（ZYDB / 2026-10-14）里 AWR 报告既没生成、包里也翻不到。查出两个独立缺陷
+（许可闸门把「跳过」记成 `ok`；AWR HTML 落在 `TASK_DIR` 之外 ⇒ 永不进包）。
+详见 `docs/oracle-collector-fix-plan.md` 的 §批 21（OF-31 / OF-32）。
+
+| # | 契约变化 | 落点 | Python 侧要知道的事 |
+|:--:|---|---|---|
+| 1 | **新增采集项 `oracle.awr.report`**（`category = sql`），产物型 | `status/oracle.awr.report.tsv`；文件 `evidence/<prefix>_awr_<tag>_<qctime>.html` | 本项**不是表**，别去 `tables/` 找。`output_file` 是**相对包根**的真实路径；注意 `package_adapter._load_tables` 目前**只对 `tables/` 前缀**做「文件 → item_id」反查，`evidence/` 前缀暂无消费者（`coverage_audit` 的 evidence 只认 `.txt`，故这张 `.html` 不会进「无人提及」清单） |
+| 2 | **模块级新增一种「非失败的非 ok」状态**：`oracle.module.awr_report` 在许可未确认时记 **`not_enabled`**（原先恒 `ok`） | `status/oracle.module.awr_report.tsv` | 它会进 `quality.non_ok_items` ⇒ 报告附录「数据缺口」多一行（状态词走 `STATUS_DISPLAY` → 「未启用」）；`quality.score` 按既有权重 `not_enabled=0.8` 计（原先按 `ok=1.0`） |
+| 3 | **新增模块内部返回码 `EXIT_POLICY_SKIP=40`** | `run_module` | 语义 = 「模块跑了，但按许可/前置条件没采集」。记账为 `not_enabled`、**不计入失败数**、不写「采集异常」。§8 的退出码表**不含 40** —— status 里的 `exit_code=40` 是模块内部码，不是脚本终态退出码 |
+
+**不变量（本批没动）**：
+
+- 许可未确认时**不产生** `oracle.awr.report` 这一行 —— 「没生成」不许伪装成「空结果」或「0」。
+- 生成失败记 `error`，reason **只取 `ORA-` 编号**（不整段落盘，避免输出里夹带连接串痕迹）。
+- 旧包（脚本不重跑）**不会**出现该行 ⇒ 历史包的分析结论与基线不受影响。
+
+**一处容易误判的地方**：`AWR_REPORT` 的**默认值是 1**，所以命令行加不加 `--awr-report` 对结果
+没有区别；真正决定跑不跑的是 `--diagnostics-pack`（默认 0）。现场「打开了 AWR 报告却没采到」
+的根因就是这个不对称 —— 开场现在会显式告警，不再静默。

@@ -2166,6 +2166,173 @@ Oracle / PG 改为只产出 spec。
 
 **未做**：Pillow 降级图左上角 y 轴标签与首个刻度轻微重叠（既有布局问题，另记）。
 
+## 批 21：AWR 报告的许可闸门与产物落点（采集层）✅ 已完成（2026-10-14，仅动 `inspection/oracle_inspection.sh`）
+
+**触发**：现场问「AWR 报告采集打开了，为什么没采到？产物放哪？包里怎么没有？」
+复核 2.0 实包（`oracle_inspection_task_ZYDB_…_2026-10-14_09-26-21.tar.gz`）后确认**两个独立缺陷**。
+
+### OF-31 许可闸门把「跳过」记成 `ok`【P0 · 口径】
+
+- **实际行为**：`collect_awr_report` 的双开关闸门（`AWR_REPORT` + `DIAGNOSTICS_PACK`）不满足时
+  直接 `return 0`。`run_module` 按 `rc=0 → ok` 记账 ⇒ 包内 `status/oracle.module.awr_report.tsv`
+  = `ok / 13ms / row_count 0 / exit_code 0 / reason 空`（13ms 就是函数开头 return 的耗时，
+  真生成 AWR 是秒级）。控制台与 `summary.txt` 的分档里它落在「成功 ok 117」，**看不出被跳过**。
+- **还有一处不对称**：`CONFIG[AWR_REPORT]` **默认就是 1**，所以「加 `--awr-report`」这个动作
+  等于什么都没改变；真正卡住的是 `DIAGNOSTICS_PACK`（默认 0）。现场 `tables/capabilities.tsv`
+  实测 `diagnostics_pack 0` —— 而快照是齐的（`oracle.basic.awr_snapshot_status.psv` = snap
+  166–184，最新 2026-10-14 09:05）、`oracle.awr.package_access.psv` 的
+  `control_management_pack_access = DIAGNOSTIC+TUNING`，纯属开关没开。
+  （反方向另有不对称：`--no-diagnostics-pack` 会顺手把 `AWR_REPORT` 也置 0。）
+- **改法**：新增模块级**策略跳过码** `EXIT_POLICY_SKIP=40`，闸门分支 `return "$EXIT_POLICY_SKIP"`
+  并设 `MODULE_REASON`；`run_module` 在 `rc -ne 0 → error` 分支**之前**拦下，记 `not_enabled`
+  + reason，**不**累加 `MODULES_FAILED`、**不**往 md 里写「采集异常」。
+  ⚠ 为什么非要一个专用码：若直接返回 1，就从「错记成功」变成「错记失败」——两个极端都不对
+  （负控制实测：删掉这个分支后状态确实退化成 `error`）。
+  另加开场显式告警：`AWR_REPORT=1 且 DIAGNOSTICS_PACK=0` 时在终端与日志各出一行。
+
+### OF-32 AWR 报告落在 `TASK_DIR` 之外，永不进包【P0 · 产物】
+
+- **实际行为**：`awr_file` 写在 `${CONFIG[REPORT_DIR]}/…`，而 `REPORT_DIR` 与 `TASK_DIR`
+  **同级**；打包是 `tar -C <parent> -czf … <basename TASK_DIR>`（**只打 TASK_DIR**）
+  ⇒ AWR HTML **哪怕生成成功也永远不会进包**。且它**没有 `record_status` 登记、不进 manifest**，
+  只在包外留一个孤儿文件（文件名带 `qctime` 不覆盖，长期堆积）。实测现场 2.0 包 316 个条目里
+  一个 AWR 报告都没有；同一个原因，`RUNTIME[REPORT_FILE]` 的 `.md` 也不在包内
+  （manifest 307 项、`.md` 0 项 —— 这是早就定下的操作员副本定位，**不在本批范围内**）。
+- **改法**：落点改为 `$EVIDENCE_DIR`（`TASK_DIR/evidence/`；未开结构化包时回退 `REPORT_DIR`
+  保持原行为），并新增采集项 `oracle.awr.report` 登记：
+  成功 → `ok` + `output_file = evidence/<prefix>_awr_<tag>_<qctime>.html`（**相对包根、可真解析**）；
+  生成失败 → `error` + reason（**只取 `ORA-` 编号**，不整段落盘，避免输出里夹带连接串痕迹）。
+  「没生成」与「没采集」不许长得一样：未确认许可时**不产生该行**（不加行、不补 0）。
+- **下游影响（预期交付物变更，旧包不受影响，基线无需刷新）**：
+  ① `summary.txt` 的「未启用」分档 +1，并进「失败项明细」清单（可被看见）；
+  ② `package_adapter` 的 `non_ok_items` 收录它 ⇒ 报告附录「数据缺口」表多一行
+  （状态词走 `STATUS_DISPLAY` → 「未启用」）；
+  ③ `quality.score` 按既有权重 `not_enabled=0.8`（原先按 `ok=1.0` 计）⇒ 采集质量分微降。
+
+### 验收证据（可复跑）
+
+- `python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh` → **PASS=154 / FAIL=0**（新增 **T27**；
+  单跑 `bash _work/_b21_t27_only.sh` = **PASS=15 / FAIL=0**）。
+  T27 覆盖：许可未确认 = `not_enabled`（且 `exit_code=40`、reason 含开关名、**不产生产物项**）/
+  生成成功 = 模块 `ok`（防误伤）+ 产物 `ok` + `output_file` **按包根真能解析到文件** + 包外无孤儿 /
+  生成失败 = `error` 且 reason 带 `ORA-` 编号 / 空输出 = `error` / 另有三条静态断言
+  （闸门走跳过码、落点优先 `EVIDENCE_DIR`、`run_module` 认得这个码）。
+  并给假 sqlplus 补了两个探针（`*AWR_REPORT_HTML*` / `*dba_hist_snapshot*`）——
+  没有它们函数会落到「快照不足 2 个」分支，T27 会**假绿**。
+  ⚠ 生成器 prelude 还必须补 `CONFIG[REPORT_PREFIX]`（抽取器只抽函数、不抽顶层 CONFIG，见其注释）——
+  漏了的话产物文件名算成 `evidence/_awr_….html`，T27 会**假红**（测试环境缺声明，不是采集器缺陷）。
+- **静态尺子自证**：把三处判据逐一改坏成副本（`return "$EXIT_POLICY_SKIP"`→`return 0`、
+  `awr_dir="$EVIDENCE_DIR"`→`REPORT_DIR`、`rc -eq "$EXIT_POLICY_SKIP"`→`false`），
+  用**同一个 T27** 跑（`B1_SRC=<变异副本>`）→ **三条静态断言全红（PASS=12 FAIL=3）**，运行时断言不动。
+- **负控制**（`_work/_b21_awr_harness.py`，从真实脚本逐字抽函数、独立跑）：
+  ① 删掉 `run_module` 的策略跳过分支 → 场景 1 由 `not_enabled` 变 `error`（其余仍绿）；
+  ② 落点改回 `REPORT_DIR` → 产物断言变红（`output_file` 成为绝对路径、包外出现孤儿文件），
+  其余仍绿。两组都**只在自己那条断言上变红**，配对反误伤成立。
+- `bash -n` 通过；纯 LF、无 BOM 保持；`tools/check_oracle_psv_widths.py` 四类判据全过
+  （136 个 SQL 项、26 条列宽声明）；生成期三道静态守门通过（反引号 / 裸美元 / `record_status` 实参=10）。
+- 全量回归：**502 passed / 7 failed**（**本节所属时点**的数字）。其中 5 条是长期既有
+  （`tests/test_mysql_*`，MySQL 源包不在仓库）；另 2 条 `tests/test_oracle_lookup_keys.py`
+  读的是 `plugins/oracle/oracle_rules.py` 的「用户密码过期预警」取数键未登记，
+  属工作区里**上一轮未提交的 Python 改动**（该测试**只读 `plugins/oracle/*.py`、不读采集脚本**，
+  与本节的采集层改动无因果）。
+  ⚠ 那 2 条**已随下一节 OF-35**（旧标题登记进 `LEGACY_ALIASES`）修掉 ⇒ **当前**全量回归为
+  **508 passed / 5 failed**（5 条全部既有），见下一节「验收证据」。读这两节时以 508/5 为准，
+  不要把本节的 7 条误记成"现在的失败面"。
+  ⚠ 用例总数随批次增长（批 20 记 471、本节 502、当前 508），**别拿两批的 passed 数相减**当作本批新增用例数。
+
+## 批 21 续：证据引用域归一 / 规则判据修正 / 缺口原因中文化（分析层 + 报告层）✅ 已完成（2026-10-14）
+
+**触发**：交付前的客户级审查（同一份 2.0 实包 `…_2026-10-14_09-26-21.tar.gz` 的报告）。
+审查把问题分成**加分题（缺采集项）**与**及格线（代码正确性缺陷）**两条轴 —— 本节全部属后者。
+
+### OF-33 证据引用全部指向不存在的文件【P0 · 口径】
+
+- **实际行为**：规则包 42 条里有 36 条把 `evidence_refs` 写成 **1.4 时代中文 `.tsv` 的假路径**
+  （`tables/归档模式检查.tsv`），而 2.0 的产物是 `tables/<item_id>.psv` ⇒ 交付物「证据引用」
+  列里写的文件**一个都不存在**（产物里共 **48 处**）。它不报错、不抛异常、测试全绿。
+- **改法分两步**（只做第一步会留下"看着像真名字、仍然解析不到"的残余）：
+  1. `tables/xxx.tsv` → `xxx`（36 处 / 34 行 diff）；
+  2. 改名后仍有 **8 条指向 2.0 已改名的旧标题** + 1 条 `collection_status`，逐条按**规则实际取数的表**
+     改成当前名：
+     `FRA使用统计`→`闪回区使用情况` + `ASM 快速恢复区使用情况`（该规则两个分支各自取表，故列两条）、
+     `表空间使用情况`→`所有表空间容量使用情况`（`metrics.tablespace_max_capacity_pct` 的取数表）、
+     `asm_diskgroup_summary`→`ASM 磁盘组汇总`、`Scheduler失败作业`→`Scheduler 失败作业（近7天）`、
+     `特权用户`→`特权用户 (DBA角色)`、`用户密码过期预警`→新标题、`缺失统计信息表`→`缺失统计信息表 (TOP20)`、
+     `重做日志切换频率`→`重做日志切换频率（近24小时）`、`collection_status`→`collection_status.json`。
+- **验收**：产物 61 条渲染引用 **0 条解析不到**；DOCX 里 `.tsv`/`.psv` 字样 **0**。
+- **守门** `tests/test_oracle_lookup_keys.py::EvidenceRefResolvabilityTests`（4 用例）：尺子与取数键审计
+  **共用同一份** `package_adapter.known_table_keys()` ∪ OS 层合法键 ∪ 采集包契约里的固定文件路径 ——
+  单列一份"合法引用名"就是又养第二份映射表，那正是这轮漂移的成因。含尺子自证
+  （`tables/归档模式检查.tsv` / `FRA使用统计` / `用户密码过期预警` 三种真实缺陷形态必须被抓）与防误伤配对
+  （OS 层键、`snapshot.json#time_evidence`、`history/*.csv` 不许报）。
+
+### OF-34 块校验规则的标题与事实不符【P1 · 判据】
+
+- **实际行为**：判据是「`VALUE ∈ {OFF,FALSE,NONE}` 一刀切」⇒ `filesystemio_options=none`
+  （**Oracle 默认值**，不是安全开关）被算成"未开启"；而 `db_block_checksum=TYPICAL` 不在 bad 集合里，
+  标题却写「块校验参数未开启」。facts 只列参数名不给取值，读者无从核对。实包 reason = 「4 个参数未开启」。
+- **改法**：判据改为按**参数白名单**（`db_block_checking` / `db_lost_write_protect` / `db_ultra_safe`）
+  判定；标题改「块校验与丢失写保护参数未开启」，summary 说明 `db_block_checksum` 默认 `TYPICAL` 属已开启；
+  facts 带参数与取值。实包 reason 由「4 个参数未开启」变「**3 个参数未开启**」。
+
+### OF-35 密码过期与锁定账户两条规则讲同一件事【P1 · 判据】
+
+- **实际行为**：`_check_password_expiry` 用 `len(rows) > 0` 判定，而采集表的 SQL 是
+  `WHERE account_status != 'OPEN' OR (… < 30)` ⇒ 把 34 个**锁定账户**也算进来，报「35 个账户需关注」；
+  同一份报告里 `ORA.SECURITY.ACCOUNT_LOCKED` 报「locked_accounts=34」——**两条 finding 语义重叠、数字差 1**
+  （差的正是 `SYS`：OPEN 但 `DAYS_UNTIL_EXPIRE=-2557`）。
+- **改法**：① 规则只统计 `ACCOUNT_STATUS` 不含 `LOCKED` 的账户；② 采集 SQL 同步改为
+  `WHERE account_status = 'OPEN' AND oracle_maintained = 'N' AND expiry_date IS NOT NULL
+  AND expiry_date - SYSDATE BETWEEN 0 AND 30`（**下次采集生效**）；③ 标题改「账户密码临近过期」，
+  summary 指回「锁定账户数量偏多」那条；④ 采集脚本标题改了 ⇒ `item_titles.json` 重生成，**旧标题登记进
+  `LEGACY_ALIASES`** 供 1.4 包取数（否则那条规则在 1.4 包上静默「证据不足」）。
+  实包 count 由 35 变 **1**，与 `locked_accounts=34` 不再重叠。
+
+### OF-36 备份规则的 facts 恒为空【P2 · 呈现】
+
+`_check_backup_recent` 写死 `_evaluate(..., [], state)` ⇒ 交付物里「依据」列整列空白，
+而这条是 **high** 风险。改为输出 `recent_backup_count` 与「已查询备份任务表，未命中
+COMPLETED / COMPLETED WITH WARNINGS 记录」。
+
+### OF-37 数据缺口表的「原因」列整列印英文报错【P2 · 呈现】
+
+采集器的 `reason` 是**运行期原文**：`506 Cannot talk to daemon`（chronyd 未运行）、
+`Linux Error: 111: Connection refused … TNS-12541: TNS:no listener`（监听器未启动）、
+`ip available; ifconfig is the mutually-exclusive fallback`（按设计跳过）—— 5 条缺口的原因列全是英文。
+改为在 `inspection_core/word_engine.py` 加**模块级映射表** `GAP_REASON_NOTES`（按模式匹配，
+**未命中一律原样返回**，fail-safe），输出「中文说明（原始信息：<截断到 80 字符>）」；
+另加 `GAP_ACTION_NOTES`：与已成功采集项**互斥而跳过**的项，`补充建议` 由「修复采集条件后重采」
+改为「无需处理」（原语义**相反** —— 它并没有采集失败）。守门
+`tests/test_word_engine.py::GapReasonLocalisationTests`（6 用例，含**运行期负控制**：
+清空映射表后同一批样本必须逐字原样返回，证明中文确实来自那张表）。
+⚠ 三库影响面已核：四库基线的缺口 reason 无一命中这些模式 ⇒ 其余三库产物逐字节不变。
+
+### OF-38 数据侧守门把占位行当表头 ⇒ 「从来没被检查过」却是绿的【P2 · 假绿】
+
+`tools/check_oracle_psv_records.py` 的 `classify()` 原先只跳空行，`lines[0]` 被当表头；
+而 `# oracle-inspection psv-empty …` 是**无表头的占位形态**。当前 2.0 包每个占位文件只有这一行、
+后面没有数据行，于是**恰好**不报违规 —— 98 个文件里 **37 个从未被判定**，输出却是「无违规」。
+改为与下游三处（`tabular.py` / `package_adapter.py` / `presentation.py`）**同一个 `#` 判据**跳过，
+并**单独计数**（本包：98 个文件 → **37 个占位 / 61 个实判**）。守门
+`tests/test_oracle_psv_records.py::PlaceholderLineTests`（5 用例，含负控制：把 `_is_comment`
+换成恒假后同一行必须被报出，以及"占位文件在场也不许把旁边真违规一起跳过去"）。
+
+### 验收证据（可复跑）
+
+- 端到端：`python analyze.py <2.0 包> -o DIR` → `python generate_report.py DIR`，两次 exit 0；
+  12 findings / Score 20 与改前一致（**业务结论不变**）。
+- 与改前逐项 diff（`_work/_b21_before` vs `_work/_b21_after2`）：差异**只**落在
+  `evidence_refs` / `块校验与密码过期两条规则的 title+summary+recommendation+facts` / `F-003 facts` /
+  缺口表；其余字段逐项相同。
+- 全量回归：**508 passed / 5 failed**，5 条**全部既有**（`tests/test_mysql_*`，MySQL 源包不在仓库）。
+  ⚠ 本批上半段（采集层 AWR）记录的「502 passed / 7 failed」里的 2 条 `test_oracle_lookup_keys`
+  失败，**根因就是 OF-35 的旧标题未登记**，已随本节修掉 ⇒ 回到长期基线 5 条。
+- 基线刷新：`tests/baselines/oracle/current/` 用**同一个源包**（08-10 1.4 包）整体重出
+  （含 docx 与 charts）+ 重算 `output_sha256`；**`expected_summary` 逐项相同**
+  （instances 1 / quality 100.0 / score 23 / rules 42 / triggered 11 / passed 24 / not_evaluated 7 /
+  sections 9 / items 76 / charts 10 / risk_register 11 / severity 2-2-5-2）——这是"业务判据零变化"的强证据。
+  `source_implementation.*` 按既有约定**刻意不重写**；旧 `refreshed_detail` 随 `refreshed_history` 保留。
+
 ## 0.5 实测复核：真实采集包逐条验证（2026-10-09）
 
 **复核对象**：`oracle_inspection_task_ZYDB_db01_192.168.100.80_1521_zydb1_2026-10-09_22-47-04.tar.gz`  
@@ -2310,6 +2477,7 @@ Oracle 侧原**一个测试都没有**；**批 1 起已建立构造自测**（`_
    - 批 2：`_work/_verify_b2os.sh`（OF-06/07/09/11/12/18 综合 → **PASS=20 / FAIL=0**）、`_work/_verify_b2.sh`（OF-06 独立）。
    - 批 3：`_work/_verify_b3.sh` + `_work/_verify_b3_pkg.sh`。
    - 批 2 后 `bash -n` 通过、`run_with_timeout` 13 处调用、`collect_sys_info` 内重复裸命令归零。
+   - **批 21（最新，仅 `inspection/oracle_inspection.sh`）**：`python _work/_b1_make_verify.py` → `bash _work/_verify_b1.sh` → **PASS=154 / FAIL=0**（新增 **T27**：AWR 许可闸门 + 产物落点；单跑 15/0）。负控制 `_work/_b21_awr_harness.py` 两组，各自**只红对应断言**；静态断言另做尺子自证（变异副本 → 3 红）。
 
 ---
 
