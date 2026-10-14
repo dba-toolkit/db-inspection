@@ -1249,7 +1249,19 @@ def build_inspection_sections(ctx: Any, metrics: dict[str, Any],
     sections.append({"section_id": "objects", "title": "对象检查", "items": obj_items})
 
     # ── 10. 安全与审计检查 (security) ──
-    pwd_rows = ctx.tables.get("用户密码过期预警（账户非OPEN或30天内到期）", []) or ctx.tables.get("用户密码过期预警", [])
+    # 表名跟着采集脚本的标题走（item_titles.json 由脚本生成），同时留旧标题与 item_id 兜底：
+    # 1.4 包 / 2.0 包 / 改名前后都能取到 —— 否则「改一个标题」就会静默变成取不到数。
+    # 过滤掉 LOCKED：锁定账户由下一张「锁定账户」表展示，混进密码过期预警表会与本条规则
+    # （已改为只统计未锁定账户）自相矛盾。
+    pwd_rows = [
+        row for row in (
+            ctx.tables.get("用户密码过期预警（OPEN 账户 30 天内到期）", [])
+            or ctx.tables.get("用户密码过期预警（账户非OPEN或30天内到期）", [])
+            or ctx.tables.get("oracle.basic.password_expiry", [])
+            or ctx.tables.get("用户密码过期预警", [])
+        )
+        if "LOCKED" not in str(row.get("ACCOUNT_STATUS", "")).upper()
+    ]
     display_pwd: list[dict[str, Any]] = []
     for row in pwd_rows[:20]:
         display_pwd.append({
@@ -1614,12 +1626,9 @@ def build_report_model(analysis: dict[str, Any], inspection_sections_list: list[
 
     # ── collection_gaps ──
     collection_gaps: list[dict[str, Any]] = []
-    gap_status_cn: dict[str, str] = {
-        "partial": "部分可用", "permission_denied": "权限不足",
-        "timeout": "超时", "error": "失败",
-        "insufficient_history": "历史不足",
-        "external_evidence_required": "需要外部证据",
-    }
+    # ★ 批 21：此处原有一份 `gap_status_cn`（6 键字典），**只定义、从未被引用** ——
+    #   既是死代码，也是「第二份状态词表」的苗头（第一份已在批 19 收口到
+    #   `inspection_core/word_engine.py::STATUS_DISPLAY`）。删除，避免下次有人照着它再加一份。
     for item in quality.get("non_ok_items", []):
         status = str(item.get("status", ""))
         if status in {"ok", "empty", "not_applicable"}:

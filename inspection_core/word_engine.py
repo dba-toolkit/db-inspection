@@ -250,6 +250,57 @@ def gap_status_text(value: Any) -> str:
     return STATUS_DISPLAY.get(raw.lower(), raw)
 
 
+# ★ 批 21：采集器的 `reason` 是**运行期原文**（服务未运行时，命令自己的英文报错被原样收下），
+#   于是「数据缺口」表的「原因」列会把 `506 Cannot talk to daemon`、`TNS-12541: TNS:no listener`
+#   这类字符串直接交付给客户 —— 表格里唯一一处整列说英文的地方。
+#   这里按**模式**映射成中文说明，并附原始信息以便追溯；**未命中模式一律原样返回**
+#   （fail-safe：宁可保留原文，也不改写没见过的内容）。
+#   单一来源 = 本表；新增映射必须加在这里（就地写死则"漏一条"只能靠肉眼，而 Excel 里不报错）。
+GAP_REASON_NOTES: tuple[tuple[str, str], ...] = (
+    ("no listener", "数据库监听器未启动或未监听（连接被拒）"),
+    ("cannot talk to daemon", "时间同步守护进程（chronyd/NTP）未运行"),
+    ("connection refused", "目标服务端口未开放（服务未启动）"),
+    ("mutually-exclusive fallback", "同类命令已成功采集，本项作为互斥备选按设计跳过"),
+)
+
+# ★ 同上：`推荐动作` 列原先是展示层写死的一句话，对「按设计跳过」的项**语义相反**
+#   （它并没有采集失败、重采也无意义）。只覆盖这一类，其余仍用采集侧给的原文。
+GAP_ACTION_NOTES: tuple[tuple[str, str], ...] = (
+    ("mutually-exclusive fallback", "无需处理：该项与已成功的同类采集项互斥，按设计跳过。"),
+)
+
+# 原始信息保留长度：够定位（TNS 报错的关键片段在前 80 字符内），又不至于撑破单元格。
+_GAP_RAW_KEEP = 80
+
+
+def _gap_matched(text_value: Any, table: tuple[tuple[str, str], ...]) -> str:
+    """在 `table` 里按模式找中文说明；未命中返回空串。"""
+    low = str(text_value or "").strip().lower()
+    if not low:
+        return ""
+    for pattern, note in table:
+        if pattern in low:
+            return note
+    return ""
+
+
+def gap_reason_text(reason: Any) -> str:
+    """「数据缺口」表的「原因」列：命中模式 → 中文说明（附原始信息），否则原样返回。"""
+    raw = str(reason or "").strip()
+    note = _gap_matched(raw, GAP_REASON_NOTES)
+    if not note:
+        return raw
+    detail = raw if len(raw) <= _GAP_RAW_KEEP else raw[:_GAP_RAW_KEEP].rstrip() + "…"
+    return f"{note}（原始信息：{detail}）"
+
+
+def gap_action_text(reason: Any, action: Any) -> str:
+    """「数据缺口」表的「推荐动作」列：只在语义相反时改写，否则沿用原文。"""
+    note = _gap_matched(reason, GAP_ACTION_NOTES)
+    return note or text(action)
+
+
+
 def clean_limitation(value: Any) -> str:
     raw = str(value)
     if "system.filesystems" in raw:
@@ -1764,8 +1815,9 @@ class WordReportEngine:
             self.data_table([{
                 "采集项": gap.get("item_id"),
                 "状态": gap_status_text(gap.get("status")),
-                "原因": gap.get("reason"),
-                "补充建议": gap.get("recommended_action"),
+                # ★ 批 21：原因列原先直接印采集器原文（英文报错），改为 `gap_reason_text` 中文化。
+                "原因": gap_reason_text(gap.get("reason")),
+                "补充建议": gap_action_text(gap.get("reason"), gap.get("recommended_action")),
             } for gap in gaps])
             subsection += 1
         self.heading(f"{main_number}.{subsection} 规则执行状态", 2)
@@ -1892,8 +1944,9 @@ class WordReportEngine:
                 {
                     "采集项": gap.get("item_id"),
                     "状态": gap_status_text(gap.get("status")),
-                    "原因": gap.get("reason"),
-                    "补充建议": gap.get("recommended_action"),
+                    # ★ 批 21：同 professional —— 原因列中文化（未命中模式原样带出）。
+                    "原因": gap_reason_text(gap.get("reason")),
+                    "补充建议": gap_action_text(gap.get("reason"), gap.get("recommended_action")),
                 }
                 for gap in gaps
             ])

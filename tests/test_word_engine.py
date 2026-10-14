@@ -570,5 +570,121 @@ class CollectionStatusVocabularyTests(unittest.TestCase):
                     self.assertNotIn(status, cells, f"{layout} 布局把 {status} 原样印出来了")
 
 
+class GapReasonLocalisationTests(unittest.TestCase):
+    """批 21：「数据缺口」表的「原因」列不许整列印英文报错。
+
+    真实缺陷：采集器的 `reason` 是**运行期原文** —— 服务没起来时，命令自己的英文报错
+    （`506 Cannot talk to daemon`、`TNS-12541: TNS:no listener`）被原样收下，于是
+    Oracle 2.0 报告的 §16.2 表格里，5 条缺口的「原因」列全是一串英文。
+    它不报错、不抛异常、测试也不红（四库基线里没有一条缺口命中这些模式）。
+    """
+
+    # 取自 2.0 采集包 `analysis_output/report_model_standard.json` 的**真实** 5 条。
+    REAL_REASONS = (
+        "506 Cannot talk to daemon ",
+        "506 Cannot talk to daemon ",
+        "ip available; ifconfig is the mutually-exclusive fallback",
+        " Linux Error: 111: Connection refused Connecting to "
+        "(DESCRIPTION=(ADDRESS=(PROTOCOL=IPC)(KEY=EXTPROC1521))) TNS-12541: TNS:no listener "
+        "TNS-12560: TNS:protocol adapter error TNS-00511: No listener",
+        "chronyc available; ntpq is the mutually-exclusive fallback",
+    )
+
+    # 另外三库基线里的真实 reason（必须**逐字不变**地穿过去）。
+    FOREIGN_REASONS = (
+        "数据库现场采集不能证明备份任务成功或备份可恢复",
+        "阈值 104857600 bytes",
+        "未检测到备份工具或定时任务",
+        "深度检查未启用：统计信息、索引碎片和孤立用户未扫描；使用 -IncludeDeepChecks 启用。",
+    )
+
+    def test_known_pattern_reasons_lead_with_chinese_and_keep_raw_trace(self) -> None:
+        """防漏判：5 条真原因都必须以中文说明开头，并保留可追溯的原始信息。"""
+        from inspection_core.word_engine import GAP_REASON_NOTES, gap_reason_text
+
+        expected = {
+            "506 Cannot talk to daemon ": "时间同步守护进程（chronyd/NTP）未运行",
+            "ip available; ifconfig is the mutually-exclusive fallback":
+                "同类命令已成功采集，本项作为互斥备选按设计跳过",
+            "chronyc available; ntpq is the mutually-exclusive fallback":
+                "同类命令已成功采集，本项作为互斥备选按设计跳过",
+        }
+        for raw, note in expected.items():
+            out = gap_reason_text(raw)
+            self.assertTrue(out.startswith(note), out)
+            self.assertIn("原始信息：", out, out)
+        # 长的 TNS 报错：中文在前 + 原文截断留痕（不能整段塞进单元格）
+        tns = gap_reason_text(self.REAL_REASONS[3])
+        self.assertTrue(tns.startswith("数据库监听器未启动或未监听（连接被拒）"), tns)
+        self.assertIn("…", tns, tns)
+        self.assertNotIn(self.REAL_REASONS[3].strip(), tns, "原始报错没有被截断")
+        self.assertLess(len(tns), 160, tns)
+        # 映射表的**每一条模式**都至少被这批真实样本命中过（防止写下永远不生效的死条目）
+        joined = " ".join(r.lower() for r in self.REAL_REASONS)
+        for pattern, _note in GAP_REASON_NOTES:
+            self.assertIn(pattern, joined, f"模式 {pattern!r} 没有真实样本能命中它")
+
+    def test_unmatched_reason_passes_through_byte_identical(self) -> None:
+        """**防误伤配对**：没命中模式的一律原样返回 —— 绝不把中文库的 reason 二次加工。"""
+        from inspection_core.word_engine import gap_reason_text
+
+        for raw in self.FOREIGN_REASONS:
+            self.assertEqual(gap_reason_text(raw), raw, raw)
+        # `None` / 空串：不许抛异常、不许产出「（原始信息：）」
+        for empty in (None, "", "   "):
+            self.assertEqual(gap_reason_text(empty), "")
+
+    def test_action_is_rewritten_only_where_the_generic_advice_is_wrong(self) -> None:
+        """「推荐动作」列：按设计跳过的项不该被劝「重采」，其余项沿用采集侧原文。"""
+        from inspection_core.word_engine import gap_action_text
+
+        generic = "修复采集条件后重采；已取得的部分数据仍保留为证据。"
+        mutex = "chronyc available; ntpq is the mutually-exclusive fallback"
+        self.assertEqual(gap_action_text(mutex, generic), "无需处理：该项与已成功的同类采集项互斥，按设计跳过。")
+        # 真失败（chronyd 没起来）仍然保留原建议
+        self.assertEqual(gap_action_text("506 Cannot talk to daemon ", generic), generic)
+
+    def test_mapping_table_is_the_only_thing_driving_the_output(self) -> None:
+        """**尺子自证**（运行期负控制）：清空映射表后，同一批样本必须逐字原样返回。
+
+        否则「输出是中文」可能来自别处（比如某个全局的后处理），而不是这张表。
+        """
+        import inspection_core.word_engine as word_engine
+
+        original = word_engine.GAP_REASON_NOTES
+        try:
+            word_engine.GAP_REASON_NOTES = ()
+            for raw in self.REAL_REASONS:
+                self.assertEqual(word_engine.gap_reason_text(raw), raw.strip(), raw)
+        finally:
+            word_engine.GAP_REASON_NOTES = original
+
+    def test_gap_table_renders_chinese_reason_in_both_layouts(self) -> None:
+        """端到端：把 5 条真缺口塞进真模型渲染，落在单元格里的必须是中文说明。"""
+        model = json.loads(json.dumps(read_json(REPORT_MODEL)))
+        model["collection_gaps"] = [
+            {"item_id": f"system.gap{i}", "status": "not_enabled", "reason": raw,
+             "recommended_action": "修复采集条件后重采；已取得的部分数据仍保留为证据。"}
+            for i, raw in enumerate(self.REAL_REASONS)
+        ]
+        head = "时间同步守护进程（chronyd/NTP）未运行（原始信息：506 Cannot talk to daemon）"
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "report_model.json"
+            write_json(model_path, model)
+            for layout in ("professional", "legacy"):
+                output = Path(temporary) / f"gaps-{layout}.docx"
+                MySQLWordReportGenerator(model_path, output, layout=layout).build()
+                cells = {
+                    cell.text
+                    for table in Document(output).tables
+                    for row in table.rows
+                    for cell in row.cells
+                }
+                self.assertIn(head, cells, layout)
+                # 原始英文只允许出现在「（原始信息：…）」括号里，不许作为整格值裸奔
+                self.assertNotIn("506 Cannot talk to daemon", cells, layout)
+                self.assertNotIn("506 Cannot talk to daemon ", cells, layout)
+
+
 if __name__ == "__main__":
     unittest.main()
