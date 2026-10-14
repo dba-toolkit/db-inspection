@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -330,6 +332,70 @@ class LiveRepositoryTests(unittest.TestCase):
         result = tool.audit({})
         self.assertGreaterEqual(len(result["sites"]), 20)
         self.assertLessEqual(len(result["sites"]), 60)
+
+
+class EvidenceRefResolvabilityTests(unittest.TestCase):
+    """批 21：规则包的 `evidence_refs` 必须指向**真的存在**的东西。
+
+    真实缺陷：Oracle 2.0 报告里 42 条规则有 36 条把「证据引用」写成 1.4 时代中文 `.tsv`
+    的**假路径**（`tables/归档模式检查.tsv`），而 2.0 的产物是 `tables/<item_id>.psv`
+    ⇒ 交付物那一列写的文件**一个都不存在**。它不报错、不抛异常、测试也全绿。
+    去掉 `tables/….tsv` 外壳之后仍有 8 条指向 2.0 里**已改名的旧标题**（`FRA使用统计`、
+    `表空间使用情况`、`特权用户`…）—— 看着像真名字，仍然解析不到。
+
+    尺子与取数键审计**共用一份**：`package_adapter.known_table_keys()`（`item_id` ∪ 1.4 标题
+    含等价写法 ∪ `LEGACY_ALIASES` ∪ 尾段别名）∪ OS 层合法键 ∪ 采集包契约里的固定文件路径。
+    单列一份"合法引用名"清单就等于又养了第二份映射表 —— 那正是这类漂移的成因。
+    """
+
+    # 采集包契约里的**非表**证据（`docs/oracle-collector-interface.md`）。
+    PATH_REF = re.compile(
+        r"^(manifest\.json|snapshot\.json(#\w+)?|collection_status\.json|packaging_status\.json"
+        r"|summary\.txt|(history|timeseries)/[\w.\-]+\.(csv|txt))$"
+    )
+
+    @classmethod
+    def _keys(cls) -> frozenset[str]:
+        from plugins.oracle.package_adapter import known_table_keys
+
+        return known_table_keys() | tool.ALLOWED_OS_KEYS
+
+    @classmethod
+    def _unresolved(cls, refs: list[str]) -> list[str]:
+        keys = cls._keys()
+        return [r for r in refs if r not in keys and not cls.PATH_REF.match(r)]
+
+    @staticmethod
+    def _rules() -> dict:
+        path = ROOT / "plugins" / "oracle" / "inspection_rules_oracle.json"
+        return json.loads(path.read_text(encoding="utf-8"))["rules"]
+
+    def test_every_rule_evidence_ref_resolves(self) -> None:
+        bad = {
+            rule_id: self._unresolved(rule.get("evidence_refs") or [])
+            for rule_id, rule in self._rules().items()
+        }
+        self.assertEqual({k: v for k, v in bad.items() if v}, {})
+
+    def test_no_rule_ships_without_evidence_refs(self) -> None:
+        """一条规则连引用都没有时，报告只能印「未登记证据引用」—— 等于没给证据。"""
+        missing = [rid for rid, rule in self._rules().items() if not (rule.get("evidence_refs") or [])]
+        self.assertEqual(missing, [])
+
+    def test_ruler_flags_the_exact_shapes_that_shipped(self) -> None:
+        """**尺子自证**：把两种真实缺陷形态喂进同一个 `_unresolved()`，必须都被抓到。"""
+        self.assertEqual(self._unresolved(["归档模式检查", "filesystems"]), [])
+        self.assertEqual(self._unresolved(["tables/归档模式检查.tsv"]), ["tables/归档模式检查.tsv"])
+        self.assertEqual(self._unresolved(["FRA使用统计"]), ["FRA使用统计"])
+        self.assertEqual(self._unresolved(["用户密码过期预警"]), ["用户密码过期预警"])
+
+    def test_ruler_does_not_wound_legal_refs(self) -> None:
+        """**防误伤配对**：OS 层键与契约里的文件路径都是合法引用，不许报。"""
+        legal = ["filesystems", "hugepages", "manifest.json", "collection_status.json",
+                 "snapshot.json#time_evidence", "history/sar_cpu.csv",
+                 "timeseries/oracle_sysstat.csv", "归档模式检查", "ASM 磁盘组汇总",
+                 "日志传输服务状态 (v$archive_dest)"]
+        self.assertEqual(self._unresolved(legal), [])
 
 
 if __name__ == "__main__":

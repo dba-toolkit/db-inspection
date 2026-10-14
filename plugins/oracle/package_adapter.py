@@ -49,6 +49,12 @@ LEGACY_ALIASES: dict[str, str] = {
     "scheduler_failures": "oracle.validation.scheduler_failed",
     "Scheduler失败": "oracle.validation.scheduler_failed",
     "archive_mode": "oracle.archive.mode",
+    # ★ 批 21：采集脚本把这一项的标题从「（账户非OPEN或30天内到期）」改成
+    #   「（OPEN 账户 30 天内到期）」（旧 SQL 把锁定账户也捞了进来，与 ACCOUNT_LOCKED 重叠），
+    #   `item_titles.json` 随之重生成 ⇒ **旧标题不再是 2.0 的词表项**。但 1.4 的
+    #   `tables/<中文标题>.tsv` 用的还是旧标题，规则层也保留它作兼容别名。
+    #   登记在这里，1.4 包才取得到数（否则那条规则在 1.4 包上静默「证据不足」）。
+    "用户密码过期预警（账户非OPEN或30天内到期）": "oracle.basic.password_expiry",
 }
 
 # 批 6 / N-8 把 4 个"扩展名说谎"的对齐文本从 `tables/` 挪到了 `evidence/*.txt`，

@@ -482,11 +482,19 @@ class OracleRuleEngine:
     def _check_backup_recent(self, metrics: dict[str, Any]) -> None:
         rule = "ORA.BACKUP.RECENT"
         has_backup, collected, state = _collected(metrics, "has_recent_backup")
+        # ★ 从前 facts 写死 `[]`，报告「事实依据」列只能落显示层的兜底文案「未提供事实」——
+        #   一条 high 级结论零事实支撑，而且**读者无法区分「查了确实没有」与「没查」**。
+        #   事实直接来自取数层：`recent_backup_count` 是本次查询命中的备份任务行数。
+        facts: list[str] = []
+        if collected:
+            facts.append(f"recent_backup_count={metrics.get('recent_backup_count', 0)}")
+            if not has_backup:
+                facts.append("已查询备份任务表，未命中 COMPLETED / COMPLETED WITH WARNINGS 记录")
         self._evaluate(
             rule, True, collected, not has_backup,
             ("备份正常" if has_backup else "近 48h 无成功备份") if collected
             else _missing_reason("最近备份集汇总", state),
-            [],
+            facts,
             state,
         )
 
@@ -577,12 +585,23 @@ class OracleRuleEngine:
         fetch = ctx.table_fetch("块校验与丢失写保护参数", "oracle.validation.block_checksum",
                                 "checksum_params")
         rows = fetch.rows
-        bad_params = [r for r in rows if str(r.get("VALUE", "")).upper() in {"OFF", "FALSE", "NONE"}]
+        # ★ 只判这三个「块校验 / 丢失写保护」开关，**不按值一刀切**。
+        #   从前是 `VALUE ∈ {OFF,FALSE,NONE}`，会把 `filesystemio_options=none` 一起算进来 ——
+        #   而 `none` 是 Oracle 的**默认取值**，不是"未开启"的缺陷（且无人负责这条参数）。
+        #   更糟的是 `db_block_checksum=TYPICAL`（默认为开）不在 bad 里，于是标题写成
+        #   「块校验参数未开启」而实际块校验是开着的 —— 客户一查 DBA 就发现标题不成立。
+        checked = {"db_block_checking", "db_lost_write_protect", "db_ultra_safe"}
+        bad_params = [
+            r for r in rows
+            if str(r.get("NAME", "")).lower() in checked
+            and str(r.get("VALUE", "")).upper() in {"OFF", "FALSE", "NONE"}
+        ]
         self._evaluate(
             rule, True, fetch.available, len(bad_params) > 0,
             (f"{len(bad_params)} 个参数未开启" if bad_params else "正常") if fetch.available
             else _missing_reason("块校验与丢失写保护参数", fetch_state(fetch)),
-            [f"params={[r.get('NAME') for r in bad_params]}"] if bad_params else [],
+            # 事实带**当前取值**：只列参数名客户无法自行核对「到底开没开」。
+            [f"{r.get('NAME')}={r.get('VALUE')}" for r in bad_params] if bad_params else [],
             fetch_state(fetch),
         )
 
@@ -593,15 +612,23 @@ class OracleRuleEngine:
         #   静默落到下一条、最后返回 `[]`，与"查了没有"不可分。改走 `table_fetch` 后
         #   命中哪个键、键的真实状态是什么都是可查的（批 19 的 B 项）。
         fetch = ctx.table_fetch(
-            "用户密码过期预警（账户非OPEN或30天内到期）", "oracle.basic.password_expiry",
-            "password_expiry",
+            "用户密码过期预警（OPEN 账户 30 天内到期）",
+            # 1.4 包的表名就是这个中文标题，保留作别名以免历史包取不到数；
+            # 2.0 命中 item_id 那一项，中文别名只为兼容。
+            "用户密码过期预警（账户非OPEN或30天内到期）",
+            "oracle.basic.password_expiry", "password_expiry",
         )
         rows = fetch.rows
+        # ★ 只统计**未锁定**的账户。采集表为留档把 `account_status != 'OPEN'` 的账户一并带回，
+        #   直接 `len(rows)` 会与本条规则的语义错位：实测报 35 个，而其中 34 个正是
+        #   ORA.SECURITY.ACCOUNT_LOCKED 要报的那批锁定账户（那条报 locked_accounts=34），
+        #   于是两条 finding 讲同一件事、数字还差 1。锁定/过期状态归 ACCOUNT_LOCKED。
+        active = [r for r in rows if "LOCKED" not in str(r.get("ACCOUNT_STATUS", "")).upper()]
         self._evaluate(
-            rule, True, fetch.available, len(rows) > 0,
-            (f"{len(rows)} 个账户需关注" if rows else "正常") if fetch.available
+            rule, True, fetch.available, len(active) > 0,
+            (f"{len(active)} 个账户需关注" if active else "正常") if fetch.available
             else _missing_reason("账户密码过期预警", fetch_state(fetch)),
-            [f"count={len(rows)}"] if fetch.available else [],
+            [f"count={len(active)}"] if fetch.available else [],
             fetch_state(fetch),
         )
 

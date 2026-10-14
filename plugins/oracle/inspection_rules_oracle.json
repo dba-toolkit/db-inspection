@@ -30,7 +30,7 @@
       "title": "采集数据完整度偏低",
       "summary": "关键采集项缺失可能使部分检查无法执行。",
       "recommendation": "检查失败采集项并在补足权限后重采。",
-      "evidence_refs": ["collection_status"]
+      "evidence_refs": ["collection_status.json"]
     },
     "COMMON.SYSTEM.TIME_SYNC": {
       "category": "system",
@@ -72,7 +72,7 @@
       "title": "文件系统使用率过高",
       "summary": "高使用率会增加数据库写入失败和服务中断风险。",
       "recommendation": "确认数据/归档/备份目录对应挂载点，清理或扩容并设置容量告警。",
-      "evidence_refs": ["tables/filesystems.tsv"]
+      "evidence_refs": ["filesystems"]
     },
     "ORA.STORAGE.TABLESPACE": {
       "category": "storage",
@@ -82,7 +82,7 @@
       "title": "表空间使用率过高",
       "summary": "表空间使用率超过告警阈值，可能存在空间不足风险。",
       "recommendation": "扩容数据文件或添加新数据文件，清理历史归档和备份。",
-      "evidence_refs": ["tables/表空间使用情况.tsv"]
+      "evidence_refs": ["所有表空间容量使用情况"]
     },
     "ORA.STORAGE.ASM": {
       "category": "storage",
@@ -92,7 +92,7 @@
       "title": "ASM 磁盘组告警",
       "summary": "ASM 磁盘组使用率超过阈值或状态异常。",
       "recommendation": "添加磁盘扩容磁盘组，检查磁盘健康状态。",
-      "evidence_refs": ["tables/asm_diskgroup_summary.tsv"]
+      "evidence_refs": ["ASM 磁盘组汇总"]
     },
     "ORA.STORAGE.FRA": {
       "category": "storage",
@@ -102,7 +102,7 @@
       "title": "快速恢复区使用率告警",
       "summary": "FRA 使用率超过阈值，可能影响归档和备份。",
       "recommendation": "扩展 FRA 大小或迁移到更大存储，清理过期归档和备份。",
-      "evidence_refs": ["tables/FRA使用统计.tsv"]
+      "evidence_refs": ["闪回区使用情况", "ASM 快速恢复区使用情况"]
     },
     "ORA.OBJECT.INVALID": {
       "category": "objects",
@@ -111,7 +111,7 @@
       "title": "存在无效数据库对象",
       "summary": "数据库中存在状态为 INVALID 的对象。",
       "recommendation": "编译或重建无效对象，定位依赖链问题。",
-      "evidence_refs": ["tables/无效对象检查.tsv"]
+      "evidence_refs": ["无效对象检查"]
     },
     "ORA.TXN.LONG": {
       "category": "transactions",
@@ -120,7 +120,7 @@
       "title": "长时间未提交事务",
       "summary": "存在运行超过巡检阈值的事务，可能积压 UNDO。",
       "recommendation": "排查长事务来源，评估回滚或提交。",
-      "evidence_refs": ["tables/长事务检查.tsv"]
+      "evidence_refs": ["长事务检查"]
     },
     "ORA.LOCK.BLOCKING": {
       "category": "transactions",
@@ -129,7 +129,7 @@
       "title": "锁等待/阻塞",
       "summary": "发现会话间的锁等待或阻塞链。",
       "recommendation": "定位阻塞源头，评估 kill session 或修改业务逻辑。",
-      "evidence_refs": ["tables/锁等待链.tsv"]
+      "evidence_refs": ["锁等待链"]
     },
     "ORA.ARCHIVE.MODE": {
       "category": "backup",
@@ -138,7 +138,7 @@
       "title": "数据库未开启归档模式",
       "summary": "生产环境应开启 ARCHIVELOG 模式以保证可恢复性。",
       "recommendation": "规划维护窗口，开启归档模式并确认归档路径。",
-      "evidence_refs": ["tables/归档模式检查.tsv"]
+      "evidence_refs": ["归档模式检查"]
     },
     "ORA.BACKUP.RECENT": {
       "category": "backup",
@@ -147,7 +147,7 @@
       "title": "近期无成功备份",
       "summary": "近 48 小时未检测到成功的 RMAN 备份。",
       "recommendation": "检查 RMAN 备份调度、日志和存储空间。",
-      "evidence_refs": ["tables/最近RMAN备份任务状态.tsv"]
+      "evidence_refs": ["最近RMAN备份任务状态"]
     },
     "ORA.DATA.BLOCK_CORRUPTION": {
       "category": "data",
@@ -156,7 +156,7 @@
       "title": "数据库物理坏块",
       "summary": "V$DATABASE_BLOCK_CORRUPTION 返回坏块记录。",
       "recommendation": "立即使用 RMAN BLOCKRECOVER 恢复，排查存储原因。",
-      "evidence_refs": ["tables/数据库坏块记录.tsv"]
+      "evidence_refs": ["数据库坏块记录"]
     },
     "ORA.DATA.FILE_HEADER": {
       "category": "data",
@@ -165,16 +165,16 @@
       "title": "数据文件头异常",
       "summary": "数据文件头存在离线、需恢复、模糊或错误状态。",
       "recommendation": "检查文件系统与存储，必要时执行 RECOVER DATAFILE。",
-      "evidence_refs": ["tables/数据文件头异常.tsv"]
+      "evidence_refs": ["数据文件头异常"]
     },
     "ORA.DATA.CHECKSUM": {
       "category": "data",
       "severity": "medium",
       "confidence": 1.0,
-      "title": "块校验参数未开启",
-      "summary": "db_block_checksum 或 db_lost_write_protect 未启用。",
-      "recommendation": "在生产环境开启块校验和丢失写保护。",
-      "evidence_refs": ["tables/块校验与丢失写保护参数.tsv"]
+      "title": "块校验与丢失写保护参数未开启",
+      "summary": "db_block_checking / db_lost_write_protect / db_ultra_safe 之一未启用（db_block_checksum 默认为 TYPICAL，属已开启）。",
+      "recommendation": "评估后在维护窗口开启对应的块检查或丢失写保护参数。",
+      "evidence_refs": ["块校验与丢失写保护参数"]
     },
     "ORA.CONTROL.REDUNDANCY": {
       "category": "data",
@@ -183,7 +183,7 @@
       "title": "控制文件冗余不足",
       "summary": "控制文件数量少于 2 份，存在单点故障风险。",
       "recommendation": "将控制文件多路复用到不同故障域（不同磁盘/存储）。",
-      "evidence_refs": ["tables/控制文件多路复用.tsv"]
+      "evidence_refs": ["控制文件多路复用"]
     },
     "ORA.JOB.FAILURE": {
       "category": "maintenance",
@@ -192,7 +192,7 @@
       "title": "Scheduler 作业失败",
       "summary": "近 7 天存在未成功的 Scheduler 作业。",
       "recommendation": "检查失败作业日志和依赖条件，补跑或修复。",
-      "evidence_refs": ["tables/Scheduler失败作业.tsv"]
+      "evidence_refs": ["Scheduler 失败作业（近7天）"]
     },
     "ORA.PERFORMANCE.BUFFER_CACHE": {
       "category": "performance",
@@ -218,10 +218,10 @@
       "category": "security",
       "severity": "medium",
       "confidence": 1.0,
-      "title": "账户密码临近过期或已锁定",
-      "summary": "存在即将过期、已过期或锁定状态的数据库账户。",
-      "recommendation": "更新过期密码，解锁异常锁定账户，建立密码轮换流程。",
-      "evidence_refs": ["tables/用户密码过期预警.tsv"]
+      "title": "账户密码临近过期",
+      "summary": "存在 30 天内即将到期的数据库账户（锁定账户数量见「锁定账户数量偏多」）。",
+      "recommendation": "评估并更新临近到期的账户口令，建立密码轮换流程。",
+      "evidence_refs": ["用户密码过期预警（OPEN 账户 30 天内到期）"]
     },
     "ORA.CONFIG.REDO_MEMBER": {
       "category": "config",
@@ -231,7 +231,7 @@
       "title": "在线日志成员冗余不足",
       "summary": "部分 redo log group 为单成员配置，存在日志文件单点故障风险。",
       "recommendation": "为每个日志组添加至少一个成员到不同磁盘路径。",
-      "evidence_refs": ["tables/Redo 日志多路复用检查.tsv"]
+      "evidence_refs": ["Redo 日志多路复用检查"]
     },
     "ORA.CONFIG.REDO_SIZE": {
       "category": "config",
@@ -241,7 +241,7 @@
       "title": "在线日志尺寸偏小",
       "summary": "在线 redo log 尺寸偏小或切换频率过高，可能导致频繁检查点。",
       "recommendation": "评估业务峰值日志量，适当调大 redo log 到 1GB-4GB。",
-      "evidence_refs": ["tables/Redo 日志组信息.tsv", "tables/重做日志切换频率.tsv"]
+      "evidence_refs": ["Redo 日志组信息", "重做日志切换频率（近24小时）"]
     },
     "ORA.PERFORMANCE.LIBRARY_CACHE": {
       "category": "performance",
@@ -251,7 +251,7 @@
       "title": "Library Cache 命中率偏低",
       "summary": "SQL AREA 的 GET/PIN 命中率低于建议阈值，存在硬解析开销。",
       "recommendation": "检查未使用绑定变量的 SQL，增大 shared_pool_size。",
-      "evidence_refs": ["tables/Library Cache 命中率.tsv"]
+      "evidence_refs": ["Library Cache 命中率"]
     },
     "ORA.PERFORMANCE.WAIT_EVENTS": {
       "category": "performance",
@@ -261,7 +261,7 @@
       "title": "数据库存在显著等待事件",
       "summary": "等待事件累计耗时较高，可能影响数据库响应。",
       "recommendation": "分析高耗时等待事件根因：I/O 类检查存储和 SQL；并发类检查锁和应用逻辑。",
-      "evidence_refs": ["tables/等待事件 TOP10（数据库级）.tsv"]
+      "evidence_refs": ["等待事件 TOP10（数据库级）"]
     },
     "ORA.CONFIG.AUTOEXTEND": {
       "category": "storage",
@@ -270,7 +270,7 @@
       "title": "数据文件未开启自动扩展",
       "summary": "部分数据文件的自动扩展功能被关闭，可能因空间满导致业务中断。",
       "recommendation": "为生产表空间数据文件开启 autoextend，设置合理的 maxsize。",
-      "evidence_refs": ["tables/数据文件自动扩展余量.tsv"]
+      "evidence_refs": ["数据文件自动扩展余量"]
     },
     "ORA.SECURITY.DBA_COUNT": {
       "category": "security",
@@ -280,7 +280,7 @@
       "title": "DBA 角色用户偏多",
       "summary": "拥有 DBA 角色的用户数量较多，增加误操作和安全风险。",
       "recommendation": "遵循最小权限原则，为业务用户授予精确的系统/对象权限。",
-      "evidence_refs": ["tables/特权用户.tsv"]
+      "evidence_refs": ["特权用户 (DBA角色)"]
     },
     "ORA.SECURITY.ACCOUNT_LOCKED": {
       "category": "security",
@@ -290,7 +290,7 @@
       "title": "锁定账户数量偏多",
       "summary": "大量账户处于 LOCKED 或 EXPIRED 状态，建议定期清理。",
       "recommendation": "审计锁定的账户列表，删除不再使用的账户。",
-      "evidence_refs": ["tables/用户列表.tsv"]
+      "evidence_refs": ["用户列表"]
     },
     "ORA.PERFORMANCE.SQL_EXECUTION": {
       "category": "performance",
@@ -300,7 +300,7 @@
       "title": "存在单 SQL 执行耗时偏高",
       "summary": "部分 SQL 的单次执行时间超过阈值。",
       "recommendation": "对比执行计划与统计信息，确认索引使用和连接方式。",
-      "evidence_refs": ["tables/Top 20 SQL (按执行时间).tsv"]
+      "evidence_refs": ["Top 20 SQL (按执行时间)"]
     },
     "ORA.DATA.INDEX_UNUSABLE": {
       "category": "objects",
@@ -309,7 +309,7 @@
       "title": "存在不可用索引",
       "summary": "数据库中存在状态为 UNUSABLE 的索引，可能影响 SQL 性能。",
       "recommendation": "重建不可用索引或评估是否可以删除。",
-      "evidence_refs": ["tables/无效_不可用索引.tsv"]
+      "evidence_refs": ["无效_不可用索引"]
     },
     "ORA.DATA.MISSING_STATS": {
       "category": "objects",
@@ -319,7 +319,7 @@
       "title": "存在缺失统计信息的表",
       "summary": "部分业务表未收集统计信息，可能导致执行计划不优。",
       "recommendation": "使用 DBMS_STATS.GATHER_TABLE_STATS 收集统计信息。",
-      "evidence_refs": ["tables/缺失统计信息表.tsv"]
+      "evidence_refs": ["缺失统计信息表 (TOP20)"]
     },
     "ORA.PERFORMANCE.IO_HOTFILE": {
       "category": "performance",
@@ -329,7 +329,7 @@
       "title": "存在 IO 热点数据文件",
       "summary": "单个数据文件的读写 IO 占比显著偏高，可能成为存储瓶颈。",
       "recommendation": "考虑将该数据文件迁移到更快的存储，或分散热点段到不同表空间。",
-      "evidence_refs": ["tables/IO 消耗最高数据文件 TOP10.tsv"]
+      "evidence_refs": ["IO 消耗最高数据文件 TOP10"]
     },
 
     "ORA.DG.TRANSPORT_ERROR": {
@@ -339,7 +339,7 @@
       "title": "归档 / DG 日志传输目的地异常",
       "summary": "v$archive_dest 中存在 ERROR 非空的目的地，归档或备库日志传输可能已中断；主库可能因归档目录写满而挂起。",
       "recommendation": "检查该目的地对应的网络、目录权限与 TNS 配置，确认归档空间未满；必要时先清理再重试传输。",
-      "evidence_refs": ["tables/日志传输服务状态 (v$archive_dest).tsv"]
+      "evidence_refs": ["日志传输服务状态 (v$archive_dest)"]
     },
     "ORA.DG.APPLY_LAG": {
       "category": "dataguard",
@@ -349,7 +349,7 @@
       "title": "DataGuard 备库延迟偏大",
       "summary": "备库的传输延迟或应用延迟超过阈值，故障切换时可能丢失较多数据（实际损失取决于保护模式）。",
       "recommendation": "确认备库 MRP / RFS 进程正常、日志传输链路与网络带宽无瓶颈，并核对保护模式与 RPO 诉求。",
-      "evidence_refs": ["tables/保护模式与主库统计.tsv"]
+      "evidence_refs": ["保护模式与主库统计"]
     },
     "ORA.DG.LOG_GAP": {
       "category": "dataguard",
@@ -359,7 +359,7 @@
       "title": "主备库归档日志序差距过大",
       "summary": "主库已归档日志的最大 sequence 与备库已应用日志之间存在明显差距，说明备库落后于主库。",
       "recommendation": "排查备库应用进程与 FAL 传输，确认归档日志已完整送达备库并成功应用。",
-      "evidence_refs": ["tables/主备库日志序差距.tsv"]
+      "evidence_refs": ["主备库日志序差距"]
     },
     "ORA.DG.EVENT_ERROR": {
       "category": "dataguard",
@@ -368,7 +368,7 @@
       "title": "近 24 小时存在 DataGuard 错误事件",
       "summary": "v$dataguard_status 中近 24 小时存在非零错误码事件，说明 DG 链路发生过异常（即使当前已恢复）。",
       "recommendation": "结合事件时间点与主备库告警日志定位原因，确认异常已恢复且归档传送、应用均正常。",
-      "evidence_refs": ["tables/最近 DG 事件 (v$dataguard_status).tsv"]
+      "evidence_refs": ["最近 DG 事件 (v$dataguard_status)"]
     },
     "ORA.SCHEMA.SEGMENT_BLOAT": {
       "category": "objects",
@@ -378,7 +378,7 @@
       "title": "存在明显空间膨胀的段",
       "summary": "段实际占用远大于按统计信息估算的应有大小，存在可回收的空闲空间（多为大量删除后未整理）。",
       "recommendation": "评估对相关表执行在线重组（ALTER TABLE MOVE / DBMS_REDEFINITION）或 SHRINK SPACE，回收前先备份。",
-      "evidence_refs": ["tables/数据膨胀预估 (DBA_SEGMENTS vs DBA_TABLES).tsv"]
+      "evidence_refs": ["数据膨胀预估 (DBA_SEGMENTS vs DBA_TABLES)"]
     },
     "ORA.CAPACITY.LARGE_SEGMENT": {
       "category": "capacity",
@@ -388,7 +388,7 @@
       "title": "存在超大表 / 索引段",
       "summary": "单个表或索引段体积很大，日常维护（DDL、导出、重建、分区改造）的窗口占用与风险都会随之放大。",
       "recommendation": "评估对大段做分区化改造、按时间归档历史数据，并把重建 / 导出安排在低峰窗口。",
-      "evidence_refs": ["tables/大表段 TOP20（按大小排序）.tsv", "tables/大索引段 TOP20.tsv"]
+      "evidence_refs": ["大表段 TOP20（按大小排序）", "大索引段 TOP20"]
     },
     "ORA.SECURITY.PASSWORD_PROFILE": {
       "category": "security",
@@ -397,7 +397,7 @@
       "title": "口令 Profile 策略偏弱",
       "summary": "存在未启用口令复杂度校验（PASSWORD_VERIFY_FUNCTION 为空）、或口令永不过期 / 失败次数不受限的 Profile，口令被暴力破解或长期不变更的风险上升。",
       "recommendation": "为在用 Profile 配置 PASSWORD_VERIFY_FUNCTION 校验函数，并设置有限的 FAILED_LOGIN_ATTEMPTS 与 PASSWORD_LIFE_TIME。",
-      "evidence_refs": ["tables/密码配置文件参数.tsv"]
+      "evidence_refs": ["密码配置文件参数"]
     },
     "ORA.SYSTEM.HUGEPAGES": {
       "category": "system",
@@ -407,7 +407,7 @@
       "title": "大页配置不符合 Oracle 建议",
       "summary": "透明大页（THP）未关闭时内核会异步合并内存页，容易造成 Oracle 大内存进程的分配抖动；而 HugePages 是 Oracle SGA 推荐使用的静态大页 —— 与 MySQL 只要求关闭 THP 不同，Oracle 还要把 SGA 放进 HugePages。",
       "recommendation": "把透明大页设为 never；按 SGA 大小计算并配置 vm.nr_hugepages，重启实例后确认 HugePages_Free 接近 0（表示已被 SGA 用掉）。",
-      "evidence_refs": ["tables/hugepages.tsv"]
+      "evidence_refs": ["hugepages"]
     }
   }
 }

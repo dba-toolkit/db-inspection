@@ -47,7 +47,7 @@
   "oracle.basic.object_counts": "数据库对象统计",
   "oracle.basic.parameters": "关键初始化参数",
   "oracle.basic.partitioned_tables": "分区表统计（分区数 TOP20）",
-  "oracle.basic.password_expiry": "用户密码过期预警（账户非OPEN或30天内到期）",
+  "oracle.basic.password_expiry": "用户密码过期预警（OPEN 账户 30 天内到期）",
   "oracle.basic.pdb_list": "PDB 状态列表（CDB环境）",
   "oracle.basic.pga_stats": "PGA 统计",
   "oracle.basic.redo_groups": "Redo 日志组信息",
