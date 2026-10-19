@@ -325,9 +325,33 @@ mysql_inspection_v1_<host>_<ip>_<port>_<YYYYmmdd_HHMMSS>/
 
 | 级别 | 内容 |
 |:---:|---|
-| P3 | `snapshot.json` 声明 `history/coverage.json`，同时存在 `history/coverage.tsv`（`compute_sar_coverage` 两个都写）。**两个都在**，Python 该以哪个为准尚未定 |
+| P3 | `snapshot.json` 声明 `history/coverage.json`，同时存在 `history/coverage.tsv`（`compute_sar_coverage` 两个都写）。**两个都在**，Python 该以哪个为准尚未定。现状：`inspection_core/sampling.py` 读的是包内 `coverage_hours` / `status`，不读 point_count / max_gap_seconds |
 | P3 | `evidence/ip_address.txt` 文件名语义误导：`ip` 命令存在时只可能是 `ip addr` 输出，`ifconfig` 只在 `ip` 不存在时兜底；且 `ip` 存在但执行失败时不会退到 `ifconfig` |
 | P3 | `system.backup_*` 三项的 `item_id` 前缀（system）/ `category`（mysql.backup）/ 模块名（mysql_logs_backup）三套不一致，按 category 分组时会与 `mysql.logs.*` 混在一起 |
+
+### 8.2.1 sar 覆盖口径变更（2026-10-15，三库同形，**下游必读**）
+
+`compute_sar_coverage` 与 PostgreSQL / Oracle 两库对齐后有两处**语义**变化，字段名不变：
+
+| 字段 | 旧语义 | 新语义 |
+|---|---|---|
+| `coverage_seconds` / `coverage_hours` | 窗口内**首尾两点相减**（把中间停机时间也算成覆盖） | **累计覆盖**：只累加相邻点间隔 ≤1h 的部分；>1h 的间隔计为断点、不计入 |
+| `status` | 只判 `累计/窗口 ≥ 90%` | 再加一条：**`max_gap_seconds > 3600` 一律降为 `partial`**（覆盖够但中间断过 ≠ 历史可用） |
+| （新增） | — | `point_count` / `discontinuity_count` / `max_gap_seconds` 三个字段，`coverage.json` 升到 `schema_version=1.1` |
+
+⇒ **不要**把 `coverage_seconds` 当"历史数据跨度"用（它比跨度小）；要看连续性就读 `max_gap_seconds`。
+
+### 8.2.2 OS 采集面三库统一（2026-10-15）
+
+MySQL / PostgreSQL / Oracle 三个脚本在**同一台服务器**上跑，OS 面必须同口径。本轮统一四处：
+
+| 项 | 统一后的口径 | 为什么 |
+|---|---|---|
+| `capture_command` 失败落盘 | 表格类（`*.tsv` / `*.psv` / `*.csv`）**清空**；纯文本证据（`evidence/*.txt`）**保留**已输出的半截 | 残缺表格会被下游当完整数据取值（看不出少了行）；文本证据有诊断价值。两种极端各有隐患，按扩展名分流是唯一同时成立的写法 |
+| 磁盘设备过滤 | `/sys/block` 循环排除 `dm-*` | device-mapper 逻辑设备与底层物理盘统计**同一份 IO**；两层都列会让报告的"磁盘设备"表出现两行描述同一个盘。报告取**物理盘**口径，多路径/ASM 视图由 Oracle 的 `system.asm_multipath`（`multipath -ll`）单独取证 |
+| `system.hugepages` | 行数为 0 时写 `empty`（原为**无条件写 `ok`**） | `/sys` 下几个文件都不可读时（容器/裁剪内核），旧写法让报告显示"大页配置正常"，实际一个字都没采到 |
+| **互斥链判据** | `chronyc` / `ntpq` 的取舍**不能只看 `has_cmd`**（`chronyd` 装了≠在跑）。改用 `capture_command … chronyc tracking` 的**返回码**当判据：不应答且有 `ntpq` 时**真采一次**，避免 ntpd 的对端列表整块丢失（2026-10-16，三库同形） |
+| **命令缺失时的登记** | 每个被 `has_cmd` 守卫的采集项都**必须有 `else` 登记**（`unsupported`）；互斥备选（`ip`↔`ifconfig`、`chrony`↔`ntpq`）在**未采用**的那条记 `skipped` | 不登记 ⇒ 该 item **不进 `collection_status.json`**、不进 `collection_quality` 的分母 ⇒ 完整度**只升不降**，越精简的机器分数越高（**2026-10-16，三库 21/17/12 处**）|
 
 ### 8.3 批 1 / 批 2 新增或改名的文件、列（Python 必须同步）
 

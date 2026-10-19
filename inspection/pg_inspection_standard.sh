@@ -26,7 +26,6 @@ MIN_FREE_MB=200
 TOP_N=100
 OUTPUT_PARENT="/var/tmp"
 CREATE_PACKAGE=1
-INCLUDE_LOG_TEXT=0
 ALL_DATABASES=1
 REDACT_SQL=0
 
@@ -35,7 +34,6 @@ PGPORT_ARG="${PGPORT:-5432}"
 PGUSER_ARG="${PGUSER:-postgres}"
 PGDATABASE_ARG="${PGDATABASE:-postgres}"
 PASSWORD_FILE=""
-LEGACY_PASSWORD=""
 
 show_usage() {
 cat <<'EOF'
@@ -63,7 +61,6 @@ PostgreSQL 巡检采集器 v2.0.1（标准版）
   --sample-count N        默认 6 次，总时长约 30 秒
   --sar-history-hours N   默认请求最近 24 小时历史 sar
   --pg-timeout SEC        单条 PG 命令超时，默认 30 秒
-  --include-log-text      包含有限日志样本（默认关闭）
 
 说明：
   1. 同一份脚本可在主库、备库执行。
@@ -197,11 +194,16 @@ log_error() { log ERROR "$@"; }
 classify_failure() {
     local rc="$1" err_file="$2"
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then printf 'timeout'; return; fi
-    if grep -Eqi 'cannot talk to daemon|could not open connection|service.*not (running|active)|command not found' "$err_file" 2>/dev/null; then
+    # 对齐 MySQL：chrony/ntp 相关失败必须落 not_enabled（服务未运行），而不是 error
+    if grep -Eqi 'cannot talk to daemon|could not open connection|chronyd.*not running|chrony.*not running|daemon is not running|service.*not (running|active)|No such file or directory.*chrony|command not found' "$err_file" 2>/dev/null; then
         printf 'not_enabled'
     elif grep -Eqi 'access denied|command denied|permission denied|requires.*privilege|you need.*privilege' "$err_file" 2>/dev/null; then
         printf 'permission_denied'
-    elif grep -Eqi "doesn.t exist|unknown table|unknown system variable|unknown column|not supported|unsupported|relation.*does not exist" "$err_file" 2>/dev/null; then
+    elif grep -Eqi 'column .* does not exist|unknown column|unknown field|unknown identifier' "$err_file" 2>/dev/null; then
+        # 对齐 MySQL F-21：表在、列不在 = 采集器 SQL 与本版本列集不匹配（**脚本缺陷**），
+        #   必须在 unsupported 之前拦下 —— 否则与"环境真不支持"撞同一状态，改脚本的压力消失。
+        printf 'schema_mismatch'
+    elif grep -Eqi "doesn.t exist|unknown table|unknown system variable|not supported|unsupported|relation.*does not exist" "$err_file" 2>/dev/null; then
         printf 'unsupported'
     else
         printf 'error'
@@ -226,6 +228,10 @@ known_tsv_header() {
       checkpointer.tsv) printf 'num_timed\tnum_requested\trestartpoints_timed\trestartpoints_req\trestartpoints_done\twrite_time\tsync_time\tbuffers_written\tstats_reset' ;;
       archiver.tsv) printf 'archived_count\tlast_archived_wal\tlast_archived_time\tfailed_count\tlast_failed_wal\tlast_failed_time\tstats_reset' ;;
       database_conflicts.tsv) printf 'database_name\tconfl_tablespace\tconfl_lock\tconfl_snapshot\tconfl_bufferpin\tconfl_deadlock' ;;
+      table_health.tsv) printf 'schemaname\ttable_name\tn_live_tup\tn_dead_tup\tdead_tuple_ratio\tlast_vacuum\tlast_autovacuum\tlast_analyze\tlast_autoanalyze\tn_mod_since_analyze\ttotal_bytes' ;;
+      large_tables.tsv) printf 'schemaname\ttable_name\ttable_bytes\tindex_bytes\ttotal_bytes\tn_live_tup' ;;
+      indexes.tsv) printf 'schemaname\ttable_name\tindex_name\tidx_scan\tindex_bytes\tindisvalid\tindisready\tindisunique\tindisprimary' ;;
+      sequences.tsv) printf 'schemaname\tsequence_name\tlast_value\tmax_value\tusage_ratio' ;;
       no_primary_key.tsv) printf 'schemaname\ttable_name\ttotal_bytes\testimated_rows' ;;
       pg_stat_statements.tsv) printf 'queryid\tquery\tcalls\ttotal_exec_ms\tmean_exec_ms\trows\tshared_blks_hit\tshared_blks_read\ttemp_blks_written' ;;
       object_counts.tsv) printf 'object_type\tcount' ;;
@@ -283,7 +289,13 @@ capture_command() {
             head -c 500 "$outfile" >> "$err" 2>/dev/null
         fi
         status=$(classify_failure "$rc" "$err"); reason=$(tail -n 5 "$err" 2>/dev/null | tr '\n' ' ')
-        : > "$outfile"
+        # 失败时的落盘口径（三库统一）：表格类（*.tsv/*.csv）残缺比没有更危险 ——
+        #   下游按行列取值看不出少了行，故清空，让"没采到"只由 collection_status 表达；
+        #   纯文本证据类（evidence/*.txt）保留已输出的半截，便于事后定位。
+        case "$outfile" in
+          *.tsv|*.csv) : > "$outfile" ;;
+          *) : ;;
+        esac
     elif [ ! -s "$outfile" ]; then status="empty"; fi
     rows=$(wc -l < "$outfile" 2>/dev/null | tr -d ' '); rows=${rows:-0}
     cat "$err" >> "$MODULE_LOG_DIR/$(sanitize_id "$category").log" 2>/dev/null
@@ -421,50 +433,132 @@ check_output_space() {
 collect_system_static() {
     capture_command "system.os_release" "system.static" "$EVIDENCE_DIR/os_release.txt" bash -c 'cat /etc/os-release 2>/dev/null; uname -a; uptime 2>/dev/null' || true
     capture_command "system.time_status" "system.static" "$EVIDENCE_DIR/time_status.txt" bash -c 'printf "local_time="; date --iso-8601=seconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z; printf "utc_time="; date -u --iso-8601=seconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; printf "timezone="; cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || date +%Z; printf "epoch_seconds="; date +%s' || true
-    if has_cmd timedatectl; then capture_command "system.timedatectl" "system.static" "$EVIDENCE_DIR/timedatectl.txt" timedatectl status || true; fi
+    if has_cmd timedatectl; then
+        capture_command "system.timedatectl" "system.static" "$EVIDENCE_DIR/timedatectl.txt" timedatectl status
+    else
+        record_skipped "system.timedatectl" "system.static" "unsupported" "timedatectl not installed"
+    fi
     if has_cmd chronyc; then
-        capture_command "system.chronyc_tracking" "system.static" "$EVIDENCE_DIR/chronyc_tracking.txt" chronyc tracking || true
-        capture_command "system.chronyc_sources" "system.static" "$EVIDENCE_DIR/chronyc_sources.txt" chronyc sources -v || true
+        # ★ B5：判据不能只看 `has_cmd` —— chronyd **装了 ≠ 在跑**。只看命令存在时，
+        #   本机（chronyd 停着）会把 `ntpq_peers` 记成 skipped 并写"chronyc available"，
+        #   而 chronyc 实际返回 "506 Cannot talk to daemon" ⇒ 理由与事实矛盾；
+        #   若本机真正用的是 ntpd，ntpd 的对端列表还会整块丢失。
+        #   `capture_command` 返回的就是命令自身的 rc ⇒ 用它当"守护进程是否在应答"的判据。
+        if capture_command "system.chronyc_tracking" "system.static" "$EVIDENCE_DIR/chronyc_tracking.txt" chronyc tracking; then
+            # 互斥备选：chronyd 在应答 ⇒ ntpq 不被采用，显式记 skipped，
+            #   让两个 item 在**所有**路径都出现在台账里 —— 下游据此区分"环境不适用"与"该采却没采到"。
+            record_skipped "system.ntpq_peers" "system.static" "skipped" "chronyd is answering; ntpq is the mutually-exclusive fallback"
+        elif has_cmd ntpq; then
+            # chronyd 不在应答，但本机有 ntpq ⇒ 采一次，别让时间同步证据整块丢失。
+            capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn
+        else
+            record_skipped "system.ntpq_peers" "system.static" "unsupported" "chronyd is not answering and ntpq is not installed"
+        fi
+        capture_command "system.chronyc_sources" "system.static" "$EVIDENCE_DIR/chronyc_sources.txt" chronyc sources -v
     elif has_cmd ntpq; then
-        capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn || true
+        capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn
+        record_skipped "system.chronyc_tracking" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.chronyc_sources" "system.static" "unsupported" "chronyc not installed"
+    else
+        record_skipped "system.chronyc_tracking" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.chronyc_sources" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.ntpq_peers" "system.static" "unsupported" "neither chronyc nor ntpq installed"
     fi
     has_cmd lscpu && capture_command "system.lscpu" "system.static" "$EVIDENCE_DIR/lscpu.txt" lscpu || record_status "system.lscpu" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "lscpu not installed"
-    has_cmd free && capture_command "system.free" "system.static" "$TABLES_DIR/memory_snapshot.tsv" free -b || true
-    has_cmd df && capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
-    has_cmd df && capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
-    has_cmd lsblk && capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL || true
-    has_cmd mount && capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount || true
-    if has_cmd ip; then
-        capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show || true
-        capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all || true
-    elif has_cmd ifconfig; then
-        capture_command "system.ifconfig" "system.static" "$EVIDENCE_DIR/ip_address.txt" ifconfig -a || true
+    if has_cmd free; then
+        capture_command "system.free" "system.static" "$TABLES_DIR/memory_snapshot.tsv" free -b
     else
-        record_status "system.ip_address" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "ip/ifconfig not installed"
+        record_skipped "system.free" "system.static" "unsupported" "free not installed"
     fi
-    has_cmd ss && capture_command "system.socket_summary" "system.static" "$EVIDENCE_DIR/socket_summary.txt" ss -s || true
-    has_cmd numactl && capture_command "system.numa" "system.static" "$EVIDENCE_DIR/numa.txt" numactl --hardware || true
-    has_cmd sysctl && capture_command "system.sysctl_selected" "system.static" "$TABLES_DIR/kernel_parameters.tsv" bash -c '
+    if has_cmd df; then
+        capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon
+    else
+        record_skipped "system.filesystems" "system.static" "unsupported" "df not installed"
+    fi
+    if has_cmd df; then
+        capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon
+    else
+        record_skipped "system.inodes" "system.static" "unsupported" "df not installed"
+    fi
+    if has_cmd lsblk; then
+        capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL
+    else
+        record_skipped "system.block_devices" "system.static" "unsupported" "lsblk not installed"
+    fi
+    if has_cmd mount; then
+        capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount
+    else
+        record_skipped "system.mounts" "system.static" "unsupported" "mount not installed"
+    fi
+    if has_cmd ip; then
+        capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show
+        capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all
+        # 互斥备选（对齐 Oracle N-14）：有 ip 时 ifconfig 不被采用，显式记 skipped。
+        record_skipped "system.ifconfig" "system.static" "skipped" "ip available; ifconfig is the mutually-exclusive fallback"
+    elif has_cmd ifconfig; then
+        capture_command "system.ifconfig" "system.static" "$EVIDENCE_DIR/ip_address.txt" ifconfig -a
+        # ifconfig 给不出路由表 ⇒ ip_route 在只有 ifconfig 的机器上确实采不到，如实记 unsupported。
+        record_skipped "system.ip_route" "system.static" "unsupported" "ip not installed; ifconfig cannot dump the route table"
+    else
+        record_skipped "system.ip_address" "system.static" "unsupported" "ip/ifconfig not installed"
+        record_skipped "system.ip_route" "system.static" "unsupported" "ip not installed; ifconfig cannot dump the route table"
+        record_skipped "system.ifconfig" "system.static" "unsupported" "ip/ifconfig not installed"
+    fi
+    if has_cmd ss; then
+        capture_command "system.socket_summary" "system.static" "$EVIDENCE_DIR/socket_summary.txt" ss -s
+    else
+        record_skipped "system.socket_summary" "system.static" "unsupported" "ss not installed"
+    fi
+    if has_cmd numactl; then
+        capture_command "system.numa" "system.static" "$EVIDENCE_DIR/numa.txt" numactl --hardware
+    else
+        record_skipped "system.numa" "system.static" "unsupported" "numactl not installed"
+    fi
+    if has_cmd sysctl; then
+        capture_command "system.sysctl_selected" "system.static" "$TABLES_DIR/kernel_parameters.tsv" bash -c '
       for k in vm.swappiness vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes vm.overcommit_memory vm.zone_reclaim_mode fs.file-max fs.aio-max-nr kernel.shmmax kernel.shmall net.core.somaxconn net.ipv4.tcp_max_syn_backlog; do
         v=$(sysctl -n "$k" 2>/dev/null) && printf "%s\t%s\n" "$k" "$v"
       done
-      exit 0' || true
+      exit 0'
+    else
+        record_skipped "system.sysctl_selected" "system.static" "unsupported" "sysctl not installed"
+    fi
     {
         printf 'path\tvalue\n'
         for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag /proc/sys/vm/nr_hugepages; do
             [ -r "$f" ] && printf '%s\t%s\n' "$f" "$(tr '\n' ' ' < "$f")"
         done
     } > "$TABLES_DIR/hugepages.tsv"
-    record_status "system.hugepages" "system.static" "ok" "$(iso_now)" "$(iso_now)" 0 "$(awk 'END{print NR-1}' "$TABLES_DIR/hugepages.tsv")" 0 "tables/hugepages.tsv" ""
+    # F-27（三库同形）：行数为 0 必须写 empty。旧写法**无条件写 ok** —— 一旦 /sys 下这几个
+    #   文件都不可读（容器 / 裁剪内核），报告看到的是"大页配置正常"，实际一个字都没采到。
+    local hp_rows=0 hp_status="ok" hp_reason=""
+    hp_rows=$(awk 'END{print (NR>0?NR-1:0)}' "$TABLES_DIR/hugepages.tsv" 2>/dev/null); hp_rows=${hp_rows:-0}
+    if [ "$hp_rows" -eq 0 ]; then
+        hp_status="empty"; hp_reason="no readable hugepage file under /sys/kernel/mm/transparent_hugepage or /proc/sys/vm"
+    fi
+    record_status "system.hugepages" "system.static" "$hp_status" "$(iso_now)" "$(iso_now)" 0 "$hp_rows" 0 "tables/hugepages.tsv" "$hp_reason"
     if has_cmd dmesg; then
-        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null || true
+        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null
+    else
+        record_skipped "system.dmesg_errors" "system.static" "unsupported" "dmesg not installed"
     fi
     if has_cmd ps; then
-        ps -eo pid,ppid,user,etimes,%cpu,%mem,args 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /[p]ostgres/ {print}' > "$EVIDENCE_DIR/postgres_processes.txt"
+        # ★ 判据必须落在 **COMMAND 的第一列**（`$7`），不能对整行匹配：
+        #   `/[p]ostgres/` 会命中 USER 列是 postgres 的进程，于是 `su - postgres`
+        #   之后整条 shell 树（`-bash` / `bash pg_inspection_standard.sh` / `sleep` /
+        #   `ps` / `awk`）全被采进来。真机实测 16 行里 **8 行是采集脚本自己**，
+        #   台账 `row_count` 也跟着虚高，报告会说出"16 个 postgres 进程"。
+        ps -eo pid,ppid,user,etimes,%cpu,%mem,args 2>/dev/null \
+            | awk 'BEGIN{IGNORECASE=1} $7 == "postgres" || $7 == "postgres:" || $7 ~ /\/postgres$/ {print}' \
+            > "$EVIDENCE_DIR/postgres_processes.txt"
         record_status "system.postgres_processes" "system.static" "$([ -s "$EVIDENCE_DIR/postgres_processes.txt" ] && echo ok || echo empty)" "$(iso_now)" "$(iso_now)" 0 "$(wc -l < "$EVIDENCE_DIR/postgres_processes.txt")" 0 "evidence/postgres_processes.txt" ""
+    else
+        record_skipped "system.postgres_processes" "system.static" "unsupported" "ps not installed"
     fi
     if has_cmd iostat; then
-        capture_command "system.iostat" "system.static" "$TABLES_DIR/iostat_snapshot.tsv" iostat -xz 1 3 || true
+        capture_command "system.iostat" "system.static" "$TABLES_DIR/iostat_snapshot.tsv" iostat -xz 1 3
+    else
+        record_skipped "system.iostat" "system.static" "unsupported" "iostat not installed (sysstat)"
     fi
 }
 
@@ -531,7 +625,9 @@ find_sar_files() {
 }
 
 collect_sadf_metric() {
-    local metric_id="$1" outfile="$2"; shift 2
+    # 第 1 个参数（metric 名）保留：三库调用点保持同形，跨库同步补丁不必改调用点；
+    #   本函数自身不需要它（B4，2026-10-16）。
+    local outfile="$2"; shift 2
     local f any=0 rc=0
     : > "$outfile"
     while IFS= read -r f; do
@@ -567,8 +663,13 @@ compute_sar_coverage() {
         first_ts=$(date -u -d "@$first_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)
         last_ts=$(date -u -d "@$last_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)
         status="partial"
-        [ "$coverage_seconds" -lt $((SAR_HISTORY_HOURS*3600*9/10)) ] && status="partial"
-        [ "$coverage_seconds" -ge $((SAR_HISTORY_HOURS*3600*9/10)) ] && status="ok"
+        if [ "$coverage_seconds" -ge $((SAR_HISTORY_HOURS*3600*9/10)) ]; then status="ok"; fi
+        # F-04：窗口内出现 **>1 小时的点间空洞**时，即使累计覆盖达标也不判 ok ——
+        #   一台早上 3h + 晚上 3h、中间停机的主机不该被写成"历史可用"。
+        #   阈值取 3600s（与上面"covered 只累加 <=1h 的间隔"同一口径），**不要**改成
+        #   "窗口的 10%"：24h 窗口的 10% = 2.4h，而空洞 >2.4h 时累计覆盖必然 <21.6h(90%)
+        #   ⇒ 两条判据互斥、连续性那条永远不触发，等于给自己立了一条验证不了的规则。
+        if [ "$max_gap_seconds" -gt 3600 ]; then status="partial"; fi
     fi
     {
       printf 'status\t%s\n' "$status"
@@ -607,9 +708,10 @@ collect_sar_history() {
         collect_sadf_metric io "$HISTORY_DIR/sar_io.csv" -b || true
         collect_sadf_metric process "$HISTORY_DIR/sar_process.csv" -w || true
         compute_sar_coverage
-        local coverage_status coverage_hours
+        local coverage_status coverage_hours coverage_discontinuity
         coverage_status=$(awk -F'\t' '$1=="status"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         coverage_hours=$(awk -F'\t' '$1=="coverage_hours"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
+        coverage_discontinuity=$(awk -F'\t' '$1=="discontinuity_count"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         # 直接映射 coverage.tsv 的判定结果：导出成功不等于有覆盖，
         # empty（读不到历史区间）必须如实记为 empty，不能默认 ok。
         case "${coverage_status:-}" in
@@ -617,7 +719,7 @@ collect_sar_history() {
             empty|"") status="empty" ;;
             *)        status="partial" ;;
         esac
-        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours"
+        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours, discontinuity_count=${coverage_discontinuity:-unknown}"
     fi
     end_iso=$(iso_now); end_ms=$(epoch_ms)
     record_status "system.sar_history" "system.history" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "${count:-0}" 0 "history/" "$reason"
@@ -665,6 +767,10 @@ append_disk_sample() {
     local ts="$1" elapsed_ms="$2" delta_ms="$3" p dev s ri rs rt wi ws wt inflight io_ms weighted sector_size
     local dri drs drt dwi dws dwt dio dweighted
     for p in /sys/block/*; do
+        # 设备过滤（三库统一）：loop/ram/zram/fd/sr 是伪设备或只读介质；`dm-*` 是 device-mapper
+        #   逻辑设备（LVM / 多路径），它与底层物理盘**统计同一份 IO** —— 两层都列会让报告
+        #   的"磁盘设备"表出现两行描述同一个盘，util 取 max 时口径也含糊。
+        #   报告按**物理盘**口径；多路径/ASM 视图另经 `multipath -ll` 取证（Oracle 的 asm_multipath）。
         [ -r "$p/stat" ] || continue; dev=${p##*/}; case "$dev" in loop*|ram*|zram*|fd*|sr*|dm-*) continue;; esac
         s=$(cat "$p/stat" 2>/dev/null) || continue
         read -r ri rs rt wi ws wt inflight io_ms weighted < <(awk '{print $1,$3,$4,$5,$7,$8,$9,$10,$11}' "$p/stat" 2>/dev/null)
@@ -781,36 +887,33 @@ collect_pg_performance() {
       "SELECT pid, datname AS database_name, relid::regclass::text AS relation, phase, heap_blks_total, heap_blks_scanned, heap_blks_vacuumed, index_vacuum_count FROM pg_stat_progress_vacuum" || true
     pg_query_tsv "pg.bgwriter" "pg.performance" "$TABLES_DIR/bgwriter.tsv" \
       "SELECT * FROM pg_stat_bgwriter" || true
-    pg_query_tsv "pg.table_health" "pg.performance" "$TABLES_DIR/table_health.tsv" \
-      "SELECT schemaname, relname AS table_name, n_live_tup, n_dead_tup, CASE WHEN n_live_tup+n_dead_tup=0 THEN 0 ELSE round(n_dead_tup::numeric/(n_live_tup+n_dead_tup),4) END AS dead_tuple_ratio, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze, n_mod_since_analyze, pg_total_relation_size(relid) AS total_bytes FROM pg_stat_user_tables ORDER BY n_dead_tup DESC NULLS LAST LIMIT ${TOP_N}" || true
-    pg_query_tsv "pg.large_tables" "pg.performance" "$TABLES_DIR/large_tables.tsv" \
-      "SELECT schemaname, relname AS table_name, pg_relation_size(relid) AS table_bytes, pg_indexes_size(relid) AS index_bytes, pg_total_relation_size(relid) AS total_bytes, n_live_tup FROM pg_stat_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 30" || true
-    pg_query_tsv "pg.no_primary_key" "pg.performance" "$TABLES_DIR/no_primary_key.tsv" \
-      "SELECT n.nspname AS schemaname, c.relname AS table_name, pg_total_relation_size(c.oid) AS total_bytes, c.reltuples::bigint AS estimated_rows FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') AND NOT EXISTS (SELECT 1 FROM pg_constraint x WHERE x.conrelid=c.oid AND x.contype='p') ORDER BY pg_total_relation_size(c.oid) DESC LIMIT ${TOP_N}" || true
-    pg_query_tsv "pg.indexes" "pg.performance" "$TABLES_DIR/indexes.tsv" \
-      "SELECT s.schemaname, s.relname AS table_name, s.indexrelname AS index_name, s.idx_scan, pg_relation_size(s.indexrelid) AS index_bytes, i.indisvalid, i.indisready, i.indisunique, i.indisprimary FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid=s.indexrelid ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT ${TOP_N}" || true
-    pg_query_tsv "pg.sequences" "pg.performance" "$TABLES_DIR/sequences.tsv" \
-      "SELECT schemaname, sequencename AS sequence_name, last_value, max_value, CASE WHEN last_value IS NULL OR max_value=0 THEN NULL ELSE round(last_value::numeric/max_value,4) END AS usage_ratio FROM pg_sequences ORDER BY usage_ratio DESC NULLS LAST LIMIT 50" || true
+    # ★ B6：下面 9 项在**顶层连接**上恒为空 —— 默认连的是 postgres 系统库，
+    #   而 pg_stat_user_tables / pg_stat_user_indexes 只返回**当前库**的对象。
+    #   真实数据来自逐库采集（db.<name>.<x>，见 collect_pg_objects）。原先写成
+    #   `pg_query_tsv` ⇒ 台账里恒记 `empty`，看着像“实例没有未使用索引”。
+    #   改记 `skipped`：项仍在台账里（不消失）、文件仍是一个 header，但原因
+    #   明确，且不再白跑这 9 个必然为空的查询。
+    record_skipped "pg.table_health" "pg.performance" "skipped" "改由逐库采集（db.<name>.table_health）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/table_health.tsv"
+    record_skipped "pg.large_tables" "pg.performance" "skipped" "改由逐库采集（db.<name>.large_tables）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/large_tables.tsv"
+    record_skipped "pg.no_primary_key" "pg.performance" "skipped" "改由逐库采集（db.<name>.no_primary_key）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/no_primary_key.tsv"
+    record_skipped "pg.indexes" "pg.performance" "skipped" "改由逐库采集（db.<name>.indexes）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/indexes.tsv"
+    record_skipped "pg.sequences" "pg.performance" "skipped" "改由逐库采集（db.<name>.sequences）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/sequences.tsv"
     pg_query_tsv "pg.prepared_xacts" "pg.performance" "$TABLES_DIR/prepared_xacts.tsv" \
       "SELECT transaction, gid, prepared, owner, database FROM pg_prepared_xacts ORDER BY prepared" || true
 
     pg_query_tsv "pg.object_counts" "pg.performance" "$TABLES_DIR/object_counts.tsv" \
       "SELECT 'table' AS object_type, count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'partitioned_table', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='p' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'index', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='i' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'view', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='v' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'sequence', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='S' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'trigger', count(*) FROM pg_trigger WHERE tgisinternal=false UNION ALL SELECT 'function', count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') UNION ALL SELECT 'extension', count(*) FROM pg_extension UNION ALL SELECT 'materialized_view', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='m' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') UNION ALL SELECT 'foreign_table', count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='f' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') ORDER BY 2 DESC" || true
 
-    pg_query_tsv "pg.duplicate_indexes" "pg.performance" "$TABLES_DIR/duplicate_indexes.tsv" \
-      "WITH idx AS (SELECT n.nspname AS schemaname, t.relname AS table_name, i.indrelid, i.indkey::text AS indkey, i.indcollation::text AS indcollation, i.indclass::text AS indclass, i.indoption::text AS indoption, i.indexprs::text AS indexprs, i.indpred::text AS indpred, i.indnkeyatts, i.indisunique, i.indisprimary, i.indisexclusion, ic.relam, pg_get_indexdef(i.indexrelid) AS index_def, pg_relation_size(i.indexrelid) AS index_bytes FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_class ic ON ic.oid=i.indexrelid JOIN pg_namespace n ON n.oid=t.relnamespace WHERE i.indisvalid AND i.indisready AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')) SELECT schemaname, table_name, min(index_def) AS index_def, count(*) AS duplicate_count, sum(index_bytes) AS index_bytes FROM idx GROUP BY schemaname, table_name, indrelid, indkey, indcollation, indclass, indoption, indexprs, indpred, indnkeyatts, indisunique, indisprimary, indisexclusion, relam HAVING count(*)>1 ORDER BY sum(index_bytes) DESC LIMIT ${TOP_N}" || true
+    record_skipped "pg.duplicate_indexes" "pg.performance" "skipped" "改由逐库采集（db.<name>.duplicate_indexes）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/duplicate_indexes.tsv"
 
-    pg_query_tsv "pg.unused_indexes" "pg.performance" "$TABLES_DIR/unused_indexes.tsv" \
-      "SELECT s.schemaname, s.relname AS table_name, s.indexrelname AS index_name, pg_size_pretty(pg_relation_size(s.indexrelid)) AS index_size, s.idx_scan FROM pg_stat_user_indexes s JOIN pg_index i ON i.indexrelid=s.indexrelid CROSS JOIN (SELECT stats_reset FROM pg_stat_database WHERE datname=current_database()) d WHERE s.idx_scan=0 AND i.indisvalid AND i.indisready AND NOT i.indisprimary AND NOT i.indisunique AND NOT i.indisexclusion AND pg_relation_size(s.indexrelid)>65536 AND s.indexrelname NOT LIKE 'pg_toast_%' AND s.schemaname NOT IN ('pg_catalog','information_schema') AND greatest(coalesce(d.stats_reset,'epoch'::timestamptz),pg_postmaster_start_time()) < now()-interval '7 days' ORDER BY pg_relation_size(s.indexrelid) DESC LIMIT ${TOP_N}" || true
+    record_skipped "pg.unused_indexes" "pg.performance" "skipped" "改由逐库采集（db.<name>.unused_indexes）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/unused_indexes.tsv"
 
     pg_query_tsv "pg.db_role_settings" "pg.performance" "$TABLES_DIR/db_role_settings.tsv" \
       "SELECT coalesce(d.datname,'(all)') AS database, coalesce(r.rolname,'(all)') AS role, unnest(setconfig) AS parameter_value FROM pg_db_role_setting s LEFT JOIN pg_database d ON d.oid=s.setdatabase LEFT JOIN pg_roles r ON r.oid=s.setrole ORDER BY database, role" || true
 
-    pg_query_tsv "pg.bloat_estimation" "pg.performance" "$TABLES_DIR/bloat_estimation.tsv" \
-      "SELECT schemaname, relname AS table_name, pg_total_relation_size(relid) AS total_bytes, pg_relation_size(relid) AS table_bytes, pg_indexes_size(relid) AS index_bytes, n_live_tup, n_dead_tup, CASE WHEN n_live_tup+n_dead_tup>0 THEN round(100.0*n_dead_tup/(n_live_tup+n_dead_tup),1) ELSE 0 END AS dead_pct, CASE WHEN n_live_tup+n_dead_tup>0 AND n_live_tup>0 THEN (pg_relation_size(relid)*n_dead_tup/(n_live_tup+n_dead_tup))::bigint ELSE 0 END AS estimated_dead_bytes, last_vacuum, last_autovacuum FROM pg_stat_user_tables WHERE n_dead_tup>0 ORDER BY estimated_dead_bytes DESC LIMIT ${TOP_N}" || true
+    record_skipped "pg.bloat_estimation" "pg.performance" "skipped" "改由逐库采集（db.<name>.bloat_estimation）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/bloat_estimation.tsv"
 
-    pg_query_tsv "pg.partition_summary" "pg.performance" "$TABLES_DIR/partition_summary.tsv" \
-      "SELECT n.nspname AS schemaname, p.relname AS partitioned_table, count(c.oid) AS partition_count, pg_size_pretty(sum(pg_total_relation_size(c.oid))) AS total_size, sum(pg_total_relation_size(c.oid)) AS total_bytes FROM pg_class p JOIN pg_namespace n ON n.oid=p.relnamespace JOIN pg_inherits i ON i.inhparent=p.oid JOIN pg_class c ON c.oid=i.inhrelid WHERE p.relkind='p' AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast') GROUP BY n.nspname,p.relname,p.oid ORDER BY sum(pg_total_relation_size(c.oid)) DESC LIMIT ${TOP_N}" || true
+    record_skipped "pg.partition_summary" "pg.performance" "skipped" "改由逐库采集（db.<name>.partition_summary）；顶层连接默认 postgres，无用户对象" "$TABLES_DIR/partition_summary.tsv"
 
     if [ "$STAT_STATEMENTS_AVAILABLE" -eq 1 ]; then
         if [ "$REDACT_SQL" -eq 1 ]; then
@@ -865,6 +968,8 @@ collect_pg_objects() {
 
         pg_query_tsv_db "$db" "db.${safe_db}.extensions" "pg.objects" "$base/extensions.tsv" \
           "SELECT current_database() AS database_name, extname AS extension_name, extversion AS version FROM pg_extension ORDER BY extname" || true
+        pg_query_tsv_db "$db" "db.${safe_db}.sequences" "pg.objects" "$base/sequences.tsv" \
+          "SELECT current_database() AS database_name, schemaname, sequencename AS sequence_name, last_value, max_value, CASE WHEN last_value IS NULL OR max_value=0 THEN NULL ELSE round(last_value::numeric/max_value,4) END AS usage_ratio FROM pg_sequences ORDER BY usage_ratio DESC NULLS LAST LIMIT 50" || true
         pg_query_tsv_db "$db" "db.${safe_db}.table_health" "pg.objects" "$base/table_health.tsv" \
           "SELECT current_database() AS database_name, schemaname, relname AS table_name, n_live_tup, n_dead_tup, CASE WHEN n_live_tup+n_dead_tup=0 THEN 0 ELSE round(n_dead_tup::numeric/(n_live_tup+n_dead_tup),4) END AS dead_tuple_ratio, last_vacuum, last_autovacuum, last_analyze, last_autoanalyze, n_mod_since_analyze, pg_total_relation_size(relid) AS total_bytes FROM pg_stat_user_tables ORDER BY n_dead_tup DESC NULLS LAST LIMIT ${TOP_N}" || true
         pg_query_tsv_db "$db" "db.${safe_db}.large_tables" "pg.objects" "$base/large_tables.tsv" \
@@ -937,10 +1042,18 @@ collect_pg_logs_backup() {
         capture_command "backup.barman" "pg.backup" "$EVIDENCE_DIR/barman_check.txt" barman check all || true
     else record_skipped "backup.barman" "pg.backup" "unsupported" "barman unavailable"; fi
     if has_cmd patronictl; then
-        capture_command "ha.patroni" "pg.backup" "$EVIDENCE_DIR/patroni_cluster.json" patronictl list --format json || true
+        capture_command "ha.patroni" "pg.backup" "$EVIDENCE_DIR/patroni_cluster.json" patronictl list --format json
+        # 互斥备选（对齐 Oracle N-14 的 ntpq/ifconfig 写法）。原实现把"都不存在"兜底写成
+        #   第三个 id `ha.manager` ⇒ 两个真实项在任何单一路径下都不是"两个分支都可见"。
+        #   改为 patroni/repmgr 各自在所有路径留痕；`ha.manager` 随之废弃（Python 侧零消费）。
+        record_skipped "ha.repmgr" "pg.backup" "skipped" "patronictl available; repmgr is the mutually-exclusive fallback"
     elif has_cmd repmgr; then
-        capture_command "ha.repmgr" "pg.backup" "$EVIDENCE_DIR/repmgr_cluster.txt" repmgr cluster show --csv || true
-    else record_skipped "ha.manager" "pg.backup" "unsupported" "patronictl/repmgr unavailable"; fi
+        capture_command "ha.repmgr" "pg.backup" "$EVIDENCE_DIR/repmgr_cluster.txt" repmgr cluster show --csv
+        record_skipped "ha.patroni" "pg.backup" "skipped" "repmgr available; patronictl is the mutually-exclusive fallback"
+    else
+        record_skipped "ha.patroni" "pg.backup" "unsupported" "patronictl not installed"
+        record_skipped "ha.repmgr" "pg.backup" "unsupported" "repmgr not installed"
+    fi
 
     if has_cmd crontab; then
         crontab -l 2>/dev/null | grep -Ei 'pg|postgres|backup|pgbackrest|barman|pg_dump|pgdump|wal|repmgr|patroni' > "$EVIDENCE_DIR/backup_cron.txt"
@@ -950,6 +1063,8 @@ collect_pg_logs_backup() {
     if has_cmd systemctl; then
         systemctl list-timers --all --no-pager 2>/dev/null | grep -Ei 'pg|postgres|backup|pgbackrest|barman|dump|wal' > "$EVIDENCE_DIR/backup_timers.txt"
         record_status "system.backup_timers" "pg.backup" "$([ -s "$EVIDENCE_DIR/backup_timers.txt" ] && echo ok || echo empty)" "$(iso_now)" "$(iso_now)" 0 "$(wc -l < "$EVIDENCE_DIR/backup_timers.txt")" 0 "evidence/backup_timers.txt" ""
+    else
+        record_skipped "system.backup_timers" "pg.backup" "unsupported" "systemctl command unavailable"
     fi
 
     ps -eo pid,user,etimes,args 2>/dev/null | grep -Ei '[p]gbackrest|[b]arman|[p]g_dump|[w]al-g|[p]g_basebackup' > "$EVIDENCE_DIR/backup_processes.txt"
@@ -996,9 +1111,12 @@ derive_role_evidence() {
 # ============ 输出生成 ============
 
 generate_collection_status_json() {
-    local files
-    files=$(find "$STATUS_PARTS_DIR" -type f -name '*.tsv' | sort | tr '\n' ' ')
-    if [ -z "$files" ]; then
+    # 对齐 MySQL F-10：路径必须逐项传递。原先 `find | tr '\n' ' '` 再裸展开 `$files`，
+    #   一旦路径含空格就把一个路径拆成两个参数 ⇒ awk 读不到文件 ⇒ items 静默变少。
+    local -a files=()
+    local f
+    while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(find "$STATUS_PARTS_DIR" -type f -name '*.tsv' | sort)
+    if [ ${#files[@]} -eq 0 ]; then
         printf '{"schema_version":"1.0","items":[],"summary":{}}\n' > "$COLLECTION_STATUS_FILE"
         return 0
     fi
@@ -1014,9 +1132,9 @@ generate_collection_status_json() {
       }
       END{
         print ""; print "  ],";
-        printf "  \"summary\": {\"ok\":%d,\"empty\":%d,\"unsupported\":%d,\"not_enabled\":%d,\"not_applicable\":%d,\"permission_denied\":%d,\"timeout\":%d,\"error\":%d,\"skipped\":%d,\"partial\":%d}\n",c["ok"]+0,c["empty"]+0,c["unsupported"]+0,c["not_enabled"]+0,c["not_applicable"]+0,c["permission_denied"]+0,c["timeout"]+0,c["error"]+0,c["skipped"]+0,c["partial"]+0
+        printf "  \"summary\": {\"ok\":%d,\"empty\":%d,\"unsupported\":%d,\"not_enabled\":%d,\"not_applicable\":%d,\"permission_denied\":%d,\"timeout\":%d,\"error\":%d,\"skipped\":%d,\"partial\":%d,\"schema_mismatch\":%d}\n",c["ok"]+0,c["empty"]+0,c["unsupported"]+0,c["not_enabled"]+0,c["not_applicable"]+0,c["permission_denied"]+0,c["timeout"]+0,c["error"]+0,c["skipped"]+0,c["partial"]+0,c["schema_mismatch"]+0
         print "}"
-      }' $files > "$COLLECTION_STATUS_FILE"
+      }' "${files[@]}" > "$COLLECTION_STATUS_FILE"
 }
 
 generate_snapshot_json() {
@@ -1051,7 +1169,10 @@ generate_snapshot_json() {
     host_local_time=$(awk -F= '$1=="local_time"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
     host_utc_time=$(awk -F= '$1=="utc_time"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
     host_timezone=$(awk -F= '$1=="timezone"{print substr($0,index($0,"=")+1)}' "$EVIDENCE_DIR/time_status.txt" 2>/dev/null)
-    ntp_synchronized=$(awk -F: '/System clock synchronized/{gsub(/^[ \t]+|[ \t]+$/,"",$2);print $2}' "$EVIDENCE_DIR/timedatectl.txt" 2>/dev/null)
+    # 对齐 MySQL F-31：systemd >= 239 的 `timedatectl status` 输出字段名是 `NTP synchronized`，
+    #   旧写法只匹配 `System clock synchronized` ⇒ 新系统上该字段恒为空，
+    #   snapshot.json#time_evidence.ntp_synchronized 拿到空值而**不报任何错**。
+    ntp_synchronized=$(awk -F: '/^(System clock|NTP) synchronized:/{gsub(/^[ \t]+|[ \t]+$/,"",$2);print $2}' "$EVIDENCE_DIR/timedatectl.txt" 2>/dev/null)
 
     {
       printf '{\n'
@@ -1090,7 +1211,7 @@ generate_snapshot_json() {
 }
 
 generate_summary() {
-    local total_ms ok empty unsupported not_enabled permission timeout error skipped partial
+    local total_ms ok empty unsupported not_enabled permission timeout error skipped partial schema_mismatch
     local actual_pg_points actual_elapsed_ms sampling_status sar_coverage_status sar_coverage_hours sar_first sar_last
     total_ms=$(( $(epoch_ms) - COLLECTION_STARTED_MS ))
     ok=$(awk -F'\t' '$3=="ok"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
@@ -1102,6 +1223,9 @@ generate_summary() {
     error=$(awk -F'\t' '$3=="error"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     partial=$(awk -F'\t' '$3=="partial"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     skipped=$(awk -F'\t' '$3=="skipped"||$3=="not_applicable"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
+    # 对齐 MySQL F-21：schema_mismatch = 表在、列不在，说明采集 SQL 与本版本列集不匹配。
+    #   它是**采集器缺陷**，不是"环境不支持"，必须单独计数并让人看见。
+    schema_mismatch=$(awk -F'\t' '$3=="schema_mismatch"{n++}END{print n+0}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null)
     actual_pg_points=$(awk 'END{print (NR>0?NR-1:0)}' "$PG_ACTIVITY_CSV" 2>/dev/null); actual_pg_points=${actual_pg_points:-0}
     actual_elapsed_ms=$(awk -F, 'NR>1{v=$2}END{print v+0}' "$PG_ACTIVITY_CSV" 2>/dev/null); actual_elapsed_ms=${actual_elapsed_ms:-0}
     sampling_status=$(awk -F'\t' '$1=="timeseries.realtime_sampling"{print $3}' "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null | tail -1); sampling_status=${sampling_status:-error}
@@ -1128,6 +1252,7 @@ generate_summary() {
       printf '实时同步采样实际: 状态 %s，PG 数据点 %s，实际跨度 %.2f 秒\n' "$sampling_status" "$actual_pg_points" "$(awk -v ms="$actual_elapsed_ms" 'BEGIN{print ms/1000}')"
       printf '\n状态统计\n'
       printf '  成功: %s\n  成功但无数据: %s\n  部分成功: %s\n  不支持: %s\n  未启用: %s\n  不适用/跳过: %s\n  权限不足: %s\n  超时: %s\n  错误: %s\n' "$ok" "$empty" "$partial" "$unsupported" "$not_enabled" "$skipped" "$permission" "$timeout" "$error"
+      printf '  与版本不匹配(schema_mismatch): %s  ← 非 0 表示采集脚本与目标版本列集不符，属采集器缺陷，需修脚本而不是忽略\n' "$schema_mismatch"
       printf '\n耗时最长的采集项（前 10）\n'
       cat "$STATUS_PARTS_DIR"/*.tsv 2>/dev/null | awk -F'\t' -v total="$total_ms" '$4!="" && $6 ~ /^[0-9]+$/ && $6>=0 && $6<=total*2' | sort -t$'\t' -k6,6nr | head -10 | awk -F'\t' '{printf "  %-45s %8.3f 秒  %s\n",$1,$6/1000,$3}'
       printf '\n非成功项\n'
@@ -1223,7 +1348,9 @@ while [ $# -gt 0 ]; do
       --sample-count) SAMPLE_COUNT="${2-}"; shift 2 ;;
       --sar-history-hours) SAR_HISTORY_HOURS="${2-}"; shift 2 ;;
       --pg-timeout) PG_TIMEOUT_SECONDS="${2-}"; shift 2 ;;
-      --include-log-text) INCLUDE_LOG_TEXT=1; shift ;;
+      # F-05（2026-10-16）：原 --include-log-text 旋钮已删除。
+      # 它声明/帮助/解析三处齐全但全脚本无人读 = 假开关，会让人以为
+      # "没传参所以没采到日志"，实际传了也一样。要恢复日志采集请先加读取点。
       --redact-sql) REDACT_SQL=1; shift ;;
       --current-database-only) ALL_DATABASES=0; shift ;;
       --no-package) CREATE_PACKAGE=0; shift ;;
@@ -1280,8 +1407,6 @@ if [ -n "$PASSWORD_FILE" ]; then
         mode=$(stat -c '%a' "$PASSWORD_FILE" 2>/dev/null); [ -n "$mode" ] && [ "$mode" -gt 600 ] 2>/dev/null && log_warn "密码文件权限建议设置为 600"
     fi
     PGPASS=$(head -n 1 "$PASSWORD_FILE")
-elif [ -n "$LEGACY_PASSWORD" ]; then
-    PGPASS="$LEGACY_PASSWORD"; log_warn "检测到命令行密码，建议改用 --password-file"
 elif [ -n "${PGPASSWORD:-}" ]; then
     PGPASS="$PGPASSWORD"
 else

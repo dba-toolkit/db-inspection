@@ -130,7 +130,7 @@ parse_args / load_config
 | `system.socket_summary` | `evidence/socket_summary.txt` | `ss -s` | 一致 |
 | `system.numa` | `evidence/numa.txt` | `numactl --hardware` | ✅ **10s 超时**（OF-08） |
 | `system.sysctl_selected` | `tables/kernel_parameters.tsv` | 13 个键（`vm.swappiness` … `net.ipv4.tcp_max_syn_backlog`） | 一致 |
-| `system.hugepages` | `tables/hugepages.tsv` | `path\tvalue`：THP enabled / defrag / `nr_hugepages` **+ `/proc/meminfo` 大页实测值**（HugePages_Total / Free / Rsvd / Hugepagesize / AnonHugePages / Hugetlb） | ✅ 批 2 已扩（OF-09） |
+| `system.hugepages` | `tables/hugepages.tsv` | `path\tvalue`：THP enabled / defrag / `nr_hugepages` **+ `/proc/meminfo` 大页实测值**（HugePages_Total / Free / Rsvd / Hugepagesize / AnonHugePages / Hugetlb） | ✅ 批 2 已扩（OF-09）；★ **批 24（三库同形）**：可读大页文件数为 **0** 时记 `empty`（旧写法**无条件 `ok`** ⇒ `/sys` 与 `/proc/meminfo` 都读不到时表现为"检查通过"） |
 | `system.dmesg_errors` | `evidence/dmesg_errors.txt` | `dmesg --level=err,crit,alert,emerg` | ✅ **20s 超时**（OF-08） |
 | `system.ifconfig` | `evidence/ip_address.txt` | `ifconfig -a` ⚠️ **仅当无 `ip` 时采集**；有 `ip` 时记 `skipped`（N-14 互斥清单） | 一致 |
 
@@ -183,7 +183,7 @@ parse_args / load_config
 
 | item_id | category | 输出 | 现状 |
 |---|---|---|---|
-| `system.sar_history` | `system.history` | `history/sar_{cpu,memory,swap,load,disk,network,io,**process**}.csv` + `source_files.txt` + `coverage.tsv` + **`coverage.json`** | ✅ 批 2 已补 `-w` 与 `coverage.json`（OF-18）；`sadf` **有意不带 `-t`**（四库归一，OF-07）；★ 批 6/N-7：中间清单落 `RUNTIME[TMP_DIR]`（**不进包**），`history/source_files.txt` 是唯一留档；★ 批 7/N-19：`output_file` = `history/coverage.json`（不再是目录 `history/`），无产物时为空串 |
+| `system.sar_history` | `system.history` | `history/sar_{cpu,memory,swap,load,disk,network,io,**process**}.csv` + `source_files.txt` + `coverage.tsv` + **`coverage.json`** | ✅ 批 2 已补 `-w` 与 `coverage.json`（OF-18）；`sadf` **有意不带 `-t`**（四库归一，OF-07）；★ 批 6/N-7：中间清单落 `RUNTIME[TMP_DIR]`（**不进包**），`history/source_files.txt` 是唯一留档；★ 批 7/N-19：`output_file` = `history/coverage.json`（不再是目录 `history/`），无产物时为空串；★ **批 24（OS 三库对齐）**：`coverage.json` 升 `schema_version 1.1` —— 新增 `point_count` / `discontinuity_count` / `max_gap_seconds` 三字段（`coverage.tsv` 同步增三行），`status` 增加**连续性判据**（见 §7 `partial`）；旧包（1.0）字段是子集，`json.load` 后按 `.get()` 取值即兼容 |
 | `timeseries.realtime_sampling` | `timeseries` | `timeseries/system_{cpu,memory,network,disk}.csv` + `oracle_sysstat.csv` | 与 MySQL 版一致（间隔 5s × 6 次 ≈ 30s），见 INTERFACE §5.1 的 `_PREV_*` 差分口径；★ 批 7/N-19：`output_file` = `timeseries/oracle_sysstat.csv`（不再是目录 `timeseries/`） |
 
 时序 CSV 表头（**下游按列名取值，不要按列号**）：
@@ -428,6 +428,16 @@ DIR/                                                                    ← --ou
 | `output_file` | ~~**SQL 项恒为 `"report"`**~~ **v2.0 已修**：SQL 项指向 `tables/<item_id>.psv`；`capture_command` 项是真实证据路径（`evidence/*.txt`）；`module` 项为空串。★ **批 7/N-19：列值必须是"包内真实存在的**文件**"**（可被 `os.path.isfile(包根/值)` 命中）。一次产出多个文件的"集合型"项（`sar_history` / `realtime_sampling`）取一个**代表文件**（`history/coverage.json` / `timeseries/oracle_sysstat.csv`），**不再写目录**；无产物时写空串 |
 | `reason` | `sanitize_text` 处理过（TAB/CR/LF → 空格，多空格压缩），最多 5 行截断。**v2.0 起完整原文另落包内 `logs/modules/<category>.log`**（OF-26）—— status 里只留摘要 |
 
+**★ 批 24（OS 三库对齐）：`capture_command` 失败时的落盘口径按扩展名分流**
+
+命令**失败（rc≠0）**时不再一律清空，改为：
+
+- `*.tsv` / `*.psv` / `*.csv` → **清空**：残缺表格进了包就会被下游当完整表解析，而"表只有半截"这件事**没有任何字段能表达**（`row_count` 记的是半截的真实行数，看起来更像"表确实这么小"）⇒ 宁可让它 `empty`。
+- 其它（`*.txt` 等文本证据）→ **保留半截输出**：命令行原文本身就是证据，"失败时到底看到了什么"比"什么都没有"有用。
+- 判据**只看扩展名**，不看内容；成功时两条路都不动（`row_count` / 落盘行为与批 24 前一致）。
+
+mysql / pg / oracle 三库同形（`*.psv` 只在 Oracle 侧存在，是它 SQL 结果的原生扩展名）。
+
 **v1.4 实测数量对账（保留作对照；v2.0 后 status 文件数应等于 136 + 31 + 28 + 打包项）**：
 
 ```
@@ -531,7 +541,7 @@ NAME^I |DB_UNIQUE_NAME^I^I|DATABASE_ROLE^I |OPEN_MODE^I      |LOG_MODE    |CREAT
 | `permission_denied` | 权限不足（`ORA-01031`…） | **不得当作 unsupported**；须在报告里显式披露"权限不足" | ✅（v1.4: 0 个） |
 | `not_enabled` | 服务/daemon 未运行、文件不存在 | 须区分"客户没开"与"没采到" | ✅ **v1.4: 2 个**（`chronyc_sources` / `chronyc_tracking`，`506 Cannot talk to daemon`）。★ 批 6/N-13 起 `lsnrctl` 的 `TNS-12541` / `TNS-00511` / `no listener` 也归此（listener 未运行 ≠ 采集失败） |
 | `skipped` | 用户 `--exclude` / `--no-sar` 主动跳过；★ 批 6/N-14 起**互斥备选未采用**也记此（`system.ifconfig` / `system.ntpq_peers`，见 §4.1 互斥清单） | 按设计跳过 | ✅（v1.4: 0 个） |
-| `partial` | 部分成功：`timeseries.realtime_sampling`（采样点数不足 / Oracle 统计读取偶发失败，rc=2）、★ 批 7 起 `system.sar_history`（`coverage` 介于"有覆盖"与"读不到历史区间"之间，如只命中部分 sa 文件） | 按 `reason` 里的实际点数 / `history/coverage.json` 决定可用性 | ✅ **v1.4: 1 个**；v2.0 实测两者都可能出现 |
+| `partial` | 部分成功：`timeseries.realtime_sampling`（采样点数不足 / Oracle 统计读取偶发失败，rc=2）、★ 批 7 起 `system.sar_history`（`coverage` 介于"有覆盖"与"读不到历史区间"之间，如只命中部分 sa 文件）、★ **批 24 起** `system.sar_history` 的**连续性**判据（窗口内存在 **>1 小时**的点间空洞 ⇒ `partial`，即使累计覆盖仍 ≥90%） | 按 `reason` 里的实际点数 / `history/coverage.json` 决定可用性 | ✅ **v1.4: 1 个**；v2.0 实测两者都可能出现 |
 | `schema_mismatch` | 表在、列不在 = **采集器缺陷**（`ORA-00904`/`ORA-01722`） | **必须单独计数并让人看见**，不得混进 `unsupported` | ✅ **v2.0 新增**（批 1 / OF-03；分类顺序在 `unsupported` **之前**） |
 | `not_applicable` | 该环境不适用（非 RAC 的 RAC 项、无 ASM 的 ASM 项） | **Oracle 不产出这个值**，adapter 需按 `snapshot.json` 的 `is_rac`/`has_asm`/`is_cdb` **自行推断** | ❌ |
 
@@ -1272,3 +1282,86 @@ bash -n inspection/oracle_inspection.sh    # 语法
 - 三条出口的留痕语义（批 21/22）、两个开关的默认值与语义、`oracle.awr.report` 的 item_id 均未变。
 - 旧包（脚本不重跑）不受影响：旧命名落在 `evidence/` 根的 HTML 在新审计里会出现在
   **「无人提及」**里 —— 这是**如实报出**，不是缺陷。
+
+---
+
+### 11.25 OS 三库对齐 批 1（2026-10-15，**采集层 × 3 库**；契约只加字段，向后兼容）
+
+**起因**：`pg_inspection_standard.sh` 参照 MySQL 已完成的多批整改做对齐，重点是 **OS / 整机采集层**。但真正的约束是：
+
+> **同一台主机上，mysql / pg / oracle 三个采集器观测的是同一份 `/proc`、`/sys`、`sar`。**
+> 三份报告对同一台机器的 OS 结论必须一致 —— 否则会出现"同一台机器，两份报告说它磁盘 IO 饱和，第三份说正常"。
+
+所以本轮不是"把 MySQL 的做法抄给 PG"，而是**三库同时收口到一套口径**。Oracle 侧涉及 4 项（`coverage.json` / `capture_command` / `hugepages` / `dm-*`）。
+
+**改动清单（Oracle 侧 4 项）**：
+
+| # | 改什么 | 位置 | 为什么 |
+|:--:|---|---|---|
+| 1 | `coverage.json` `schema_version` **1.0 → 1.1**，新增 `point_count` / `discontinuity_count` / `max_gap_seconds`；`coverage.tsv` 同步增三行 | `compute_sar_coverage` | 旧字段只能说"累计覆盖了多少秒"，**说不出覆盖是否连续** |
+| 2 | `compute_sar_coverage` **窗口裁剪**：只统计 `SAR_HISTORY_HOURS` 窗口内的点 | 同上 | 旧实现把 `sa` 文件里**更早**的点也累加进 `coverage` ⇒ 覆盖率虚高（请求 24h，实际拿 30h 的点凑） |
+| 3 | `status` 增加**连续性判据**：`max_gap_seconds > 3600` ⇒ `partial` | 同上 | 见下方"★ 一条自己给自己立的死规则" |
+| 4 | `capture_command` 失败落盘**按扩展名分流** | `capture_command` | 见 §6.2 新增段（表格清空 / 文本证据保留） |
+| 5 | `system.hugepages` 行数 **0 ⇒ `empty`** | `collect_system_static` | 旧写法**无条件 `ok`** ⇒ `/sys` 与 `/proc/meminfo` 都读不到时，表现与"检查通过"完全一样 |
+| 6 | `/sys/block` 设备过滤加 `dm-*` | `append_disk_sample` | 见下方两条口径决策 |
+| 7.1 | **`chronyc`/`ntpq` 判据** | `collect_system_static` | 判据从「命令存在」改为「守护进程在应答」：套 `run_with_timeout 15 chronyc tracking` 并看返回码；不应答且有 `ntpq` 时真采一次。★ 条件里**不能**带 `|| true`（会让 `if` 恒真），原先那行已去掉。三库同形（2026-10-16） |
+| 7 | **`has_cmd` 缺命令登记** | `collect_system_static` | 命令缺失时不再静默跳过，补 `unsupported`；互斥备选（`ip`↔`ifconfig`、`chrony`↔`ntpq`）在**未采用**的那条记 `skipped`。Oracle 本轮补 4 处（`chronyc_tracking` / `chronyc_sources` / `ip_route` / `ifconfig` 末段）—— N-14/N-20 已修的不重复改 。**★ 落地后自查抓到自身缺陷**：`system.timedatectl` 那行误写成 PG/MySQL 才有的 `record_skipped`（Oracle 无此函数）⇒ 运行时 `command not found`（rc=127）、该项**照旧不进台账**，文本形态却与修好时一样。已改回本文件惯例的 10 参数 `record_status`；并新增守门 `tests/test_collector_helpers_defined.py`（详见 `docs/os-collector-crossdb-alignment.md` §1A） |
+
+（7 项，非 4 —— Oracle 侧不含 `classify_failure` / `ntp_synchronized` 两项，那两项 MySQL/PG 侧早于此就同源了。）
+
+**★★ 一条自己给自己立的死规则（`max_gap_seconds` 的阈值，别改回"窗口的 10%"）**
+
+PG 的 fix-plan F-04 原文写的是「窗口内出现 **> 窗口 10%** 的空洞时，即使累计覆盖达标也不判 ok」。看着合理，实际**两条判据互斥**：
+
+- 累计覆盖**只累加 ≤1 小时**的相邻间隔（>1h 的间隔整段不算覆盖）;
+- 24h 窗口的 10% = **2.4h**；
+- ⇒ 空洞 >2.4h 时，累计覆盖必然 <21.6h（=90%）⇒ **第 1 条判据已经判 `partial`**，连续性那条**永远没机会触发**。
+
+阈值必须取 **3600s**（与"≤1h 才算覆盖"同一口径）。自测用 `gap100` 夹具钉住这点：
+挖掉 2 个采样点 = **90 分钟空洞**，累计覆盖仍 **79200s ≥ 77760s（90%）** ⇒ 旧口径 **ok**、新口径 **partial**（对照实验见下）。
+
+**两条口径决策（三库取向本可不同，但同一台机器上必须选同一个；已定）**
+
+**2.1 命令失败时怎么落盘** → 详 §6.2。一句话：**表格清空、文本保留**，理由是"残缺表格比没有表格更危险"。
+
+**2.2 `dm-*` 采不采**：`/sys/block/dm-0`… 是 device-mapper 逻辑设备（LVM / multipath）。
+
+- **采**：磁盘 IO 统计里会同时出现 `sda` 与 `dm-0`，而 `dm-*` 的读写**就是下层盘的读写** ⇒ 同一份物理 IO **被算两遍**，利用率排行里 `dm-*` 与物理盘争夺名次。
+- **不采**：LVM 上的挂载点看不出对应哪块物理盘。
+- **定：不采**，口径 = **物理盘**。
+- ⚠️ 代价与将来换口径的条件：若"按挂载点回答磁盘问题"成为需求（例如 `df` 出的 `/data` 要能对上一块盘），改为**只采 `dm-*`** —— **不要两个都采**，那是重复计数。
+
+**验证（`_work/os_selftest/`，临时目录，不入库）**
+
+harness 在**生成期从真脚本抽取**被测函数（`classify_failure` / `capture_command` / 三库各自的 `compute_sar_coverage`），**不手抄** —— 抄一份等于测替身；正文另过一遍 `bash -n`（带引号的 heredoc 正文不在 `bash -n 主脚本` 的覆盖范围内）。
+
+结果：**PASS=40 / FAIL=0**（A 7 / B 6 / C1 5 / C2 5 / C3 5 / D 2 / E 10；见 `_work/os_selftest/selftest.log`）
+
+- **C1/C2/C3** = 三库 `compute_sar_coverage` 各跑 3 份夹具（`contiguous` / `hole` / `gap100`），三库结论**逐项相同**；
+- **D** = 负控制：同一份 `gap100`（90 分钟空洞，`max_gap=5400s`）在**旧口径下必须给 `ok`**、新口径 `partial` —— 证明"新判据真的改变了结论"，而不是恒绿；
+- **E** = `hugepages` 判据段**从三库真脚本抽取后执行**（首版曾自己写了个 `hp_verdict()` 手抄判据 —— 那是测替身，真脚本改了它照样绿），并断言三库的**行数算式逐字同形**。
+
+★ **自测工具自身踩的两个坑**（记下来，免得下次当成脚本缺陷去改采集器）：
+
+1. `subprocess.run(timeout=…)` 抛 `TimeoutExpired` 时**没兜住** ⇒ 整个生成器崩掉、python 侧已缓冲的 stdout 随之丢失。现象酷似"日志只写到 A 节、后面几个节没跑"，实际是**输出被吞**（C/D 节的产物文件时间戳证明它们确实跑过）。修法 = 单节超时只记重试、不中断全局 + 强制行缓冲。
+2. 本机 PATH 里的 `rm` 被工作台包装成"安全删除"，**从第二次调用起阻塞** ⇒ harness 前置一个 no-op `rm`（**被测函数文本一字未改**，它删的只是 harness 自建的临时文件）。
+
+**不变量（本批没动）**：
+
+- **契约向后兼容**：`coverage.json` 只**加字段**（1.0 包是 1.1 的子集，adapter 按 `.get()` 取值即兼容）；`coverage.tsv` 只加行；status **取值集合未变**（`schema_mismatch` 是批 1 / OF-03 早已有的）；目录布局、文件名一律未改。
+- **旧包不受影响**：不重跑脚本的包保持原样。
+- Python 侧不受影响：`plugins/oracle/package_adapter.py` 未读 `coverage.json` 的新字段，`coverage.json` 的 `output_file` 语义（批 7 / N-19）未变。
+- **共享层 `inspection_core/word_engine.py` 的 `STATUS_DISPLAY` 新增 `"schema_mismatch": "与版本不匹配"`**（四库**共用一份**词表）—— 此前 Oracle 报告里这项状态会**原样印英文**。
+  ★ 顺带修掉守门自身的缺陷：`test_no_known_status_renders_with_ascii_letters` 原来从
+  `set(STATUS_DISPLAY)` **自取**候选集（自我引用），漏键时候选集跟着一起漏、测试**照样绿**；
+  现改为**外部清单驱动 + 断言覆盖**，并用「变异实现 → 守门必须变红」自证过
+  （详见 `docs/os-collector-crossdb-alignment.md` §5）。
+
+**验收命令（可复跑）**：
+
+```bash
+bash -n inspection/oracle_inspection.sh
+grep -n 'schema_version":"1.1"' inspection/oracle_inspection.sh   # 三库同版本
+grep -n 'dm-\*' inspection/oracle_inspection.sh                   # 设备过滤
+bash _work/os_selftest/gen.py                                     # 抽取式自测（临时目录）
+```

@@ -338,6 +338,19 @@ record_status() {
       "$output_file" "$(sanitize_text "$reason")" > "$f"
 }
 
+# record_skipped —— 命令缺失 / 环境不适用的**登记**入口（4 参数，与 PG 同签名）。
+#   B4（2026-10-16）：原定义在靠后的 collectors 区，与 record_status / capture_command
+#   隔了一千多行；按「辅助函数集中一处」的口径前移，跨库对照与同步补丁时能一眼找到。
+record_skipped() {
+    local item_id="$1" category="$2" status="$3" reason="$4" outfile="${5-}" output_file=""
+    if [ -n "$outfile" ]; then
+        mkdir -p "$(dirname "$outfile")"
+        ensure_tsv_header "$outfile" || : > "$outfile"
+        output_file=$(safe_relpath "$outfile")
+    fi
+    record_status "$item_id" "$category" "$status" "$(iso_now)" "$(iso_now)" 0 0 0 "$output_file" "$reason"
+}
+
 capture_command() {
     local item_id="$1" category="$2" outfile="$3"; shift 3
     local start_iso end_iso start_ms end_ms rc status rows reason err
@@ -353,6 +366,13 @@ capture_command() {
             head -c 500 "$outfile" >> "$err" 2>/dev/null
         fi
         status=$(classify_failure "$rc" "$err"); reason=$(tail -n 5 "$err" 2>/dev/null | tr '\n' ' ')
+        # 失败时的落盘口径（三库统一）：表格类（*.tsv/*.csv）残缺比没有更危险 ——
+        #   下游按行列取值看不出少了行，故清空，让"没采到"只由 collection_status 表达；
+        #   纯文本证据类（evidence/*.txt）保留已输出的半截，便于事后定位。
+        case "$outfile" in
+          *.tsv|*.csv) : > "$outfile" ;;
+          *) : ;;
+        esac
     elif [ ! -s "$outfile" ]; then status="empty"; fi
     rows=$(wc -l < "$outfile" 2>/dev/null | tr -d ' '); rows=${rows:-0}
     cat "$err" >> "$MODULE_LOG_DIR/$(sanitize_id "$category").log" 2>/dev/null
@@ -568,48 +588,121 @@ check_output_space() {
 collect_system_static() {
     capture_command "system.os_release" "system.static" "$EVIDENCE_DIR/os_release.txt" bash -c 'cat /etc/os-release 2>/dev/null; uname -a; uptime 2>/dev/null' || true
     capture_command "system.time_status" "system.static" "$EVIDENCE_DIR/time_status.txt" bash -c 'printf "local_time="; date --iso-8601=seconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z; printf "utc_time="; date -u --iso-8601=seconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ; printf "timezone="; cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || date +%Z; printf "epoch_seconds="; date +%s' || true
-    if has_cmd timedatectl; then capture_command "system.timedatectl" "system.static" "$EVIDENCE_DIR/timedatectl.txt" timedatectl status || true; fi
+    if has_cmd timedatectl; then
+        capture_command "system.timedatectl" "system.static" "$EVIDENCE_DIR/timedatectl.txt" timedatectl status
+    else
+        record_skipped "system.timedatectl" "system.static" "unsupported" "timedatectl not installed"
+    fi
     if has_cmd chronyc; then
-        capture_command "system.chronyc_tracking" "system.static" "$EVIDENCE_DIR/chronyc_tracking.txt" chronyc tracking || true
-        capture_command "system.chronyc_sources" "system.static" "$EVIDENCE_DIR/chronyc_sources.txt" chronyc sources -v || true
+        # ★ B5：判据不能只看 `has_cmd` —— chronyd **装了 ≠ 在跑**。只看命令存在时，
+        #   本机（chronyd 停着）会把 `ntpq_peers` 记成 skipped 并写"chronyc available"，
+        #   而 chronyc 实际返回 "506 Cannot talk to daemon" ⇒ 理由与事实矛盾；
+        #   若本机真正用的是 ntpd，ntpd 的对端列表还会整块丢失。
+        #   `capture_command` 返回的就是命令自身的 rc ⇒ 用它当"守护进程是否在应答"的判据。
+        if capture_command "system.chronyc_tracking" "system.static" "$EVIDENCE_DIR/chronyc_tracking.txt" chronyc tracking; then
+            # 互斥备选：chronyd 在应答 ⇒ ntpq 不被采用，显式记 skipped，
+            #   让两个 item 在**所有**路径都出现在台账里 —— 下游据此区分"环境不适用"与"该采却没采到"。
+            record_skipped "system.ntpq_peers" "system.static" "skipped" "chronyd is answering; ntpq is the mutually-exclusive fallback"
+        elif has_cmd ntpq; then
+            # chronyd 不在应答，但本机有 ntpq ⇒ 采一次，别让时间同步证据整块丢失。
+            capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn
+        else
+            record_skipped "system.ntpq_peers" "system.static" "unsupported" "chronyd is not answering and ntpq is not installed"
+        fi
+        capture_command "system.chronyc_sources" "system.static" "$EVIDENCE_DIR/chronyc_sources.txt" chronyc sources -v
     elif has_cmd ntpq; then
-        capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn || true
+        capture_command "system.ntpq_peers" "system.static" "$EVIDENCE_DIR/ntpq_peers.txt" ntpq -pn
+        record_skipped "system.chronyc_tracking" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.chronyc_sources" "system.static" "unsupported" "chronyc not installed"
+    else
+        record_skipped "system.chronyc_tracking" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.chronyc_sources" "system.static" "unsupported" "chronyc not installed"
+        record_skipped "system.ntpq_peers" "system.static" "unsupported" "neither chronyc nor ntpq installed"
     fi
     has_cmd lscpu && capture_command "system.lscpu" "system.static" "$EVIDENCE_DIR/lscpu.txt" lscpu || record_status "system.lscpu" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "lscpu not installed"
-    has_cmd free && capture_command "system.free" "system.static" "$TABLES_DIR/memory_snapshot.tsv" free -b || true
-    has_cmd df && capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
-    has_cmd df && capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon || true
-    has_cmd lsblk && capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL || true
-    has_cmd mount && capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount || true
-    if has_cmd ip; then
-        capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show || true
-        capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all || true
-    elif has_cmd ifconfig; then
-        capture_command "system.ifconfig" "system.static" "$EVIDENCE_DIR/ip_address.txt" ifconfig -a || true
+    if has_cmd free; then
+        capture_command "system.free" "system.static" "$TABLES_DIR/memory_snapshot.tsv" free -b
     else
-        record_status "system.ip_address" "system.static" "unsupported" "$(iso_now)" "$(iso_now)" 0 0 127 "" "ip/ifconfig not installed"
+        record_skipped "system.free" "system.static" "unsupported" "free not installed"
     fi
-    has_cmd ss && capture_command "system.socket_summary" "system.static" "$EVIDENCE_DIR/socket_summary.txt" ss -s || true
-    has_cmd numactl && capture_command "system.numa" "system.static" "$EVIDENCE_DIR/numa.txt" numactl --hardware || true
-    has_cmd sysctl && capture_command "system.sysctl_selected" "system.static" "$TABLES_DIR/kernel_parameters.tsv" bash -c '
-      for k in vm.swappiness vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes vm.overcommit_memory vm.zone_reclaim_mode fs.file-max fs.aio-max-nr net.core.somaxconn net.ipv4.tcp_max_syn_backlog; do
+    if has_cmd df; then
+        capture_command "system.filesystems" "system.static" "$TABLES_DIR/filesystems.tsv" df -PT -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon
+    else
+        record_skipped "system.filesystems" "system.static" "unsupported" "df not installed"
+    fi
+    if has_cmd df; then
+        capture_command "system.inodes" "system.static" "$TABLES_DIR/inodes.tsv" df -Pi -x fuse.gvfsd-fuse -x fuse.gvfs-fuse-daemon
+    else
+        record_skipped "system.inodes" "system.static" "unsupported" "df not installed"
+    fi
+    if has_cmd lsblk; then
+        capture_command "system.block_devices" "system.static" "$TABLES_DIR/block_devices.tsv" lsblk -b -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,ROTA,SCHED,MODEL,SERIAL
+    else
+        record_skipped "system.block_devices" "system.static" "unsupported" "lsblk not installed"
+    fi
+    if has_cmd mount; then
+        capture_command "system.mounts" "system.static" "$EVIDENCE_DIR/mounts.txt" mount
+    else
+        record_skipped "system.mounts" "system.static" "unsupported" "mount not installed"
+    fi
+    if has_cmd ip; then
+        capture_command "system.ip_address" "system.static" "$EVIDENCE_DIR/ip_address.txt" ip -details addr show
+        capture_command "system.ip_route" "system.static" "$EVIDENCE_DIR/ip_route.txt" ip route show table all
+        # 互斥备选（对齐 Oracle N-14）：有 ip 时 ifconfig 不被采用，显式记 skipped。
+        record_skipped "system.ifconfig" "system.static" "skipped" "ip available; ifconfig is the mutually-exclusive fallback"
+    elif has_cmd ifconfig; then
+        capture_command "system.ifconfig" "system.static" "$EVIDENCE_DIR/ip_address.txt" ifconfig -a
+        # ifconfig 给不出路由表 ⇒ ip_route 在只有 ifconfig 的机器上确实采不到，如实记 unsupported。
+        record_skipped "system.ip_route" "system.static" "unsupported" "ip not installed; ifconfig cannot dump the route table"
+    else
+        record_skipped "system.ip_address" "system.static" "unsupported" "ip/ifconfig not installed"
+        record_skipped "system.ip_route" "system.static" "unsupported" "ip not installed; ifconfig cannot dump the route table"
+        record_skipped "system.ifconfig" "system.static" "unsupported" "ip/ifconfig not installed"
+    fi
+    if has_cmd ss; then
+        capture_command "system.socket_summary" "system.static" "$EVIDENCE_DIR/socket_summary.txt" ss -s
+    else
+        record_skipped "system.socket_summary" "system.static" "unsupported" "ss not installed"
+    fi
+    if has_cmd numactl; then
+        capture_command "system.numa" "system.static" "$EVIDENCE_DIR/numa.txt" numactl --hardware
+    else
+        record_skipped "system.numa" "system.static" "unsupported" "numactl not installed"
+    fi
+    if has_cmd sysctl; then
+        capture_command "system.sysctl_selected" "system.static" "$TABLES_DIR/kernel_parameters.tsv" bash -c '
+      for k in vm.swappiness vm.dirty_ratio vm.dirty_background_ratio vm.dirty_bytes vm.dirty_background_bytes vm.overcommit_memory vm.zone_reclaim_mode fs.file-max fs.aio-max-nr kernel.shmmax kernel.shmall net.core.somaxconn net.ipv4.tcp_max_syn_backlog; do
         v=$(sysctl -n "$k" 2>/dev/null) && printf "%s\t%s\n" "$k" "$v"
       done
-      exit 0' || true
+      exit 0'
+    else
+        record_skipped "system.sysctl_selected" "system.static" "unsupported" "sysctl not installed"
+    fi
     {
         printf 'path\tvalue\n'
         for f in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag /proc/sys/vm/nr_hugepages; do
             [ -r "$f" ] && printf '%s\t%s\n' "$f" "$(tr '\n' ' ' < "$f")"
         done
     } > "$TABLES_DIR/hugepages.tsv"
-    record_status "system.hugepages" "system.static" "ok" "$(iso_now)" "$(iso_now)" 0 "$(awk 'END{print NR-1}' "$TABLES_DIR/hugepages.tsv")" 0 "tables/hugepages.tsv" ""
+    # F-27（三库同形）：行数为 0 必须写 empty。旧写法**无条件写 ok** —— 一旦 /sys 下这几个
+    #   文件都不可读（容器 / 裁剪内核），报告看到的是"大页配置正常"，实际一个字都没采到。
+    local hp_rows=0 hp_status="ok" hp_reason=""
+    hp_rows=$(awk 'END{print (NR>0?NR-1:0)}' "$TABLES_DIR/hugepages.tsv" 2>/dev/null); hp_rows=${hp_rows:-0}
+    if [ "$hp_rows" -eq 0 ]; then
+        hp_status="empty"; hp_reason="no readable hugepage file under /sys/kernel/mm/transparent_hugepage or /proc/sys/vm"
+    fi
+    record_status "system.hugepages" "system.static" "$hp_status" "$(iso_now)" "$(iso_now)" 0 "$hp_rows" 0 "tables/hugepages.tsv" "$hp_reason"
     if has_cmd dmesg; then
-        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null || true
+        capture_command "system.dmesg_errors" "system.static" "$EVIDENCE_DIR/dmesg_errors.txt" dmesg --level=err,crit,alert,emerg 2>/dev/null
+    else
+        record_skipped "system.dmesg_errors" "system.static" "unsupported" "dmesg not installed"
     fi
 
     if has_cmd ps; then
         ps -eo pid,ppid,user,etimes,%cpu,%mem,args 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /[m]ysqld/ {print}' | redact_command_stream > "$EVIDENCE_DIR/mysql_processes.txt"
         record_status "system.mysql_processes" "system.static" "$([ -s "$EVIDENCE_DIR/mysql_processes.txt" ] && echo ok || echo empty)" "$(iso_now)" "$(iso_now)" 0 "$(wc -l < "$EVIDENCE_DIR/mysql_processes.txt")" 0 "evidence/mysql_processes.txt" ""
+    else
+        record_skipped "system.mysql_processes" "system.static" "unsupported" "ps not installed"
     fi
 
     collect_mycnf_allowlist
@@ -884,7 +977,11 @@ append_disk_sample() {
     local ts="$1" elapsed_ms="$2" delta_ms="$3" p dev s ri rs rt wi ws wt inflight io_ms weighted sector_size
     local dri drs drt dwi dws dwt dio dweighted
     for p in /sys/block/*; do
-        [ -r "$p/stat" ] || continue; dev=${p##*/}; case "$dev" in loop*|ram*|zram*|fd*|sr*) continue;; esac
+        # 设备过滤（三库统一）：loop/ram/zram/fd/sr 是伪设备或只读介质；`dm-*` 是 device-mapper
+        #   逻辑设备（LVM / 多路径），它与底层物理盘**统计同一份 IO** —— 两层都列会让报告
+        #   的"磁盘设备"表出现两行描述同一个盘，util 取 max 时口径也含糊。
+        #   报告按**物理盘**口径；多路径/ASM 视图另经 `multipath -ll` 取证（Oracle 的 asm_multipath）。
+        [ -r "$p/stat" ] || continue; dev=${p##*/}; case "$dev" in loop*|ram*|zram*|fd*|sr*|dm-*) continue;; esac
         s=$(cat "$p/stat" 2>/dev/null) || continue
         # 新内核可能在前 11 个标准字段后追加 discard/flush 字段。
         # 只提取固定位置，避免 read 的最后一个变量吞掉多个字段后参与算术运算。
@@ -964,8 +1061,10 @@ find_sar_files() {
 }
 
 collect_sadf_metric() {
-    local metric_id="$1" outfile="$2"; shift 2
-    local tmp="$TMP_DIR/sadf_${metric_id}.tmp" f any=0 rc=0
+    # 第 1 个参数（metric 名）保留：三库调用点保持同形，跨库同步补丁不必改调用点；
+    #   本函数自身不需要它。B4（2026-10-16）：原先还有一个赋值后从未被读的 tmp。
+    local outfile="$2"; shift 2
+    local f any=0 rc=0
     : > "$outfile"
     while IFS= read -r f; do
         [ -r "$f" ] || continue
@@ -978,19 +1077,39 @@ collect_sadf_metric() {
 }
 
 compute_sar_coverage() {
-    local src="$HISTORY_DIR/sar_cpu.csv" t first_epoch="" last_epoch="" first_ts="" last_ts="" coverage_seconds=0 coverage_hours=0 status="empty"
+    local src="$HISTORY_DIR/sar_cpu.csv" t e cutoff points_file first_epoch="" last_epoch="" first_ts="" last_ts=""
+    local coverage_seconds=0 coverage_hours=0 status="empty" point_count=0 discontinuity_count=0 max_gap_seconds=0
     [ -s "$src" ] || return 0
+    # 只统计**请求窗口内**的点（SAR_HISTORY_HOURS）：sadf 导出的是原始历史全量，
+    #   旧写法拿全量首尾相减算覆盖，会把窗口外的点算进来 ⇒ 覆盖率虚高。
+    cutoff=$(( $(date +%s) - SAR_HISTORY_HOURS*3600 ))
+    points_file="$TMP_DIR/sar_coverage_epochs.txt"; : > "$points_file"
     while IFS= read -r t; do
         [ -n "$t" ] || continue
         e=$(date -d "$t" +%s 2>/dev/null) || continue
-        if [ -z "$first_epoch" ] || [ "$e" -lt "$first_epoch" ]; then first_epoch=$e; first_ts=$t; fi
-        if [ -z "$last_epoch" ] || [ "$e" -gt "$last_epoch" ]; then last_epoch=$e; last_ts=$t; fi
+        [ "$e" -ge "$cutoff" ] && printf '%s\n' "$e" >> "$points_file"
     done < <(awk -F';' '!/^#/ && NF>=3 && $3 ~ /^[0-9][0-9][0-9][0-9]-/ {print $3}' "$src")
+    sort -nu "$points_file" -o "$points_file"
+    point_count=$(wc -l < "$points_file" | tr -d ' '); point_count=${point_count:-0}
+    first_epoch=$(head -n 1 "$points_file" 2>/dev/null); last_epoch=$(tail -n 1 "$points_file" 2>/dev/null)
     if [ -n "$first_epoch" ] && [ -n "$last_epoch" ]; then
-        coverage_seconds=$((last_epoch-first_epoch)); [ "$coverage_seconds" -lt 0 ] && coverage_seconds=0
+        # covered 只累加 <=1h 的间隔；>1h 的算一次"断点"。二者都写进 coverage.tsv，
+        #   让下游能区分"覆盖够但中间断过"与"一直连续"（F-04 类判据的依据）。
+        read -r coverage_seconds discontinuity_count max_gap_seconds < <(awk '
+          NR==1{prev=$1; next}
+          {gap=$1-prev; if(gap>maxgap)maxgap=gap; if(gap>0 && gap<=3600)covered+=gap; else if(gap>3600)breaks++; prev=$1}
+          END{print covered+0,breaks+0,maxgap+0}' "$points_file")
         coverage_hours=$(awk -v s="$coverage_seconds" 'BEGIN{printf "%.2f",s/3600}')
-        status="ok"
-        [ "$coverage_seconds" -lt $((SAR_HISTORY_HOURS*3600*9/10)) ] && status="partial"
+        first_ts=$(date -u -d "@$first_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)
+        last_ts=$(date -u -d "@$last_epoch" '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null)
+        status="partial"
+        if [ "$coverage_seconds" -ge $((SAR_HISTORY_HOURS*3600*9/10)) ]; then status="ok"; fi
+        # F-04：窗口内出现 **>1 小时的点间空洞**时，即使累计覆盖达标也不判 ok ——
+        #   一台早上 3h + 晚上 3h、中间停机的主机不该被写成"历史可用"。
+        #   阈值取 3600s（与上面"covered 只累加 <=1h 的间隔"同一口径），**不要**改成
+        #   "窗口的 10%"：24h 窗口的 10% = 2.4h，而空洞 >2.4h 时累计覆盖必然 <21.6h(90%)
+        #   ⇒ 两条判据互斥、连续性那条永远不触发，等于给自己立了一条验证不了的规则。
+        if [ "$max_gap_seconds" -gt 3600 ]; then status="partial"; fi
     fi
     {
       printf 'status\t%s\n' "$status"
@@ -999,10 +1118,13 @@ compute_sar_coverage() {
       printf 'last_timestamp\t%s\n' "$last_ts"
       printf 'coverage_seconds\t%s\n' "$coverage_seconds"
       printf 'coverage_hours\t%s\n' "$coverage_hours"
+      printf 'point_count\t%s\n' "$point_count"
+      printf 'discontinuity_count\t%s\n' "$discontinuity_count"
+      printf 'max_gap_seconds\t%s\n' "$max_gap_seconds"
     } > "$HISTORY_DIR/coverage.tsv"
     {
-      printf '{"schema_version":"1.0","status":%s,"requested_hours":%s,"first_timestamp":%s,"last_timestamp":%s,"coverage_seconds":%s,"coverage_hours":%s}\n' \
-        "$(json_quote "$status")" "$SAR_HISTORY_HOURS" "$(json_quote "$first_ts")" "$(json_quote "$last_ts")" "$coverage_seconds" "${coverage_hours:-0}"
+      printf '{"schema_version":"1.1","status":%s,"requested_hours":%s,"first_timestamp":%s,"last_timestamp":%s,"coverage_seconds":%s,"coverage_hours":%s,"point_count":%s,"discontinuity_count":%s,"max_gap_seconds":%s}\n' \
+        "$(json_quote "$status")" "$SAR_HISTORY_HOURS" "$(json_quote "$first_ts")" "$(json_quote "$last_ts")" "$coverage_seconds" "${coverage_hours:-0}" "$point_count" "$discontinuity_count" "$max_gap_seconds"
     } > "$HISTORY_DIR/coverage.json"
 }
 
@@ -1026,9 +1148,10 @@ collect_sar_history() {
         collect_sadf_metric io "$HISTORY_DIR/sar_io.csv" -b || true
         collect_sadf_metric process "$HISTORY_DIR/sar_process.csv" -w || true
         compute_sar_coverage
-        local coverage_status coverage_hours
+        local coverage_status coverage_hours coverage_discontinuity
         coverage_status=$(awk -F'\t' '$1=="status"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         coverage_hours=$(awk -F'\t' '$1=="coverage_hours"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
+        coverage_discontinuity=$(awk -F'\t' '$1=="discontinuity_count"{print $2}' "$HISTORY_DIR/coverage.tsv" 2>/dev/null)
         # 直接映射 coverage.tsv 的判定结果：导出成功不等于有覆盖，
         # empty（读不到历史区间）必须如实记为 empty，不能默认 ok。
         case "${coverage_status:-}" in
@@ -1036,23 +1159,12 @@ collect_sar_history() {
             empty|"") status="empty" ;;
             *)        status="partial" ;;
         esac
-        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours; Python will perform final filtering and coverage calculation"
+        reason="raw sadf data exported; declared coverage status=${coverage_status:-unknown}, coverage=${coverage_hours:-unknown} hours, discontinuity_count=${coverage_discontinuity:-unknown}"
     fi
     end_iso=$(iso_now); end_ms=$(epoch_ms)
     record_status "system.sar_history" "system.history" "$status" "$start_iso" "$end_iso" "$((end_ms-start_ms))" "${count:-0}" 0 "history/" "$reason"
     return 0
 }
-
-record_skipped() {
-    local item_id="$1" category="$2" status="$3" reason="$4" outfile="${5-}" output_file=""
-    if [ -n "$outfile" ]; then
-        mkdir -p "$(dirname "$outfile")"
-        ensure_tsv_header "$outfile" || : > "$outfile"
-        output_file=$(safe_relpath "$outfile")
-    fi
-    record_status "$item_id" "$category" "$status" "$(iso_now)" "$(iso_now)" 0 0 0 "$output_file" "$reason"
-}
-
 
 # ---------------------------------------------------------------------------
 # collect_innodb_status —— 采集 SHOW ENGINE INNODB STATUS 的**原始文本**
@@ -1398,6 +1510,8 @@ collect_mysql_logs_backup() {
     if has_cmd systemctl; then
         systemctl list-timers --all --no-pager 2>/dev/null | grep -Ei 'mysql|maria|backup|xtrabackup|dump' > "$EVIDENCE_DIR/backup_timers.txt"
         record_status "system.backup_timers" "mysql.backup" "$([ -s "$EVIDENCE_DIR/backup_timers.txt" ] && echo ok || echo empty)" "$(iso_now)" "$(iso_now)" 0 "$(wc -l < "$EVIDENCE_DIR/backup_timers.txt")" 0 "evidence/backup_timers.txt" ""
+    else
+        record_skipped "system.backup_timers" "mysql.backup" "unsupported" "systemctl command unavailable"
     fi
 
     ps -eo pid,user,etimes,args 2>/dev/null | grep -Ei '[x]trabackup|[m]ysqldump|[m]ydumper|[m]yloader|[m]ysqlpump|[m]ariabackup' | redact_command_stream > "$EVIDENCE_DIR/backup_processes.txt"
