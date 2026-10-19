@@ -46,6 +46,22 @@ def _normalize_finding(value: dict[str, Any]) -> dict[str, Any]:
     return finding
 
 
+def _scoring_policy() -> dict[str, Any]:
+    """健康分的**声明口径**，与 `presentation.health_summary()` 同源。
+
+    共享引擎靠这一键决定要不要渲染首页「结论速览」；**缺键不会报错、也不抛异常，
+    只会让整段静默消失** —— 与 SQL Server 适配器漏键时同一种病。延迟 import 是
+    为了不让本适配层在 import 期就拉进 presentation。
+    """
+    from .presentation import SCORE_BASE, SCORE_PENALTY
+
+    return {
+        "base": SCORE_BASE,
+        "minimum": 0,
+        "penalty_per_finding": dict(SCORE_PENALTY),
+    }
+
+
 def _build_plan(findings: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     plan: dict[str, list[dict[str, Any]]] = {"P1": [], "P2": [], "P3": []}
     for finding in findings:
@@ -96,6 +112,22 @@ def _normalized_conclusions(source: dict[str, Any], evaluations: list[dict[str, 
         item["conclusion"] = str(item.get("conclusion") or "").replace(old, replacement)
         item["evidence"] = [replacement if value == old else value for value in item.get("evidence") or []]
     return conclusions
+
+
+#: 采集缺口 → 附录「数据缺口」表的「推荐动作」列。**按状态给**，不再一律"重采"：
+#: `unsupported`（目标机没装 barman / pg_stat_statements）重采一千次也不会有结果，
+#: 那句建议本身是错的语气 —— 它把一个**环境事实**说成了**待修复的失败**。
+#: ★ 更具体的覆盖仍由 `inspection_core.word_engine.GAP_ACTION_NOTES`（按 `reason` 匹配）
+#:   先命中，例如"改由逐库采集"会给出指名道姓的说明。
+GAP_ACTIONS: dict[str, str] = {
+    "unsupported": "本环境不提供该项（对应工具/扩展未安装），无需重采；"
+                   "如确需该证据，请先在目标机安装对应组件。",
+    "not_enabled": "功能存在但未启用；如确需该证据，请在目标实例启用后重采。",
+    "skipped": "本项按设计未采（已由其它采集路径覆盖），无需处理。",
+    "not_applicable": "本项在当前架构下不适用，无需处理。",
+    "partial": "已取得部分数据，仍作为证据使用；如需完整结论请延长采集窗口后重采。",
+}
+GAP_DEFAULT_ACTION = "修复采集条件后重采；已取得的部分数据仍保留为证据。"
 
 
 def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
@@ -162,7 +194,18 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
         limitations.append(f"{quality.get('not_enabled')} 个可选能力未启用")
 
     evaluations = deepcopy(source.get("rule_evaluations") or [])
+    # 附录「数据缺口」表 = **采集侧缺口** + **规则层证据不足**。
+    # ★ 此前只有后者（`not_evaluated` 的规则项），采集侧的 19 项缺口
+    #   （10 skipped / 6 unsupported / 2 not_enabled / 1 partial）**一项都不出现** ——
+    #   而这正是读者最需要看到的"哪些证据根本没采到"。清单来自
+    #   `package_adapter.collection_quality.non_ok_items`（与完整度分子共用判据）。
     gaps = [{
+        "item_id": item.get("item_id"),
+        "status": item.get("status"),
+        "reason": item.get("reason"),
+        "recommended_action": GAP_ACTIONS.get(str(item.get("status") or ""), GAP_DEFAULT_ACTION),
+    } for item in quality.get("non_ok_items") or []]
+    gaps += [{
         "item_id": item.get("rule_id"),
         "status": "external_evidence_required",
         "reason": item.get("reason"),
@@ -215,7 +258,16 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
             "grade": (source.get("health_summary") or {}).get("grade"),
             "counts": severity_counts,
             "source_scale": {"critical": "high", "warning": "medium", "info": "low"},
+            # ★ 缺了这一键，共享引擎 `word_engine.build_summary_v31` 的判据
+            #   `if score is not None and base:` 不成立 ⇒ 首页「结论速览」整段
+            #   **静默消失**（报告照常生成、不报错）。分值口径与
+            #   `presentation.health_summary()` **同源**（模块级常量，只有一份）。
+            "scoring_policy": _scoring_policy(),
         },
+        # ★ opt-in：本机确无严重/高风险项时，让首页「1.2 高风险项速览」显式说明
+        #   「未发现」，而不是整节消失 —— 否则读者无法区分「没有高风险」与
+        #   「这一节没渲染出来」。无此键的库（MySQL/Oracle/SQLServer）产物逐字节不变。
+        "declare_no_highlights": True,
         "postgresql_analysis": {"charts": charts},
         "risk_register": findings,
         "optimization_plan": _build_plan(findings),
@@ -236,7 +288,11 @@ def adapt_report_model(source: dict[str, Any]) -> dict[str, Any]:
             "data_quality": {
                 "score": quality.get("score") or window.get("data_score"),
                 "grade": window.get("data_grade"),
-                "integrity": {"status": "not_evaluated", "reason": "旧 PG 报告模型未携带 manifest 校验明细"},
+                # 校验结果由 package_adapter.collection_quality 带进 report_model
+                # （单一来源）。只有旧模型没带时，才回落到"未判断"。
+                "integrity": deepcopy(quality.get("integrity")
+                                      or {"status": "not_evaluated",
+                                          "reason": "旧 PG 报告模型未携带 manifest 校验明细"}),
                 "limitations": limitations,
             },
             "rule_evaluations": evaluations,

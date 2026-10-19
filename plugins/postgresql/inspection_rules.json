@@ -284,6 +284,14 @@
       "recommendation": "使用 DROP INDEX CONCURRENTLY 删除无效索引，必要时重建",
       "threshold": {}
     },
+    "PG.INDEX.FK_NO_INDEX": {
+      "category": "index",
+      "severity": "warning",
+      "title": "外键列缺少支撑索引",
+      "summary": "外键的引用侧列上没有索引，父表删除/更新行时需对子表做全表扫描并加锁，易造成锁等待与写放大",
+      "recommendation": "为外键列创建索引（CREATE INDEX CONCURRENTLY ON <子表> (<外键列>)）；创建前评估空间占用与写入放大，改后复核",
+      "threshold": {}
+    },
     "PG.ROLE.SUPERUSER_COUNT": {
       "category": "security",
       "severity": "info",
