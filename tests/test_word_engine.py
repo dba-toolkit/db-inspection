@@ -525,16 +525,43 @@ class CollectionStatusVocabularyTests(unittest.TestCase):
         self.assertEqual(gap_status_text("brand_new_status"), "brand_new_status")
 
     def test_no_known_status_renders_with_ascii_letters(self) -> None:
-        """**枚举不许漏出英文**：四个库 + 规则层能产出的每一个状态，渲染后都必须无 ASCII 字母。"""
+        """**枚举不许漏出英文**：四个库 + 规则层能产出的每一个状态，渲染后都必须无 ASCII 字母。
+
+        ★ 候选集**不许只从 `STATUS_DISPLAY` 自己取**（自我引用）：漏键时候选集跟着一起漏，
+        测试照样绿。批 24 的**尺子自证**实测到了这一点 —— 把 `"schema_mismatch"` 从
+        `STATUS_DISPLAY` 删掉后，本测试**仍然 passed**（`candidates` 里被删的键自己也没了）。
+        所以下面维护一份**外部清单**，先断言词表覆盖它，再逐个渲染。
+        """
         from inspection_core.word_engine import STATUS_DISPLAY
         from plugins.oracle.package_adapter import _DATA_STATES, _NO_DATA_STATES
 
+        # 外部清单 = 「四个采集器 + 规则层写得出来的状态」，来源：
+        #   * 采集器：inspection/{mysql,pg,oracle,sqlserver}_* 里 `record_status` 的实参
+        #     （取值表见 docs/{postgresql,oracle,mysql}-collector-interface.md 的 status 语义表）
+        #   * 规则层：inspection_core/system_checks.py 与各库 rule_provider
+        #   ★ 采集器/规则层新增状态词时**必须**同时改这里 —— 这正是需要人盯的地方。
+        collector_states = {
+            "ok", "empty", "partial", "unsupported", "not_applicable", "not_enabled",
+            "permission_denied", "timeout", "error", "skipped", "schema_mismatch",
+        }
+        rule_states = {
+            "normal", "attention", "risk", "not_evaluated",
+            "insufficient_history", "external_evidence_required", "unavailable", "missing",
+        }
+        missing = (collector_states | rule_states) - set(STATUS_DISPLAY)
+        self.assertEqual(
+            missing,
+            set(),
+            f"STATUS_DISPLAY 漏了这些状态的中文名（会原样印进交付物）：{sorted(missing)}",
+        )
+
         engine = self._engine()
         candidates = (
-            set(STATUS_DISPLAY)
+            collector_states
+            | rule_states
+            | set(STATUS_DISPLAY)
             | set(_DATA_STATES)
             | set(_NO_DATA_STATES)
-            | {"insufficient_history", "external_evidence_required", "missing"}
         )
         leaks = {
             status: engine.display_status(status)
@@ -588,6 +615,10 @@ class GapReasonLocalisationTests(unittest.TestCase):
         "(DESCRIPTION=(ADDRESS=(PROTOCOL=IPC)(KEY=EXTPROC1521))) TNS-12541: TNS:no listener "
         "TNS-12560: TNS:protocol adapter error TNS-00511: No listener",
         "chronyc available; ntpq is the mutually-exclusive fallback",
+        # PG 2.0 采集包 `collection_status.json` 的真实 10 条（顶层 9 项 + ifconfig）。
+        # ★ 这条也是"顶层连接默认 postgres 系统库"这一设计决定在报告里的**唯一痕迹**：
+        #   不翻译它，客户在附录里看到的就是一句英文 + 内部表名。
+        "改由逐库采集（db.<name>.table_health）；顶层连接默认 postgres，无用户对象",
     )
 
     # 另外三库基线里的真实 reason（必须**逐字不变**地穿过去）。
@@ -608,6 +639,8 @@ class GapReasonLocalisationTests(unittest.TestCase):
                 "同类命令已成功采集，本项作为互斥备选按设计跳过",
             "chronyc available; ntpq is the mutually-exclusive fallback":
                 "同类命令已成功采集，本项作为互斥备选按设计跳过",
+            "改由逐库采集（db.<name>.table_health）；顶层连接默认 postgres，无用户对象":
+                "该项按设计改由逐库采集覆盖（顶层连接默认 postgres 系统库，无用户对象）",
         }
         for raw, note in expected.items():
             out = gap_reason_text(raw)
@@ -684,6 +717,125 @@ class GapReasonLocalisationTests(unittest.TestCase):
                 # 原始英文只允许出现在「（原始信息：…）」括号里，不许作为整格值裸奔
                 self.assertNotIn("506 Cannot talk to daemon", cells, layout)
                 self.assertNotIn("506 Cannot talk to daemon ", cells, layout)
+
+
+class SummaryGapSplitAndEmptyHighlightTests(unittest.TestCase):
+    """批 5：首页两处「缺席 ≠ 无问题」的显式化。
+
+    两处都是**不报错、不抛异常、测试也不红**的类型 —— 只能靠读渲染产物才看得见：
+
+    ① 「结论速览」把台账里的项一律说成「N 项证据缺口」。而台帐里既有**真缺口**
+       （采集失败 / 需外部证据），也有**本环境不适用**（未装对应组件、该采集项已由
+       另一条路径覆盖）。混在一起会让同一页同时出现「20 项证据缺口」和
+       「数据质量 96.9%」，读者无法判断到底缺了多少。
+    ② 本机确无严重/高风险项时，「1.2 高风险项速览」整节消失 —— 读者无法区分
+       「本次没有高风险」与「这一节没渲染出来」。这是「没采到 vs 没问题」的
+       第三种形态：**没东西可报** 与 **没渲染出来** 长得一样。
+    """
+
+    @staticmethod
+    def _model() -> dict:
+        # 深拷贝，绝不改基线文件
+        return json.loads(json.dumps(read_json(REPORT_MODEL)))
+
+    def _render_model(self, model: dict) -> Document:
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary) / "report_model.json"
+            write_json(model_path, model)
+            output = Path(temporary) / "summary.docx"
+            MySQLWordReportGenerator(model_path, output, layout="professional").build()
+            return Document(output)
+
+    @staticmethod
+    def _paragraphs(document: Document) -> str:
+        return "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    @staticmethod
+    def _all_text(document: Document) -> str:
+        return "\n".join(
+            [paragraph.text for paragraph in document.paragraphs]
+            + [cell.text for table in document.tables for row in table.rows for cell in row.cells]
+        )
+
+    # ---- ① 缺口句拆分 ----
+
+    def test_summary_separates_out_of_scope_from_real_gaps(self) -> None:
+        """有不适用项时：总数 / 真缺口 / 不适用 三个数字都要说清楚。"""
+        model = self._model()
+        model["collection_gaps"] = [
+            {"item_id": "a", "status": "unsupported", "reason": "r", "recommended_action": "x"},
+            {"item_id": "b", "status": "skipped", "reason": "r", "recommended_action": "x"},
+            {"item_id": "c", "status": "not_enabled", "reason": "r", "recommended_action": "x"},
+        ]
+        body = self._paragraphs(self._render_model(model))
+        self.assertIn("3 项采集限制", body)
+        self.assertIn("其中 1 项为证据缺口", body)
+        self.assertIn("2 项为本环境不适用", body)
+
+    def test_summary_keeps_the_original_sentence_when_nothing_is_out_of_scope(self) -> None:
+        """**配对反误报**：没有不适用项时，原句必须逐字保留。
+
+        这条同时是「另外三个库不受影响」的证明 —— MySQL 基线只有 1 条
+        `external_evidence_required`，落进这个分支，文档 hash 才有理由不变。
+        """
+        model = self._model()
+        model["collection_gaps"] = [
+            {"item_id": "a", "status": "external_evidence_required",
+             "reason": "r", "recommended_action": "x"},
+        ]
+        body = self._paragraphs(self._render_model(model))
+        self.assertIn("另有 1 项证据缺口（采集不完整或需外部证据）", body)
+        self.assertNotIn("采集限制", body)
+
+    # ---- ② 无高风险项的显式说明 ----
+
+    def _no_high_model(self) -> dict:
+        model = self._model()
+        model["declare_no_highlights"] = True
+        model["risk_register"] = [
+            {"rule_id": "R1", "severity": "medium", "title": "中风险甲", "facts": ["事实一"]},
+            {"rule_id": "R2", "severity": "low", "title": "低风险乙", "facts": ["事实二"]},
+        ]
+        model["health_assessment"]["counts"] = {"high": 0, "medium": 1, "low": 1}
+        return model
+
+    def test_no_high_findings_renders_an_explicit_note_when_opted_in(self) -> None:
+        body = self._paragraphs(self._render_model(self._no_high_model()))
+        self.assertIn("1.2 高风险项速览", body)
+        self.assertIn("本次巡检未发现严重或高风险项", body)
+        self.assertIn("共登记 2 条", body)
+        self.assertIn("其中中风险 1 条", body)
+
+    def test_no_high_findings_stays_silent_without_the_opt_in_key(self) -> None:
+        """**必须 opt-in** —— 无此键的库（MySQL/Oracle/SQLServer）产物逐字节不变。"""
+        model = self._no_high_model()
+        model.pop("declare_no_highlights")
+        body = self._paragraphs(self._render_model(model))
+        self.assertNotIn("1.2 高风险项速览", body)
+        self.assertNotIn("本次巡检未发现严重或高风险项", body)
+
+    def test_opt_in_must_not_claim_anything_when_the_register_is_empty(self) -> None:
+        """**过度修正配对**：登记册为空说明规则没跑成，此时「未发现高风险项」= 把
+        「没评价」说成「没问题」—— 这是本项目最忌讳的错，必须不渲染。"""
+        model = self._no_high_model()
+        model["risk_register"] = []
+        model["health_assessment"]["counts"] = {"high": 0, "medium": 0, "low": 0}
+        body = self._paragraphs(self._render_model(model))
+        self.assertNotIn("1.2 高风险项速览", body)
+        self.assertNotIn("本次巡检未发现严重或高风险项", body)
+
+    def test_opt_in_does_not_replace_a_real_highlight_table(self) -> None:
+        """**过度修正配对**：真有高风险项时仍走原表格，不许被那句说明顶掉。"""
+        model = self._no_high_model()
+        model["risk_register"] = [
+            {"rule_id": "R1", "severity": "high", "title": "严重问题甲", "facts": ["事实一"]},
+        ]
+        model["health_assessment"]["counts"] = {"high": 1, "medium": 0, "low": 0}
+        document = self._render_model(model)
+        body = self._paragraphs(document)
+        self.assertIn("1.2 高风险项速览", body)
+        self.assertNotIn("本次巡检未发现严重或高风险项", body)
+        self.assertIn("严重问题甲", self._all_text(document))
 
 
 if __name__ == "__main__":

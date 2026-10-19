@@ -24,6 +24,9 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
+# 「本环境不适用」与「证据缺口」是两件事 —— 判据只有一份，放在公共层。
+from inspection_core.collection_state import is_out_of_scope
+
 
 GENERATOR_VERSION = "4.2.0"
 FONT_EN = "Calibri"
@@ -237,7 +240,11 @@ STATUS_DISPLAY = {
     "empty": "无记录", "not_applicable": "不适用", "not_evaluated": "未判断",
     "skipped": "已跳过", "unsupported": "不支持", "permission_denied": "权限不足",
     "timeout": "超时", "error": "失败", "not_enabled": "未启用",
+    "schema_mismatch": "与版本不匹配",
     "unavailable": "未采集", "missing": "未采集",
+    # 「报告层没能把这节的采集来源对上台账」—— 与「没采到」同样是**不知道**，
+    # 所以既不能落「正常」，也不能落空白（F-14 立的：查不到 ≠ 没有问题）。
+    "unmapped": "未登记",
     "insufficient_history": "历史不足", "external_evidence_required": "需要外部证据",
     "attention": "关注", "normal": "正常", "risk": "风险",
     "triggered": "触发", "passed": "通过",
@@ -248,6 +255,36 @@ def gap_status_text(value: Any) -> str:
     """「数据缺口」表的状态列。与 `display_status()` 同一份词表，只此一处。"""
     raw = text(value)
     return STATUS_DISPLAY.get(raw.lower(), raw)
+
+
+# ★ 元信息行「采集状态」在**有子项没采到**时的说法。
+#   为什么需要它：章节的 `collection.status` 走的是**引擎语义**（`ok` = 该节的分析结论
+#   有效），所以 `partial`（部分有证据）被刻意归成 `ok` —— 否则引擎"非 ok 就压过结论"
+#   会把该节的 `risk` 盖成「部分可用」，等于用"证据不全"抹掉"发现问题"。
+#   但元信息行**直接印**这个值，于是出现
+#   「采集状态：正常；说明：本节部分采集项未取得…」—— 同一行自相矛盾，
+#   只看前半句的人会以为证据齐了（真机实测：备份章节 barman 与 pgbackrest 两个都不支持，
+#   整块证据为空，元信息行却印「正常」）。
+#   ⇒ 插件把缺口数（`collection.gap_count`）单独带出来，展示词在这里改写，
+#   **引擎判定完全不受影响**。只有显式给 `gap_count` 的插件走这条路（其余库产物不变）。
+GAP_STATUS_TEMPLATE = "部分（{count} 项未取得）"
+
+
+def gap_status_override(collection: dict[str, Any]) -> str:
+    """**有采集缺口**时的元信息行状态词；没有缺口返回空串（调用方沿用 `display_status`）。
+
+    判据只有一条：`status` 归成 `ok`（引擎语义：该节的分析结论有效）**但** `gap_count > 0`
+    （该节确有子项没采到）。其余情况一律返回空串 —— 例如 `skipped` / `unsupported`
+    本身就会印成「已跳过」/「不支持」，不需要再改写。
+
+    ★ 没有 `gap_count` 键的插件（MySQL / Oracle / SQL Server）**永远走不到这里**，
+      产物不受影响 —— 这是刻意的 opt-in。
+    """
+    gap_count = collection.get("gap_count")
+    if (isinstance(gap_count, int) and gap_count > 0
+            and str(collection.get("status") or "").lower() == "ok"):
+        return GAP_STATUS_TEMPLATE.format(count=gap_count)
+    return ""
 
 
 # ★ 批 21：采集器的 `reason` 是**运行期原文**（服务未运行时，命令自己的英文报错被原样收下），
@@ -261,12 +298,16 @@ GAP_REASON_NOTES: tuple[tuple[str, str], ...] = (
     ("cannot talk to daemon", "时间同步守护进程（chronyd/NTP）未运行"),
     ("connection refused", "目标服务端口未开放（服务未启动）"),
     ("mutually-exclusive fallback", "同类命令已成功采集，本项作为互斥备选按设计跳过"),
+    # PG：顶层连接默认连 `postgres` 系统库，`pg_stat_user_tables` 这类视图**只反映当前库**
+    #   ⇒ 顶层 9 项按设计跳过、改由逐库（`db.<库名>.*`）采集。这是设计决定，不是缺陷。
+    ("改由逐库采集", "该项按设计改由逐库采集覆盖（顶层连接默认 postgres 系统库，无用户对象）"),
 )
 
 # ★ 同上：`推荐动作` 列原先是展示层写死的一句话，对「按设计跳过」的项**语义相反**
 #   （它并没有采集失败、重采也无意义）。只覆盖这一类，其余仍用采集侧给的原文。
 GAP_ACTION_NOTES: tuple[tuple[str, str], ...] = (
     ("mutually-exclusive fallback", "无需处理：该项与已成功的同类采集项互斥，按设计跳过。"),
+    ("改由逐库采集", "无需处理：该项已由逐库采集（db.<库名>.*）覆盖，重采顶层无意义。"),
 )
 
 # 原始信息保留长度：够定位（TNS 报错的关键片段在前 80 字符内），又不至于撑破单元格。
@@ -807,7 +848,10 @@ class WordReportEngine:
         self.heading(f"{heading_number} {text(item.get('title'))}", 2)
         source = str(item.get("source") or "").strip()
         collection = item.get("collection") or {}
-        status = self.display_status(collection.get("status"))
+        # 有子项没采到 ⇒ 状态词必须体现（否则「正常」与紧随的「本节部分采集项未取得」
+        # 打架）。`gap_count` 是**插件显式带出**的，只有给了它才改写 —— 见
+        # `gap_status_override`。引擎用值（`collection.status`）保持 `ok` 不动。
+        status = gap_status_override(collection) or self.display_status(collection.get("status"))
         source_line = f"数据来源：{source or '报告模型'}；采集状态：{status}"
         if collection.get("row_count") is not None:
             source_line += f"；原始记录：{collection.get('row_count')} 条"
@@ -1067,10 +1111,29 @@ class WordReportEngine:
                 )
             gaps = self.model.get("collection_gaps") or []
             if gaps:
-                sentences.append(
-                    f"另有 {len(gaps)} 项证据缺口（采集不完整或需外部证据）："
-                    "按「未采集 ≠ 0」处理，既不计入评分，也不作通过结论，详见附录。"
-                )
+                # 「本环境不适用」与「证据缺口」是两件事。未装对应组件、或该采集项已由
+                # 另一条采集路径（逐库）覆盖 —— 这些**不是缺陷**。若把它们一并说成
+                # 「N 项证据缺口」，首页就会出现「20 项证据缺口」与「数据质量 96.9%」
+                # 并存的假象，读者无从判断到底缺了多少。判据统一走公共层
+                # is_out_of_scope()（与完整度分母同源）。
+                # ★ 只有**确实存在**不适用项时才改句；否则原句逐字保留 —— 这条的产物
+                #   是要按 hash 钉住的（MySQL 那份只有 1 条 external_evidence_required，
+                #   落进 else 分支，文档 hash 不变）。
+                out_of_scope = [g for g in gaps if is_out_of_scope(str(g.get("status")))]
+                if out_of_scope:
+                    real_gaps = len(gaps) - len(out_of_scope)
+                    sentences.append(
+                        f"另有 {len(gaps)} 项采集限制：其中 {real_gaps} 项为证据缺口"
+                        "（采集不完整或需外部证据）、"
+                        f"{len(out_of_scope)} 项为本环境不适用（未安装对应组件或已由其它"
+                        "采集路径覆盖）；均按「未采集 ≠ 0」处理，既不计入评分，也不作通过"
+                        "结论，详见附录。"
+                    )
+                else:
+                    sentences.append(
+                        f"另有 {len(gaps)} 项证据缺口（采集不完整或需外部证据）："
+                        "按「未采集 ≠ 0」处理，既不计入评分，也不作通过结论，详见附录。"
+                    )
             self.note_box("结论速览", "".join(sentences))
         counts_table = self.table(
             ["总体健康", "高风险", "中风险", "低风险"],
@@ -1221,6 +1284,26 @@ class WordReportEngine:
                     set_cell_shading(title_cell, fill)
                 for run in title_cell.paragraphs[0].runs:
                     set_run_font(run, size=9, bold=True, color=COLOR_HIGH)
+        elif self.model.get("declare_no_highlights"):
+            # 本机确实没有严重/高风险项时，不能让这一节**整节消失** —— 读者无法区分
+            # 「本次没有高风险」和「渲染把这一节漏了」。这正是「没采到」与「没问题」
+            # 长得一样的第三种形态：**没东西可报** 与 **没渲染出来** 看起来一样。
+            # ★ 必须 opt-in（无此键的库产物逐字节不变），且必须**风险登记册非空**才敢
+            #   声明：规则一条都没跑成时，「未发现高风险项」就是把「没评价」说成
+            #   「没问题」—— 那是本项目最忌讳的错。
+            register = self.model.get("risk_register") or []
+            if register:
+                self._summary_sub = 2
+                self.heading("1.2 高风险项速览", 2)
+                self.note_box(
+                    "速览口径",
+                    f"本次巡检未发现严重或高风险项。风险登记册共登记 "
+                    f"{number(len(register), 0)} 条，其中中风险 "
+                    f"{number(counts.get('medium') or 0, 0)} 条、低风险 "
+                    f"{number(counts.get('low') or 0, 0)} 条；"
+                    "完整事实、建议与证据见风险登记册章节。",
+                    accent=COLOR_TEXT,
+                )
         self.note_box(
             "结论口径",
             "健康评分、风险等级和检查结论均直接读取分析结果；Word 生成器仅负责呈现，不重新计算或改变判断。",
