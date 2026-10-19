@@ -80,19 +80,8 @@ class Analyzer:
         return self.chart_provider.generate_charts(ctx, metrics)
 
     def health_summary(self, findings: list[Finding]) -> dict[str, Any]:
-        critical = sum(1 for f in findings if f.severity == "critical")
-        warning = sum(1 for f in findings if f.severity == "warning")
-        info = sum(1 for f in findings if f.severity == "info")
-        score = max(0, 100 - critical * 25 - warning * 10 - info * 3)
-        if score >= 90:
-            grade = "A"
-        elif score >= 75:
-            grade = "B"
-        elif score >= 60:
-            grade = "C"
-        else:
-            grade = "D"
-        return {"score": score, "grade": grade, "critical": critical, "warning": warning, "info": info}
+        # 与 `presentation` 同源（原先两份逐字节相同，见 build_report_model 的说明）。
+        return self.presentation_builder.health_summary(findings)
 
     def build_inspection_model(self, ctx: PackageContext) -> dict[str, Any]:
         return self.presentation_builder.build_inspection_model(ctx)
@@ -101,150 +90,13 @@ class Analyzer:
                            findings: list[Finding], evaluations: list[RuleEvaluation],
                            quality: dict[str, Any], charts: list[dict[str, Any]],
                            health: dict[str, Any]) -> dict[str, Any]:
-        inspection_model = self.build_inspection_model(ctx)
-        ident = ctx.snapshot.get("instance_identity", {})
-        host = ctx.snapshot.get("host_identity", {})
-        role = ctx.snapshot.get("role_evidence", {})
-        caps = ctx.snapshot.get("capabilities", {})
-        sampling = ctx.snapshot.get("sampling", {})
-
-        instance = {
-            "instance_id": ctx.instance_id,
-            "identity": {
-                "version": ident.get("version", ""),
-                "hostname": host.get("hostname", ""),
-                "ip": host.get("primary_ip", ""),
-                "port": ident.get("port", ""),
-                "role_observed": role.get("role_observed", ""),
-                "data_directory": ident.get("data_directory", ""),
-            },
-            "metrics": metrics,
-            "health_summary": health,
-            "collection_quality": quality,
-            "capabilities": {
-                "pg_stat_statements": caps.get("pg_stat_statements", False),
-                "sar_available": caps.get("sar_command", False),
-            },
-            "sampling": {
-                "status": sampling.get("status", ""),
-                "duration_seconds": sampling.get("requested_duration_seconds", 0),
-                "sample_points": len(ctx.timeseries.get("pg_activity", [])),
-            },
-            "collector": ctx.snapshot.get("collector", {}),
-            "time_evidence": ctx.snapshot.get("time_evidence", {}),
-            "comprehensive_conclusions": self._build_conclusions(findings, metrics),
-        }
-
-        return {
-            "analyzer_version": ANALYZER_VERSION,
-            "analysis_schema": ANALYSIS_SCHEMA,
-            "analyzed_at": now_iso(),
-            "instance": instance,
-            "inspection_model": inspection_model,
-            "risk_register": [f.to_dict() for f in findings],
-            "rule_evaluations": [e.to_dict() for e in evaluations],
-            "charts": charts,
-            "comprehensive_conclusions": self._build_conclusions(findings, metrics),
-        }
-
-    def _build_conclusions(self, findings: list[Finding], metrics: dict[str, Any]) -> list[dict[str, Any]]:
-        """Build domain-level comprehensive conclusions (like MySQL's 6-domain pattern)."""
-        conclusions: list[dict[str, Any]] = []
-
-        # Domain 1: 配置合规
-        config_issues = []
-        if metrics.get("autovacuum") == "off":
-            config_issues.append("autovacuum 已关闭")
-        if metrics.get("wal_level") == "minimal":
-            config_issues.append("wal_level=minimal")
-        if metrics.get("archive_mode") == "off":
-            config_issues.append("archive_mode=off")
-        if metrics.get("has_idle_timeout") is False:
-            config_issues.append("未设置 idle_in_transaction_session_timeout")
-        if metrics.get("has_stmt_timeout") is False:
-            config_issues.append("未设置 statement_timeout")
-        cfg_status = "attention" if config_issues else "normal"
-        cfg_conclusion = (f"已检查关键参数，{len(config_issues)} 项存在可优化项：" + "；".join(config_issues)
-                          if config_issues else "已检查关键参数，未发现明显配置偏差。")
-        conclusions.append({"topic": "配置合规", "status": cfg_status, "conclusion": cfg_conclusion,
-                           "evidence": config_issues})
-
-        # Domain 2: 缓存与性能
-        cache = metrics.get("cache_hit_ratio")
-        if cache is not None:
-            cache_ok = cache >= 95
-            conclusions.append({
-                "topic": "缓存与性能", "status": "normal" if cache_ok else "attention",
-                "conclusion": f"Buffer 命中率 {cache:.1f}%{'，缓存效率良好' if cache_ok else '，建议评估增大 shared_buffers'}。",
-                "evidence": [f"命中率 {cache:.1f}%"],
-            })
-
-        # Domain 3: 事务与并发
-        long_tx = metrics.get("long_transaction_count", 0)
-        locks = metrics.get("lock_wait_count", 0)
-        deadlocks = metrics.get("deadlocked_count", 0)
-        conn_usage = metrics.get("connection_usage", 0)
-        tx_issues = []
-        if long_tx > 0: tx_issues.append(f"长事务 {long_tx} 个")
-        if locks > 0: tx_issues.append(f"锁等待 {locks} 个")
-        if deadlocks and deadlocks > 0: tx_issues.append(f"死锁 {deadlocks}")
-        if conn_usage and conn_usage > 80: tx_issues.append(f"连接使用率 {conn_usage:.0f}%")
-        tx_status = "risk" if (long_tx > 0 or locks > 0) else "attention" if conn_usage and conn_usage > 70 else "normal"
-        tx_conclusion = (f"采集时发现连接使用率 {conn_usage:.1f}%，连接数 {metrics.get('current_connections','')}/{metrics.get('max_connections','')}。"
-                         + ("关注：" + "、".join(tx_issues) if tx_issues else "未发现长事务或锁等待。结果仅代表现场时点。"))
-        conclusions.append({"topic": "事务与并发", "status": tx_status, "conclusion": tx_conclusion,
-                           "evidence": tx_issues})
-
-        # Domain 4: VACUUM 与维护
-        stale = metrics.get("stale_tables", 0)
-        dead_tup = metrics.get("dead_tuples_total", 0)
-        xid_age = metrics.get("max_xid_age", 0)
-        bloat = metrics.get("bloat_table_count", 0)
-        vac_issues = []
-        if stale > 0: vac_issues.append(f"从未 VACUUM 的表 {stale} 张")
-        if dead_tup > 100000: vac_issues.append(f"死元组 {dead_tup}")
-        if xid_age > 100000000: vac_issues.append(f"事务年龄 {xid_age}（接近回卷阈值）")
-        if bloat > 0: vac_issues.append(f"疑似膨胀表 {bloat} 张")
-        vac_status = "risk" if xid_age > 100000000 else "attention" if vac_issues else "normal"
-        vac_conclusion = (f"死元组 {dead_tup}，最大事务年龄 {xid_age}，从未 VACUUM 的表 {stale} 张。"
-                         + ("关注：" + "、".join(vac_issues) if vac_issues else "VACUUM 维护状态正常。"))
-        conclusions.append({"topic": "VACUUM 与维护", "status": vac_status, "conclusion": vac_conclusion,
-                           "evidence": vac_issues})
-
-        # Domain 5: 复制与高可用
-        rep_lag = metrics.get("max_replication_lag_bytes", 0)
-        inactive_slots = metrics.get("inactive_slots", 0)
-        arch_failed = metrics.get("archive_failed_count", 0)
-        rep_issues = []
-        if inactive_slots > 0: rep_issues.append(f"非活跃复制槽 {inactive_slots} 个")
-        if arch_failed > 0: rep_issues.append(f"归档失败 {arch_failed} 次")
-        if rep_lag and rep_lag > 100 * 1024 * 1024: rep_issues.append("备库延迟 >100MB")
-        is_standby = metrics.get("role_observed") == "standby"
-        rep_status = "risk" if (inactive_slots > 0 or arch_failed > 0) else "attention" if is_standby else "normal"
-        rep_conclusion = (f"复制槽 {metrics.get('active_replication_slots',0)} 个活跃，归档失败 {arch_failed} 次。"
-                         + ("关注：" + "、".join(rep_issues) if rep_issues else "复制状态正常。"))
-        conclusions.append({"topic": "复制与高可用", "status": rep_status, "conclusion": rep_conclusion,
-                           "evidence": rep_issues})
-
-        # Domain 6: 安全与可恢复性
-        sec_issues = []
-        if metrics.get("ssl_enabled") is False:
-            sec_issues.append("SSL 未开启")
-        if metrics.get("has_trust_auth") is True:
-            sec_issues.append("存在 trust/password 认证")
-        if metrics.get("weak_password_encryption") is True:
-            sec_issues.append("密码加密算法不安全")
-        if (metrics.get("superuser_count") or 0) > 3:
-            sec_issues.append(f"超级用户 {metrics.get('superuser_count')} 个偏多")
-        if not metrics.get("has_backup_tool") and not metrics.get("has_backup_cron"):
-            sec_issues.append("未检测到备份策略")
-        sec_status = "risk" if not metrics.get("has_backup_tool") else "attention" if sec_issues else "normal"
-        sec_conclusion = ("巡检发现以下安全与备份问题：" + "；".join(sec_issues)
-                         if sec_issues else "未发现明显安全隐患，备份策略需持续验证。")
-        conclusions.append({"topic": "安全与可恢复性", "status": sec_status, "conclusion": sec_conclusion,
-                           "evidence": sec_issues})
-
-        return conclusions
+        # ★ 单一来源：报告模型装配只在 `presentation.PostgreSQLPresentationBuilder` 里写一份。
+        #   这里原先内联了一份**逐字节复制**的副本（连同下面的 `_build_conclusions`），
+        #   于是"改 presentation 那份"对实际产出毫无影响 —— 典型的"两处实现两个数字"。
+        #   已按 MySQL 侧同款改成委托。
+        return self.presentation_builder.build_report_model(
+            ctx, metrics, findings, evaluations, quality, charts, health
+        )
 
     def build_llm_input(self, ctx: PackageContext, metrics: dict[str, Any],
                         report: dict[str, Any]) -> dict[str, Any]:
@@ -401,49 +253,8 @@ class Analyzer:
 
     def topology(self, contexts: list[PackageContext]) -> dict[str, Any]:
         """Detect PG primary-standby topology across multiple packages."""
-        if len(contexts) < 2:
-            return {"nodes": [{"instance_id": c.instance_id, "role": "standalone"} for c in contexts]}
-
-        nodes = []
-        for ctx in contexts:
-            ident = ctx.snapshot.get("instance_identity", {})
-            is_rec = ident.get("is_recovery", False)
-            ctrl = ctx.tables.get("control_system", [])
-            sys_id = ctrl[0].get("system_identifier", "") if ctrl else ""
-            role = ctx.snapshot.get("role_evidence", {}).get("role_observed", "unknown")
-            host = ctx.snapshot.get("host_identity", {})
-            nodes.append({
-                "instance_id": ctx.instance_id,
-                "hostname": host.get("hostname", ""),
-                "ip": host.get("primary_ip", ""),
-                "port": ident.get("port", ""),
-                "is_recovery": is_rec,
-                "role": role,
-                "system_identifier": sys_id,
-            })
-
-        # Match primaries to standbys by system_identifier
-        edges = []
-        primaries = [n for n in nodes if not n["is_recovery"]]
-        standbys = [n for n in nodes if n["is_recovery"]]
-
-        for p in primaries:
-            for s in standbys:
-                if s["system_identifier"] and p["system_identifier"] and s["system_identifier"] == p["system_identifier"]:
-                    edges.append({
-                        "source": p["instance_id"],
-                        "target": s["instance_id"],
-                        "type": "streaming_replication",
-                    })
-
-        # Unresolved standbys (primary not in collected packages)
-        unresolved = [s for s in standbys if not any(e["target"] == s["instance_id"] for e in edges)]
-
-        return {
-            "nodes": nodes,
-            "edges": edges,
-            "unresolved_standbys": unresolved,
-        }
+        # 与 `presentation` 同源（原先两份逐字节相同，见 build_report_model 的说明）。
+        return self.presentation_builder.topology(contexts)
 
     def _build_multi_conclusions(self, findings: list[Finding],
                                   contexts: list[PackageContext]) -> list[dict[str, Any]]:
